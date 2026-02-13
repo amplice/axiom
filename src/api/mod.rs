@@ -15,6 +15,10 @@ use crate::simulation::{self, SimulationRequest, SimulationResult};
 use crate::sprites::SpriteAssets;
 use types::*;
 
+/// Pending screenshot request
+#[derive(Resource, Default)]
+pub struct PendingScreenshot(pub bool);
+
 /// Commands sent from API → Bevy
 pub enum ApiCommand {
     GetState(tokio::sync::oneshot::Sender<GameState>),
@@ -25,6 +29,7 @@ pub enum ApiCommand {
     SetPhysicsConfig(PhysicsConfig, tokio::sync::oneshot::Sender<Result<(), String>>),
     GetSprites(tokio::sync::oneshot::Sender<crate::sprites::SpriteManifest>),
     SetSprites(crate::sprites::SpriteManifest, tokio::sync::oneshot::Sender<Result<(), String>>),
+    TakeScreenshot(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Resource, Default)]
@@ -69,12 +74,14 @@ impl Plugin for ApiPlugin {
         app.insert_resource(ApiChannels { receiver: rx })
             .insert_resource(PendingLevelChange::default())
             .insert_resource(PendingPhysicsChange::default())
+            .insert_resource(PendingScreenshot::default())
             .insert_resource(SharedSnapshot { data: snapshot.clone() })
             .add_systems(Update, (
                 update_snapshot,
                 process_api_commands,
                 apply_level_change,
                 apply_physics_change,
+                take_screenshot,
             ).chain());
 
         let state = AppState { sender: tx, snapshot };
@@ -96,6 +103,7 @@ impl Plugin for ApiPlugin {
                     .route("/generate", post(generate_level))
                     .route("/sprites", get(get_sprites))
                     .route("/sprites", post(set_sprites))
+                    .route("/screenshot", get(take_screenshot_api))
                     .with_state(state);
 
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -133,6 +141,7 @@ fn process_api_commands(
     mut pending_physics: ResMut<PendingPhysicsChange>,
     mut sprite_assets: ResMut<SpriteAssets>,
     asset_server: Res<AssetServer>,
+    mut pending_screenshot: ResMut<PendingScreenshot>,
 ) {
     while let Ok(cmd) = channels.receiver.try_recv() {
         match cmd {
@@ -202,6 +211,10 @@ fn process_api_commands(
             }
             ApiCommand::SetSprites(manifest, tx) => {
                 crate::sprites::reload_from_manifest(&manifest, &asset_server, &mut sprite_assets);
+                let _ = tx.send(Ok(()));
+            }
+            ApiCommand::TakeScreenshot(tx) => {
+                pending_screenshot.0 = true;
                 let _ = tx.send(Ok(()));
             }
         }
@@ -278,6 +291,17 @@ fn apply_physics_change(
     if let Some(new_config) = pending.0.take() {
         *physics = new_config;
     }
+}
+
+fn take_screenshot(
+    mut pending: ResMut<PendingScreenshot>,
+    mut commands: Commands,
+) {
+    if !pending.0 { return; }
+    pending.0 = false;
+    commands
+        .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
+        .observe(bevy::render::view::screenshot::save_to_disk("screenshot.png"));
 }
 
 // --- HTTP Handlers ---
@@ -489,6 +513,20 @@ async fn get_sprites(State(state): State<AppState>) -> Json<ApiResponse<crate::s
     match rx.await {
         Ok(manifest) => Json(ApiResponse::success(manifest)),
         Err(_) => Json(ApiResponse { ok: false, data: None, error: Some("Channel closed".into()) }),
+    }
+}
+
+async fn take_screenshot_api(State(state): State<AppState>) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::TakeScreenshot(tx));
+    let _ = rx.await;
+    // Wait for Bevy to render + save the screenshot
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let path = std::path::Path::new("screenshot.png");
+    if path.exists() {
+        Json(ApiResponse::success("screenshot.png".to_string()))
+    } else {
+        Json(ApiResponse::err("Screenshot not saved yet — try again"))
     }
 }
 

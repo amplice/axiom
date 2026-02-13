@@ -21,13 +21,16 @@ fn spawn_player(
 
     // Use animated sprite sheet if available, otherwise fallback
     let sprite = if let Some(ref idle_data) = player_anims.idle {
-        Sprite::from_atlas_image(
+        let mut s = Sprite::from_atlas_image(
             idle_data.texture.clone(),
             TextureAtlas {
                 layout: idle_data.layout.clone(),
                 index: 0,
             },
-        )
+        );
+        s.custom_size = Some(Vec2::new(140.0, 140.0));
+        s.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.29));
+        s
     } else if let Some(handle) = sprite_assets.get("player") {
         Sprite {
             image: handle.clone(),

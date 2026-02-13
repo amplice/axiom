@@ -230,15 +230,15 @@ fn animate_player(
             anim.frame = (anim.frame + 1) % data.frame_count;
         }
 
-        // Update sprite texture + atlas
+        // Character is ~23x34 px at y=47-81 in 96x96 frame (91% padding)
+        // Anchor offset puts character feet (image y=81) at hitbox bottom
         sprite.image = data.texture.clone();
-        sprite.custom_size = Some(Vec2::new(32.0, 32.0));
+        sprite.custom_size = Some(Vec2::new(140.0, 140.0));
+        sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.29));
         sprite.texture_atlas = Some(TextureAtlas {
             layout: data.layout.clone(),
             index: anim.frame,
         });
-
-        // Flip based on facing direction
         sprite.flip_x = !anim.facing_right;
     }
 }
