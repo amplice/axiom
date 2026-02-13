@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::components::*;
 use crate::tilemap::{Tilemap, TileEntity};
 use crate::simulation::{self, SimulationRequest, SimulationResult};
+use crate::sprites::SpriteAssets;
 use types::*;
 
 /// Commands sent from API → Bevy
@@ -22,6 +23,8 @@ pub enum ApiCommand {
     TeleportPlayer(f32, f32, tokio::sync::oneshot::Sender<Result<(), String>>),
     GetPhysicsConfig(tokio::sync::oneshot::Sender<PhysicsConfig>),
     SetPhysicsConfig(PhysicsConfig, tokio::sync::oneshot::Sender<Result<(), String>>),
+    GetSprites(tokio::sync::oneshot::Sender<crate::sprites::SpriteManifest>),
+    SetSprites(crate::sprites::SpriteManifest, tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Resource, Default)]
@@ -91,6 +94,8 @@ impl Plugin for ApiPlugin {
                     .route("/feel/compare", get(compare_feel))
                     .route("/feel/tune", post(tune_feel))
                     .route("/generate", post(generate_level))
+                    .route("/sprites", get(get_sprites))
+                    .route("/sprites", post(set_sprites))
                     .with_state(state);
 
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -126,6 +131,8 @@ fn process_api_commands(
     physics: Res<PhysicsConfig>,
     mut pending_level: ResMut<PendingLevelChange>,
     mut pending_physics: ResMut<PendingPhysicsChange>,
+    mut sprite_assets: ResMut<SpriteAssets>,
+    asset_server: Res<AssetServer>,
 ) {
     while let Ok(cmd) = channels.receiver.try_recv() {
         match cmd {
@@ -190,6 +197,13 @@ fn process_api_commands(
                 pending_physics.0 = Some(config);
                 let _ = tx.send(Ok(()));
             }
+            ApiCommand::GetSprites(tx) => {
+                let _ = tx.send(sprite_assets.manifest.clone());
+            }
+            ApiCommand::SetSprites(manifest, tx) => {
+                crate::sprites::reload_from_manifest(&manifest, &asset_server, &mut sprite_assets);
+                let _ = tx.send(Ok(()));
+            }
         }
     }
 }
@@ -200,6 +214,7 @@ fn apply_level_change(
     mut commands: Commands,
     tile_entities: Query<Entity, With<TileEntity>>,
     physics: Res<PhysicsConfig>,
+    sprite_assets: Res<SpriteAssets>,
     mut player_query: Query<(&mut GamePosition, &mut Velocity), With<Player>>,
 ) {
     let Some(req) = pending.0.take() else { return };
@@ -222,18 +237,27 @@ fn apply_level_change(
             let tile_type = tilemap.get(x as i32, y as i32);
             if tile_type == TileType::Empty { continue; }
 
-            let color = match tile_type {
-                TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
-                TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
-                TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
-                TileType::Empty => unreachable!(),
+            let sprite = if let Some(handle) = sprite_assets.get_tile(tile_type) {
+                Sprite {
+                    image: handle.clone(),
+                    custom_size: Some(Vec2::new(ts, ts)),
+                    ..default()
+                }
+            } else {
+                let color = match tile_type {
+                    TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
+                    TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
+                    TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
+                    TileType::Empty => unreachable!(),
+                };
+                Sprite::from_color(color, Vec2::new(ts, ts))
             };
 
             commands.spawn((
                 TileEntity,
                 Tile { tile_type },
                 GridPosition { x: x as i32, y: y as i32 },
-                Sprite::from_color(color, Vec2::new(ts, ts)),
+                sprite,
                 Transform::from_xyz(x as f32 * ts + ts / 2.0, y as f32 * ts + ts / 2.0, 0.0),
             ));
         }
@@ -457,4 +481,23 @@ async fn generate_level(
 
     let result = crate::generation::generate(&req, &physics);
     Json(ApiResponse::success(result))
+}
+
+async fn get_sprites(State(state): State<AppState>) -> Json<ApiResponse<crate::sprites::SpriteManifest>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetSprites(tx));
+    match rx.await {
+        Ok(manifest) => Json(ApiResponse::success(manifest)),
+        Err(_) => Json(ApiResponse { ok: false, data: None, error: Some("Channel closed".into()) }),
+    }
+}
+
+async fn set_sprites(State(state): State<AppState>, Json(req): Json<crate::sprites::SpriteManifest>) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetSprites(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
 }

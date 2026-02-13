@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use crate::components::*;
+use crate::sprites::SpriteAssets;
 
 pub struct TilemapPlugin;
 
@@ -117,6 +118,7 @@ fn spawn_tilemap(
     mut commands: Commands,
     tilemap: Res<Tilemap>,
     physics: Res<PhysicsConfig>,
+    sprite_assets: Res<SpriteAssets>,
 ) {
     let ts = physics.tile_size;
     for y in 0..tilemap.height {
@@ -126,18 +128,27 @@ fn spawn_tilemap(
                 continue;
             }
 
-            let color = match tile_type {
-                TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
-                TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
-                TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
-                TileType::Empty => unreachable!(),
+            let sprite = if let Some(handle) = sprite_assets.get_tile(tile_type) {
+                Sprite {
+                    image: handle.clone(),
+                    custom_size: Some(Vec2::new(ts, ts)),
+                    ..default()
+                }
+            } else {
+                let color = match tile_type {
+                    TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
+                    TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
+                    TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
+                    TileType::Empty => unreachable!(),
+                };
+                Sprite::from_color(color, Vec2::new(ts, ts))
             };
 
             commands.spawn((
                 TileEntity,
                 Tile { tile_type },
                 GridPosition { x: x as i32, y: y as i32 },
-                Sprite::from_color(color, Vec2::new(ts, ts)),
+                sprite,
                 Transform::from_xyz(
                     x as f32 * ts + ts / 2.0,
                     y as f32 * ts + ts / 2.0,

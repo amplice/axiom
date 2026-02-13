@@ -9,6 +9,7 @@ mod simulation;
 mod constraints;
 mod feel;
 mod generation;
+mod sprites;
 
 use bevy::prelude::*;
 use components::PhysicsConfig;
@@ -25,6 +26,7 @@ fn main() {
         }))
         .insert_resource(PhysicsConfig::default())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .add_plugins(sprites::SpritePlugin)
         .add_plugins(tilemap::TilemapPlugin)
         .add_plugins(player::PlayerPlugin)
         .add_plugins(physics::PhysicsPlugin)
