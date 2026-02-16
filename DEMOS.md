@@ -30,6 +30,18 @@ python demo_campaign.py --start-engine
 python demo_templates.py --start-engine
 ```
 
+Engine env vars:
+
+- `AXIOM_ASSETS_DIR` — custom asset directory for Bevy's asset loader (default: `assets`).
+  Games that live outside the engine repo use this to point at their own assets folder.
+  ```powershell
+  $env:AXIOM_ASSETS_DIR="C:\Users\you\my-game\assets"; cargo run
+  ```
+  On Linux/macOS:
+  ```bash
+  AXIOM_ASSETS_DIR=/path/to/my-game/assets cargo run
+  ```
+
 Optional engine env vars for `--start-engine`:
 
 - `AXIOM_ENGINE_CMD` (default: `cargo run -- --headless`)

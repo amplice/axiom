@@ -79,6 +79,7 @@ pub enum ApiCommand {
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
     GetScriptErrors(tokio::sync::oneshot::Sender<Vec<ScriptError>>),
+    ClearScriptErrors(tokio::sync::oneshot::Sender<()>),
     GetScriptVars(tokio::sync::oneshot::Sender<serde_json::Value>),
     SetScriptVars(
         serde_json::Value,
@@ -177,6 +178,33 @@ pub enum ApiCommand {
         f32,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
+    GetDebugInput(tokio::sync::oneshot::Sender<serde_json::Value>),
+    GetScriptLogs(tokio::sync::oneshot::Sender<Vec<crate::scripting::ScriptLogEntry>>),
+    ClearScriptLogs(tokio::sync::oneshot::Sender<()>),
+    // Gamepad
+    GetGamepadConfig(tokio::sync::oneshot::Sender<GamepadConfigResponse>),
+    SetGamepadConfig(
+        GamepadConfigRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Tween
+    SetEntityTween(
+        u64,
+        TweenRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Screen effects
+    TriggerScreenEffect(
+        ScreenEffectRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    GetScreenState(tokio::sync::oneshot::Sender<serde_json::Value>),
+    // Lighting
+    SetLightingConfig(
+        LightingConfigRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    GetLightingState(tokio::sync::oneshot::Sender<LightingStateResponse>),
 }
 
 #[derive(Resource, Default)]

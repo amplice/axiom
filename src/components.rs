@@ -316,6 +316,12 @@ pub struct Hitbox {
     pub damage_tag: String,
 }
 
+/// Marks an entity for deferred death — scripts get 1 frame to react via on_death().
+#[derive(Component)]
+pub struct PendingDeath {
+    pub frame_marked: u64,
+}
+
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformLoopMode {
@@ -375,6 +381,13 @@ pub struct AnimationController {
     pub facing_right: bool,
     #[serde(default)]
     pub auto_from_velocity: bool,
+    /// 8-direction facing index matching sprite sheet row: 0=NW,1=N,2=NE,3=E,4=SE,5=S,6=SW,7=W
+    #[serde(default = "default_facing_direction")]
+    pub facing_direction: u8,
+}
+
+fn default_facing_direction() -> u8 {
+    5 // South (facing camera)
 }
 
 fn default_true() -> bool {
@@ -534,6 +547,10 @@ impl GameConfig {
         self.gravity.length()
     }
 }
+
+/// Render layer for depth sorting. Higher layers render on top.
+#[derive(Component, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct RenderLayer(pub i32);
 
 /// Marks whether we're running in headless mode (no window/rendering)
 #[derive(Resource)]

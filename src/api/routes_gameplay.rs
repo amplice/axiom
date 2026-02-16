@@ -793,6 +793,7 @@ pub(super) async fn apply_generated_level(
             name: script.name.clone(),
             source: script.source.clone(),
             global: script.global,
+            always_run: None,
         };
         if state.sender.send(ApiCommand::LoadScript(req, tx)).is_err() {
             return Err(format!("Failed to queue script load: {}", script.name));

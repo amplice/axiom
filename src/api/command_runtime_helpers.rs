@@ -32,6 +32,7 @@ pub(super) type ExtrasQueryItem<'a> = (
     Option<&'a AiBehavior>,
     Option<&'a crate::particles::ParticleEmitter>,
     Option<&'a Invincibility>,
+    Option<&'a RenderLayer>,
 );
 
 pub(super) fn collect_save_entities(
@@ -69,6 +70,7 @@ pub(super) fn collect_save_entities(
             ai_behavior,
             particle_emitter,
             invincibility,
+            _render_layer,
         ) = match extras_query.get(entity) {
             Ok((
                 _e,
@@ -84,6 +86,7 @@ pub(super) fn collect_save_entities(
                 ai_behavior,
                 particle_emitter,
                 invincibility,
+                render_layer,
             )) => (
                 health,
                 contact,
@@ -97,9 +100,10 @@ pub(super) fn collect_save_entities(
                 ai_behavior,
                 particle_emitter,
                 invincibility,
+                render_layer,
             ),
             Err(_) => (
-                None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
             ),
         };
         let mut components = Vec::new();
@@ -217,6 +221,7 @@ pub(super) fn collect_save_entities(
                 playing: anim.playing,
                 facing_right: anim.facing_right,
                 auto_from_velocity: anim.auto_from_velocity,
+                facing_direction: anim.facing_direction,
             });
         }
         if let Some(pf) = path_follower {
@@ -239,6 +244,11 @@ pub(super) fn collect_save_entities(
             components.push(ComponentDef::ParticleEmitter {
                 emitter: emitter.clone(),
             });
+        }
+        if let Some(rl) = _render_layer {
+            if rl.0 != 0 {
+                components.push(ComponentDef::RenderLayer { layer: rl.0 });
+            }
         }
         let req = EntitySpawnRequest {
             x: pos.x,

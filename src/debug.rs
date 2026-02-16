@@ -53,6 +53,7 @@ fn setup_debug_overlay_text(mut commands: Commands, headless: Res<HeadlessMode>)
 fn update_debug_overlay_text(
     config: Res<DebugOverlayConfig>,
     perf: Res<PerfStats>,
+    script_errors: Res<crate::scripting::vm::ScriptErrors>,
     mut query: Query<(&mut Text, &mut Visibility), With<DebugOverlayText>>,
 ) {
     let Ok((mut text, mut visibility)) = query.get_single_mut() else {
@@ -63,16 +64,35 @@ fn update_debug_overlay_text(
         || config.features.contains("stats")
         || config.features.contains("fps")
         || config.features.contains("entity_count");
-    if config.show && show_stats {
+    let show_script_errors = config.features.contains("script_errors");
+    if config.show && (show_stats || show_script_errors) {
         *visibility = Visibility::Visible;
-        text.0 = format!(
-            "FPS: {:.0}\nEntities: {}\nPhysics: {:.2} ms\nScripts: {:.2} ms\nRender: {:.2} ms",
-            perf.fps,
-            perf.entity_count,
-            perf.physics_time_ms,
-            perf.script_time_ms,
-            perf.render_time_ms
-        );
+        let mut output = String::new();
+        if show_stats {
+            output = format!(
+                "FPS: {:.0}\nEntities: {}\nPhysics: {:.2} ms\nScripts: {:.2} ms\nRender: {:.2} ms",
+                perf.fps,
+                perf.entity_count,
+                perf.physics_time_ms,
+                perf.script_time_ms,
+                perf.render_time_ms
+            );
+        }
+        if show_script_errors && !script_errors.entries.is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("Script Errors:");
+            let start = script_errors.entries.len().saturating_sub(5);
+            for err in &script_errors.entries[start..] {
+                let entity_str = err
+                    .entity_id
+                    .map(|id| format!(" #{}", id))
+                    .unwrap_or_default();
+                output.push_str(&format!("\n[{}]{}: {}", err.script_name, entity_str, err.error_message));
+            }
+        }
+        text.0 = output;
     } else {
         *visibility = Visibility::Hidden;
     }
@@ -154,6 +174,7 @@ mod tests {
             .insert_resource(HeadlessMode(true))
             .insert_resource(PerfStats::default())
             .insert_resource(SpatialHash::new(64.0))
+            .insert_resource(crate::scripting::vm::ScriptErrors::default())
             .add_plugins(DebugPlugin);
         app.update();
     }

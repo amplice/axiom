@@ -41,6 +41,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
             "/debug/overlay",
             get(get_debug_overlay).post(set_debug_overlay),
         )
+        .route("/debug/input", get(get_debug_input))
         .route("/audio/sfx", post(set_audio_sfx))
         .route("/audio/music", post(set_audio_music))
         .route("/audio/play", post(play_audio))
@@ -94,6 +95,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
             get(get_entity_animation).post(set_entity_animation),
         )
         .route("/entities/{id}/particles", post(set_entity_particles))
+        .route("/entities/{id}/tween", post(tween_entity))
         .route("/events", get(get_events))
         .route("/events/subscribe", get(subscribe_events))
         .route("/perf", get(get_perf))
@@ -101,10 +103,11 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/scripts", get(list_scripts).post(upsert_script))
         .route("/scripts/{name}", get(get_script).delete(delete_script))
         .route("/scripts/{name}/test", post(test_named_script))
-        .route("/scripts/errors", get(get_script_errors))
+        .route("/scripts/errors", get(get_script_errors).delete(clear_script_errors))
         .route("/scripts/vars", get(get_script_vars).post(set_script_vars))
         .route("/scripts/events", get(get_script_events))
         .route("/scripts/stats", get(get_script_stats))
+        .route("/scripts/logs", get(get_script_logs).delete(clear_script_logs))
         .route("/animations", get(list_animation_graphs))
         .route(
             "/animations/{name}",
@@ -113,6 +116,17 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
                 .delete(delete_animation_graph),
         )
         .route("/animations/state", get(get_animation_states))
+        .route(
+            "/input/gamepad",
+            get(get_gamepad_config).post(set_gamepad_config),
+        )
+        .route("/screen/effect", post(trigger_screen_effect))
+        .route("/screen/state", get(get_screen_state))
+        .route(
+            "/lighting/config",
+            post(set_lighting_config),
+        )
+        .route("/lighting/state", get(get_lighting_state))
         .route("/docs", get(get_docs))
         .route("/docs/html", get(get_docs_html))
         .route("/docs/endpoints", get(get_docs_endpoints))

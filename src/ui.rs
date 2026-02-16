@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::components::HeadlessMode;
 use crate::events::GameEventBus;
 
 fn default_visible() -> bool {
@@ -109,6 +110,8 @@ pub struct UiStateSnapshot {
 pub struct UiManager {
     pub screens: HashMap<String, UiScreen>,
     pub dialogue_active: bool,
+    /// Bumped on every mutation so the rendering system knows when to re-sync.
+    pub generation: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -174,6 +177,7 @@ impl UiManager {
             screen.visible = existing.visible;
         }
         self.screens.insert(screen.name.clone(), screen);
+        self.generation += 1;
     }
 
     pub fn show_screen(&mut self, name: &str) -> Result<(), String> {
@@ -181,6 +185,7 @@ impl UiManager {
             return Err(format!("Unknown screen: {name}"));
         };
         screen.visible = true;
+        self.generation += 1;
         Ok(())
     }
 
@@ -189,6 +194,7 @@ impl UiManager {
             return Err(format!("Unknown screen: {name}"));
         };
         screen.visible = false;
+        self.generation += 1;
         Ok(())
     }
 
@@ -207,6 +213,7 @@ impl UiManager {
             ));
         };
         apply_node_update(node, update);
+        self.generation += 1;
         Ok(())
     }
 
@@ -214,6 +221,7 @@ impl UiManager {
         for screen in self.screens.values_mut() {
             if let Some(node) = find_node_mut(&mut screen.nodes, node_id) {
                 apply_node_update(node, update);
+                self.generation += 1;
                 return true;
             }
         }
@@ -395,6 +403,28 @@ struct UiEventCursor {
     last_frame: u64,
 }
 
+// === Bevy UI rendering bridge ===
+
+#[derive(Component)]
+struct UiRootMarker;
+
+#[derive(Component)]
+struct UiScreenMarker(#[allow(dead_code)] String);
+
+#[derive(Component)]
+#[allow(dead_code)]
+struct UiNodeMarker {
+    screen: String,
+    node_id: String,
+}
+
+#[derive(Component)]
+#[allow(dead_code)]
+struct UiProgressFill {
+    screen: String,
+    node_id: String,
+}
+
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
@@ -402,7 +432,8 @@ impl Plugin for UiPlugin {
         app.insert_resource(UiManager::default())
             .insert_resource(DialogueManager::default())
             .insert_resource(UiEventCursor::default())
-            .add_systems(Update, apply_ui_events);
+            .add_systems(Update, apply_ui_events)
+            .add_systems(Update, sync_ui_to_bevy.after(apply_ui_events));
     }
 }
 
@@ -486,6 +517,361 @@ fn apply_ui_events(
         }
     }
     cursor.last_frame = newest;
+}
+
+/// Creates / updates actual Bevy UI entities from `UiManager` data so UI is visible
+/// in windowed mode. Uses a generation counter to avoid unnecessary work.
+fn sync_ui_to_bevy(
+    mut commands: Commands,
+    headless: Res<HeadlessMode>,
+    ui: Res<UiManager>,
+    mut last_gen: Local<u64>,
+    root_query: Query<Entity, With<UiRootMarker>>,
+    screen_query: Query<(Entity, &UiScreenMarker)>,
+) {
+    if headless.0 {
+        return;
+    }
+    if ui.generation == *last_gen {
+        return;
+    }
+    *last_gen = ui.generation;
+
+    // Despawn all existing screen entities (full rebuild on change).
+    for (entity, _) in screen_query.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+
+    // Ensure a UI root exists.
+    let root = if let Ok(entity) = root_query.get_single() {
+        entity
+    } else {
+        commands
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    position_type: PositionType::Absolute,
+                    ..default()
+                },
+                UiRootMarker,
+                // Transparent background - don't block game view
+                GlobalZIndex(100),
+                PickingBehavior::IGNORE,
+            ))
+            .id()
+    };
+
+    // Sort screens by layer for z-ordering.
+    let mut screens: Vec<&UiScreen> = ui.screens.values().collect();
+    screens.sort_by_key(|s| s.layer);
+
+    for screen in screens {
+        if !screen.visible {
+            continue;
+        }
+        let screen_entity = commands
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    position_type: PositionType::Absolute,
+                    ..default()
+                },
+                UiScreenMarker(screen.name.clone()),
+                PickingBehavior::IGNORE,
+            ))
+            .set_parent(root)
+            .id();
+
+        for node in &screen.nodes {
+            spawn_ui_node(&mut commands, screen_entity, &screen.name, node);
+        }
+    }
+}
+
+fn spawn_ui_node(
+    commands: &mut Commands,
+    parent: Entity,
+    screen_name: &str,
+    node: &UiNode,
+) {
+    if !node.visible {
+        return;
+    }
+
+    match &node.node_type {
+        UiNodeType::Text {
+            text,
+            font_size,
+            color,
+            ..
+        } => {
+            let mut style = parse_position(&node.position);
+            apply_size(&mut style, &node.size);
+            commands
+                .spawn((
+                    Text::new(text.clone()),
+                    TextFont {
+                        font_size: font_size.unwrap_or(16.0),
+                        ..default()
+                    },
+                    TextColor(parse_color(color.as_deref().unwrap_or("white"))),
+                    style,
+                    UiNodeMarker {
+                        screen: screen_name.to_string(),
+                        node_id: node.id.clone(),
+                    },
+                    PickingBehavior::IGNORE,
+                ))
+                .set_parent(parent);
+        }
+        UiNodeType::ProgressBar {
+            value,
+            max,
+            color,
+            bg_color,
+        } => {
+            let pct = if *max > 0.0 {
+                (value / max * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let mut style = parse_position(&node.position);
+            let (w, h) = parse_size_wh(&node.size, 120.0, 14.0);
+            style.width = Val::Px(w);
+            style.height = Val::Px(h);
+
+            let bg = parse_color(bg_color.as_deref().unwrap_or("dark_red"));
+            let fg = parse_color(color.as_deref().unwrap_or("green"));
+
+            commands
+                .spawn((
+                    style,
+                    BackgroundColor(bg),
+                    UiNodeMarker {
+                        screen: screen_name.to_string(),
+                        node_id: node.id.clone(),
+                    },
+                    PickingBehavior::IGNORE,
+                ))
+                .set_parent(parent)
+                .with_children(|builder| {
+                    builder.spawn((
+                        Node {
+                            width: Val::Percent(pct),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                        BackgroundColor(fg),
+                        UiProgressFill {
+                            screen: screen_name.to_string(),
+                            node_id: node.id.clone(),
+                        },
+                        PickingBehavior::IGNORE,
+                    ));
+                });
+        }
+        UiNodeType::Panel { color } => {
+            let mut style = parse_position(&node.position);
+            apply_size(&mut style, &node.size);
+            let bg = parse_color(color.as_deref().unwrap_or("gray"));
+
+            let panel = commands
+                .spawn((
+                    style,
+                    BackgroundColor(bg),
+                    UiNodeMarker {
+                        screen: screen_name.to_string(),
+                        node_id: node.id.clone(),
+                    },
+                    PickingBehavior::IGNORE,
+                ))
+                .set_parent(parent)
+                .id();
+
+            for child in &node.children {
+                spawn_ui_node(commands, panel, screen_name, child);
+            }
+        }
+        UiNodeType::Container { direction, gap } => {
+            let mut style = parse_position(&node.position);
+            apply_size(&mut style, &node.size);
+            style.flex_direction = match direction.as_deref() {
+                Some("row") | Some("horizontal") => FlexDirection::Row,
+                _ => FlexDirection::Column,
+            };
+            if let Some(g) = gap {
+                style.row_gap = Val::Px(*g);
+                style.column_gap = Val::Px(*g);
+            }
+
+            let container = commands
+                .spawn((
+                    style,
+                    UiNodeMarker {
+                        screen: screen_name.to_string(),
+                        node_id: node.id.clone(),
+                    },
+                    PickingBehavior::IGNORE,
+                ))
+                .set_parent(parent)
+                .id();
+
+            for child in &node.children {
+                spawn_ui_node(commands, container, screen_name, child);
+            }
+        }
+        // Unsupported node types are silently ignored for now.
+        _ => {}
+    }
+}
+
+// === Position / size / color helpers ===
+
+fn parse_position(val: &serde_json::Value) -> Node {
+    let mut style = Node::default();
+
+    let anchored = val.get("Anchored").or_else(|| val.get("anchored"));
+    let Some(obj) = anchored else {
+        return style;
+    };
+
+    style.position_type = PositionType::Absolute;
+
+    let anchor = obj
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("top_left");
+    let offset = obj.get("offset").and_then(|v| v.as_array());
+    let (ox, oy) = if let Some(arr) = offset {
+        (
+            arr.first()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32,
+            arr.get(1)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    match anchor {
+        "top_left" => {
+            style.left = Val::Px(ox);
+            style.top = Val::Px(oy);
+        }
+        "top_right" => {
+            style.right = Val::Px(-ox);
+            style.top = Val::Px(oy);
+        }
+        "bottom_left" => {
+            style.left = Val::Px(ox);
+            style.bottom = Val::Px(-oy);
+        }
+        "bottom_right" => {
+            style.right = Val::Px(-ox);
+            style.bottom = Val::Px(-oy);
+        }
+        "top_center" => {
+            style.left = Val::Percent(50.0);
+            style.top = Val::Px(oy);
+            style.margin = UiRect {
+                left: Val::Px(ox),
+                ..default()
+            };
+        }
+        "bottom_center" => {
+            style.left = Val::Percent(50.0);
+            style.bottom = Val::Px(-oy);
+            style.margin = UiRect {
+                left: Val::Px(ox),
+                ..default()
+            };
+        }
+        "center" => {
+            style.left = Val::Percent(50.0);
+            style.top = Val::Percent(50.0);
+            style.margin = UiRect {
+                left: Val::Px(ox),
+                top: Val::Px(oy),
+                ..default()
+            };
+        }
+        _ => {
+            style.left = Val::Px(ox);
+            style.top = Val::Px(oy);
+        }
+    }
+
+    style
+}
+
+fn apply_size(style: &mut Node, val: &serde_json::Value) {
+    let (w, h) = parse_size_raw(val);
+    if let Some(w) = w {
+        style.width = Val::Px(w);
+    }
+    if let Some(h) = h {
+        style.height = Val::Px(h);
+    }
+}
+
+fn parse_size_raw(val: &serde_json::Value) -> (Option<f32>, Option<f32>) {
+    if let Some(arr) = val.get("fixed").and_then(|v| v.as_array()) {
+        let w = arr.first().and_then(|v| v.as_f64()).map(|v| v as f32);
+        let h = arr.get(1).and_then(|v| v.as_f64()).map(|v| v as f32);
+        return (w, h);
+    }
+    (None, None)
+}
+
+fn parse_size_wh(val: &serde_json::Value, default_w: f32, default_h: f32) -> (f32, f32) {
+    let (w, h) = parse_size_raw(val);
+    (w.unwrap_or(default_w), h.unwrap_or(default_h))
+}
+
+fn parse_color(name: &str) -> Color {
+    // Try hex first
+    if let Some(hex) = name.strip_prefix('#') {
+        if let Some(c) = parse_hex_color(hex) {
+            return c;
+        }
+    }
+    match name {
+        "white" => Color::WHITE,
+        "black" => Color::BLACK,
+        "red" => Color::srgb(1.0, 0.2, 0.2),
+        "green" => Color::srgb(0.2, 1.0, 0.2),
+        "blue" => Color::srgb(0.2, 0.4, 1.0),
+        "yellow" => Color::srgb(1.0, 1.0, 0.2),
+        "dark_red" => Color::srgb(0.3, 0.1, 0.1),
+        "dark_green" => Color::srgb(0.1, 0.3, 0.1),
+        "gray" | "grey" => Color::srgb(0.5, 0.5, 0.5),
+        _ => Color::WHITE,
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect();
+    match bytes.len() {
+        3 => Some(Color::srgb(
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+        )),
+        4 => Some(Color::srgba(
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+            bytes[3] as f32 / 255.0,
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

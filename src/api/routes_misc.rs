@@ -172,6 +172,21 @@ pub(super) async fn get_script_errors(
     }
 }
 
+pub(super) async fn clear_script_errors(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ClearScriptErrors(tx));
+    match rx.await {
+        Ok(()) => Json(ApiResponse::success(())),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
 pub(super) async fn get_script_vars(
     State(state): State<AppState>,
 ) -> Json<ApiResponse<serde_json::Value>> {
@@ -207,6 +222,51 @@ pub(super) async fn get_script_events(
     let _ = state.sender.send(ApiCommand::GetScriptEvents(tx));
     match rx.await {
         Ok(items) => Json(ApiResponse::success(items)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn get_debug_input(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetDebugInput(tx));
+    match rx.await {
+        Ok(data) => Json(ApiResponse::success(data)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn get_script_logs(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<crate::scripting::ScriptLogEntry>>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetScriptLogs(tx));
+    match rx.await {
+        Ok(entries) => Json(ApiResponse::success(entries)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn clear_script_logs(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ClearScriptLogs(tx));
+    match rx.await {
+        Ok(()) => Json(ApiResponse::success(())),
         Err(_) => Json(ApiResponse {
             ok: false,
             data: None,
@@ -940,4 +1000,110 @@ fn build_tile_summary(tiles: &[u8]) -> serde_json::Value {
         "slope_down": slope_down,
         "ladder": ladder,
     })
+}
+
+// === Gamepad ===
+
+pub(super) async fn get_gamepad_config(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<GamepadConfigResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetGamepadConfig(tx));
+    match rx.await {
+        Ok(cfg) => Json(ApiResponse::success(cfg)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn set_gamepad_config(
+    State(state): State<AppState>,
+    Json(req): Json<GamepadConfigRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetGamepadConfig(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Tween ===
+
+pub(super) async fn tween_entity(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<TweenRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityTween(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Screen Effects ===
+
+pub(super) async fn trigger_screen_effect(
+    State(state): State<AppState>,
+    Json(req): Json<ScreenEffectRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::TriggerScreenEffect(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn get_screen_state(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetScreenState(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Lighting ===
+
+pub(super) async fn set_lighting_config(
+    State(state): State<AppState>,
+    Json(req): Json<LightingConfigRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetLightingConfig(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn get_lighting_state(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<LightingStateResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetLightingState(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
 }

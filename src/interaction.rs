@@ -711,26 +711,40 @@ fn invincibility_system(mut commands: Commands, mut query: Query<(Entity, &mut I
 fn death_system(
     mut commands: Commands,
     tilemap: Res<Tilemap>,
+    frame: Res<crate::scripting::vm::ScriptFrame>,
     mut query: Query<(
         Entity,
         &mut GamePosition,
         &mut Velocity,
         &mut Alive,
+        Option<&mut Health>,
         Option<&Player>,
+        Option<&PendingDeath>,
     )>,
 ) {
-    for (entity, mut pos, mut vel, mut alive, player) in query.iter_mut() {
+    for (entity, mut pos, mut vel, mut alive, health, player, pending) in query.iter_mut() {
         if alive.0 {
             continue;
         }
+        // Already marked for deferred death — skip
+        if pending.is_some() {
+            continue;
+        }
         if player.is_some() {
+            // Respawn player at spawn point with full health
             pos.x = tilemap.player_spawn.0;
             pos.y = tilemap.player_spawn.1;
             vel.x = 0.0;
             vel.y = 0.0;
+            if let Some(mut health) = health {
+                health.current = health.max;
+            }
             alive.0 = true;
         } else {
-            commands.entity(entity).despawn();
+            // Mark for deferred death so scripts can react via on_death()
+            commands.entity(entity).insert(PendingDeath {
+                frame_marked: frame.frame,
+            });
         }
     }
 }

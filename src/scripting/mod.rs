@@ -6,6 +6,7 @@ pub mod vm;
 #[path = "vm_wasm.rs"]
 pub mod vm;
 
+use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +46,32 @@ pub struct ScriptRuntimeSnapshot {
     pub scripts: HashMap<String, String>,
     pub global_scripts: HashSet<String>,
     pub vars: HashMap<String, serde_json::Value>,
+}
+
+const MAX_SCRIPT_LOG_ENTRIES: usize = 500;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ScriptLogEntry {
+    pub level: String,
+    pub message: String,
+    pub script_name: String,
+    pub frame: u64,
+    pub entity_id: Option<u64>,
+}
+
+#[derive(Resource, Default)]
+pub struct ScriptLogBuffer {
+    pub entries: Vec<ScriptLogEntry>,
+}
+
+impl ScriptLogBuffer {
+    pub fn push(&mut self, entry: ScriptLogEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > MAX_SCRIPT_LOG_ENTRIES {
+            let excess = self.entries.len() - MAX_SCRIPT_LOG_ENTRIES;
+            self.entries.drain(0..excess);
+        }
+    }
 }
 
 pub trait ScriptBackend: Send + Sync {

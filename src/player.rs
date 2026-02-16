@@ -58,6 +58,7 @@ fn spawn_player(
             playing: true,
             facing_right: true,
             auto_from_velocity: true,
+            facing_direction: 5,
         },
         Transform::from_xyz(sx, sy, 10.0),
     ));

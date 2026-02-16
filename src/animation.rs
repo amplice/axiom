@@ -173,10 +173,21 @@ fn drive_animation_state_from_velocity(
         if !anim.auto_from_velocity {
             continue;
         }
-        if vel.x > 1.0 {
-            anim.facing_right = true;
-        } else if vel.x < -1.0 {
-            anim.facing_right = false;
+        // Compute 8-way facing direction from velocity
+        let speed_sq = vel.x * vel.x + vel.y * vel.y;
+        if speed_sq > 1.0 {
+            let angle = vel.y.atan2(vel.x); // radians, 0=E, pi/2=N, -pi/2=S
+            // Quantize to 8 sectors (45° each, offset by 22.5°)
+            let sector = ((angle + std::f32::consts::PI + std::f32::consts::FRAC_PI_8)
+                / std::f32::consts::FRAC_PI_4) as u8
+                % 8;
+            // Sector 0=W, 1=NW, 2=N, 3=NE, 4=E, 5=SE, 6=S, 7=SW
+            // Map to row (sprite sheets are X-mirrored):
+            // Row 0=NE, 1=N, 2=NW, 3=W, 4=SW, 5=S, 6=SE, 7=E
+            const SECTOR_TO_ROW: [u8; 8] = [3, 2, 1, 0, 7, 6, 5, 4];
+            anim.facing_direction = SECTOR_TO_ROW[sector as usize];
+            // Update facing_right for backward compat (E, NE, SE)
+            anim.facing_right = matches!(anim.facing_direction, 0 | 7 | 6);
         }
         let Some(graph) = library.graphs.get(&anim.graph) else {
             continue;
@@ -185,7 +196,7 @@ fn drive_animation_state_from_velocity(
             "jump"
         } else if vel.y < -1.0 && graph.states.contains_key("fall") {
             "fall"
-        } else if vel.x.abs() > 1.0 && graph.states.contains_key("run") {
+        } else if speed_sq > 1.0 && graph.states.contains_key("run") {
             "run"
         } else if graph.states.contains_key("idle") {
             "idle"
@@ -385,6 +396,7 @@ mod tests {
             playing: true,
             facing_right: true,
             auto_from_velocity: false,
+            facing_direction: 5,
         });
         {
             let mut lib = world.resource_mut::<AnimationLibrary>();
@@ -441,6 +453,7 @@ mod tests {
                 speed: 1.0,
                 playing: true,
                 facing_right: true,
+                facing_direction: 5,
                 auto_from_velocity: false,
             },
         ));
@@ -518,6 +531,7 @@ mod tests {
             playing: true,
             facing_right: true,
             auto_from_velocity: false,
+            facing_direction: 5,
         });
         world.spawn((
             NetworkId(42),
@@ -529,6 +543,7 @@ mod tests {
                 speed: 1.0,
                 playing: true,
                 facing_right: false,
+                facing_direction: 5,
                 auto_from_velocity: false,
             },
         ));

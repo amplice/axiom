@@ -10,17 +10,34 @@ impl Plugin for SpritePlugin {
         app.insert_resource(SpriteAssets::default())
             .insert_resource(SpriteSheetRegistry::default())
             .insert_resource(PlayerAnimations::default())
+            .insert_resource(SpriteSheetRenderCache::default())
             .add_systems(PreStartup, init_sprites)
-            .add_systems(PostStartup, setup_player_sprite)
-            .add_systems(Update, apply_player_animation_from_controller);
+            .add_systems(
+                Update,
+                (
+                    setup_player_sprite,
+                    sync_sprite_sheet_cache,
+                    ensure_sprite_for_sheet_entities,
+                    apply_sprite_sheet_rendering,
+                    apply_player_animation_from_controller,
+                )
+                    .chain(),
+            );
     }
 }
 
-/// After player is spawned, add AnimationState and set up sprite from loaded animations
+/// When a Player entity exists without AnimationController, set up its sprite.
+/// Runs every frame so it picks up API-spawned players (not just startup-spawned).
 fn setup_player_sprite(
     mut commands: Commands,
     player_anims: Res<PlayerAnimations>,
-    query: Query<Entity, With<crate::components::Player>>,
+    query: Query<
+        Entity,
+        (
+            With<crate::components::Player>,
+            Without<crate::components::AnimationController>,
+        ),
+    >,
 ) {
     let Ok(entity) = query.get_single() else {
         return;
@@ -35,6 +52,7 @@ fn setup_player_sprite(
         playing: true,
         facing_right: true,
         auto_from_velocity: true,
+        facing_direction: 5,
     });
     // If samurai sprites loaded, set up the initial sprite
     if let Some(ref idle_data) = player_anims.idle {
@@ -93,6 +111,8 @@ pub struct SpriteManifest {
 #[derive(Resource, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SpriteSheetRegistry {
     pub sheets: HashMap<String, SpriteSheetDef>,
+    #[serde(skip)]
+    pub version: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -101,12 +121,22 @@ pub struct SpriteSheetDef {
     pub frame_width: u32,
     pub frame_height: u32,
     pub columns: u32,
+    #[serde(default = "default_one_u32")]
+    pub rows: u32,
     #[serde(default)]
     pub animations: HashMap<String, SpriteSheetAnimationDef>,
+    #[serde(default)]
+    pub direction_map: Option<Vec<u8>>,
+}
+
+fn default_one_u32() -> u32 {
+    1
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpriteSheetAnimationDef {
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub frames: Vec<usize>,
     pub fps: f32,
@@ -120,6 +150,23 @@ pub struct SpriteSheetAnimationDef {
 
 fn default_true() -> bool {
     true
+}
+
+/// Cached texture + atlas layout for a specific sprite sheet (or per-animation override).
+struct CachedSheetEntry {
+    texture: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
+/// Runtime cache that bridges SpriteSheetRegistry (data) to actual Bevy texture handles.
+#[derive(Resource, Default)]
+pub struct SpriteSheetRenderCache {
+    /// Key: (sheet_name, anim_state) for per-animation paths, or (sheet_name, "") for sheet-level fallback
+    entries: HashMap<(String, String), CachedSheetEntry>,
+    /// Track which sheet names we've already loaded so we only load once
+    loaded_sheets: std::collections::HashSet<String>,
+    /// Last registry version we synced from
+    last_synced_version: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -222,7 +269,152 @@ fn load_samurai_sprites(
     });
 }
 
+/// Insert a default Sprite on entities that have AnimationController with a registered
+/// sprite sheet graph but no Sprite component yet. Without this, the rendering system
+/// can't write texture/atlas data (it queries for `&mut Sprite`).
+fn ensure_sprite_for_sheet_entities(
+    mut commands: Commands,
+    registry: Res<SpriteSheetRegistry>,
+    query: Query<
+        (Entity, &crate::components::AnimationController),
+        Without<Sprite>,
+    >,
+) {
+    for (entity, anim) in query.iter() {
+        if registry.sheets.contains_key(&anim.graph) {
+            commands.entity(entity).insert(Sprite {
+                color: Color::WHITE,
+                ..default()
+            });
+        }
+    }
+}
+
+/// Sync SpriteSheetRegistry into the render cache: load textures + create atlas layouts.
+fn sync_sprite_sheet_cache(
+    registry: Res<SpriteSheetRegistry>,
+    asset_server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    mut cache: ResMut<SpriteSheetRenderCache>,
+) {
+    if registry.version != cache.last_synced_version {
+        cache.loaded_sheets.clear();
+        cache.entries.clear();
+        cache.last_synced_version = registry.version;
+    }
+    for (name, sheet) in &registry.sheets {
+        if cache.loaded_sheets.contains(name) {
+            continue;
+        }
+        cache.loaded_sheets.insert(name.clone());
+        let frame_size = UVec2::new(sheet.frame_width, sheet.frame_height);
+
+        // Load the sheet-level fallback texture + layout
+        let texture: Handle<Image> = asset_server.load(&sheet.path);
+        let layout = TextureAtlasLayout::from_grid(
+            frame_size,
+            sheet.columns,
+            sheet.rows,
+            None,
+            None,
+        );
+        let layout_handle = atlas_layouts.add(layout);
+        cache.entries.insert(
+            (name.clone(), String::new()),
+            CachedSheetEntry {
+                texture,
+                layout: layout_handle,
+            },
+        );
+
+        // Load per-animation override textures (separate PNG per animation state)
+        for (anim_name, anim_def) in &sheet.animations {
+            if let Some(ref anim_path) = anim_def.path {
+                if anim_path != &sheet.path {
+                    let anim_texture: Handle<Image> = asset_server.load(anim_path);
+                    let anim_layout = TextureAtlasLayout::from_grid(
+                        frame_size,
+                        sheet.columns,
+                        sheet.rows,
+                        None,
+                        None,
+                    );
+                    let anim_layout_handle = atlas_layouts.add(anim_layout);
+                    cache.entries.insert(
+                        (name.clone(), anim_name.clone()),
+                        CachedSheetEntry {
+                            texture: anim_texture,
+                            layout: anim_layout_handle,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Render entities that have AnimationController graphs registered in SpriteSheetRegistry.
+fn apply_sprite_sheet_rendering(
+    registry: Res<SpriteSheetRegistry>,
+    cache: Res<SpriteSheetRenderCache>,
+    library: Option<Res<crate::animation::AnimationLibrary>>,
+    mut query: Query<(&mut Sprite, &crate::components::AnimationController)>,
+) {
+    for (mut sprite, anim) in query.iter_mut() {
+        let Some(sheet) = registry.sheets.get(&anim.graph) else {
+            continue; // Not a registered sprite sheet, skip (handled by samurai fallback)
+        };
+
+        // Resolve per-animation texture or fall back to sheet-level
+        let entry = cache
+            .entries
+            .get(&(anim.graph.clone(), anim.state.clone()))
+            .or_else(|| cache.entries.get(&(anim.graph.clone(), String::new())));
+
+        let Some(entry) = entry else {
+            continue;
+        };
+
+        // Compute the frame index within the animation
+        let render_frame = library
+            .as_ref()
+            .and_then(|lib| lib.graphs.get(&anim.graph))
+            .and_then(|graph| graph.states.get(&anim.state))
+            .map(|clip| crate::animation::resolve_clip_frame(clip, anim.frame))
+            .unwrap_or(anim.frame % sheet.columns.max(1) as usize);
+
+        // Compute atlas index: for multi-row sheets, row = facing_direction (or mapped via direction_map)
+        let atlas_index = if sheet.rows > 1 {
+            let row = if let Some(ref map) = sheet.direction_map {
+                *map.get(anim.facing_direction as usize).unwrap_or(&anim.facing_direction) as u32
+            } else {
+                anim.facing_direction as u32
+            };
+            let dir = row.min(sheet.rows - 1);
+            (dir * sheet.columns + render_frame as u32) as usize
+        } else {
+            render_frame
+        };
+
+        sprite.image = entry.texture.clone();
+        sprite.color = Color::WHITE; // Clear any tint from fallback sprites
+        sprite.texture_atlas = Some(TextureAtlas {
+            layout: entry.layout.clone(),
+            index: atlas_index,
+        });
+        // Display at full frame size — character body (~30% of cell) scales with world
+        let display_size = sheet.frame_width.max(sheet.frame_height) as f32;
+        sprite.custom_size = Some(Vec2::new(display_size, display_size));
+        sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.15));
+        // Don't flip for 8-directional sprites
+        if sheet.rows > 1 {
+            sprite.flip_x = false;
+        }
+    }
+}
+
 fn apply_player_animation_from_controller(
+    registry: Res<SpriteSheetRegistry>,
     player_anims: Res<PlayerAnimations>,
     library: Option<Res<crate::animation::AnimationLibrary>>,
     mut query: Query<
@@ -231,6 +423,10 @@ fn apply_player_animation_from_controller(
     >,
 ) {
     for (mut sprite, anim) in query.iter_mut() {
+        // Skip if this player is using a registered sprite sheet (handled by apply_sprite_sheet_rendering)
+        if registry.sheets.contains_key(&anim.graph) {
+            continue;
+        }
         let anim_data = match anim.state.as_str() {
             "run" => player_anims.run.as_ref(),
             "attack" => player_anims.attack.as_ref(),

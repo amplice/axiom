@@ -226,6 +226,7 @@ pub fn spawn_entity_with_network_id(
                 playing,
                 facing_right,
                 auto_from_velocity,
+                facing_direction,
             } => {
                 entity.insert(AnimationController {
                     graph: graph.clone(),
@@ -236,6 +237,7 @@ pub fn spawn_entity_with_network_id(
                     playing: *playing,
                     facing_right: *facing_right,
                     auto_from_velocity: *auto_from_velocity,
+                    facing_direction: *facing_direction,
                 });
             }
             ComponentDef::PathFollower {
@@ -322,6 +324,20 @@ pub fn spawn_entity_with_network_id(
             }
             ComponentDef::ParticleEmitter { emitter } => {
                 entity.insert(emitter.clone());
+            }
+            ComponentDef::RenderLayer { layer } => {
+                entity.insert(RenderLayer(*layer));
+            }
+            ComponentDef::PointLight {
+                radius,
+                intensity,
+                color,
+            } => {
+                entity.insert(crate::lighting::PointLight2d {
+                    color: *color,
+                    intensity: *intensity,
+                    radius: *radius,
+                });
             }
         }
     }
@@ -784,6 +800,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
                     playing: true,
                     facing_right: true,
                     auto_from_velocity: true,
+                    facing_direction: 5,
                 },
             ],
         },
@@ -818,6 +835,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
                     playing: true,
                     facing_right: true,
                     auto_from_velocity: true,
+                    facing_direction: 5,
                 },
             ],
         },
@@ -869,6 +887,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
                     playing: true,
                     facing_right: true,
                     auto_from_velocity: true,
+                    facing_direction: 5,
                 },
             ],
         },
@@ -924,6 +943,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
                     playing: true,
                     facing_right: true,
                     auto_from_velocity: true,
+                    facing_direction: 5,
                 },
             ],
         },

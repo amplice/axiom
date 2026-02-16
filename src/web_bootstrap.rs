@@ -269,6 +269,8 @@ enum EmbeddedComponentDef {
         facing_right: bool,
         #[serde(default)]
         auto_from_velocity: bool,
+        #[serde(default = "default_facing_direction")]
+        facing_direction: u8,
     },
     #[serde(rename = "path_follower")]
     PathFollower {
@@ -557,6 +559,11 @@ fn default_f32_one() -> f32 {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn default_facing_direction() -> u8 {
+    5
+}
+
+#[cfg(target_arch = "wasm32")]
 fn default_player_tag() -> String {
     "player".to_string()
 }
@@ -733,6 +740,7 @@ fn apply_embedded_component_wasm(entity: &mut EntityCommands, component: Embedde
             playing,
             facing_right,
             auto_from_velocity,
+            facing_direction,
         } => {
             entity.insert(crate::components::AnimationController {
                 graph,
@@ -743,6 +751,7 @@ fn apply_embedded_component_wasm(entity: &mut EntityCommands, component: Embedde
                 playing,
                 facing_right,
                 auto_from_velocity,
+                facing_direction,
             });
         }
         EmbeddedComponentDef::PathFollower {

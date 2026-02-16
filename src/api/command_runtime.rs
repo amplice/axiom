@@ -118,6 +118,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 ai_behavior,
                 particle_emitter,
                 _invincibility,
+                render_layer,
             )) => EntityInfoExtras {
                 health_current: health.map(|h| h.current),
                 health_max: health.map(|h| h.max),
@@ -143,6 +144,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 animation_state: animation_controller.map(|a| a.state.clone()),
                 animation_frame: animation_controller.map(|a| a.frame),
                 animation_facing_right: animation_controller.map(|a| a.facing_right),
+                render_layer: render_layer.map(|r| r.0),
             },
             Err(_) => EntityInfoExtras::default(),
         }
@@ -347,6 +349,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     sheet_anims.insert(
                         state_name.clone(),
                         crate::sprites::SpriteSheetAnimationDef {
+                            path: anim.path.clone(),
                             frames,
                             fps: anim.fps.max(0.001),
                             looping: anim.looping,
@@ -387,7 +390,9 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     frame_width: req.frame_width,
                     frame_height: req.frame_height,
                     columns: req.columns,
+                    rows: req.rows.max(1),
                     animations: sheet_anims,
+                    direction_map: req.direction_map,
                 };
                 let graph = crate::animation::AnimationGraphDef {
                     default_state,
@@ -403,6 +408,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                             return;
                         };
                         registry.sheets.insert(name.clone(), sheet);
+                        registry.version += 1;
                     }
                     {
                         let Some(mut library) =
@@ -557,6 +563,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                             _ai_behavior,
                             _particle_emitter,
                             _invincibility,
+                            _render_layer,
                         )| {
                             animation_controller.map(|anim| {
                                 crate::animation::AnimationEntityState {
@@ -778,12 +785,24 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
             }
             ApiCommand::LoadScript(req, tx) => {
                 let script_name = req.name.clone();
+                let always_run = req.always_run.unwrap_or(false);
+                // Clear old errors for this script on re-upload
+                script_errors
+                    .entries
+                    .retain(|e| e.script_name != script_name);
                 let result = crate::scripting::ScriptBackend::load_script(
                     &mut *script_engine,
-                    req.name,
+                    req.name.clone(),
                     req.source,
                     req.global,
                 );
+                if result.is_ok() {
+                    if always_run {
+                        script_engine.always_run_scripts.insert(req.name.clone());
+                    } else {
+                        script_engine.always_run_scripts.remove(&req.name);
+                    }
+                }
                 if let Err(err) = &result {
                     script_errors.push(ScriptError {
                         script_name,
@@ -813,6 +832,10 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
             }
             ApiCommand::GetScriptErrors(tx) => {
                 let _ = tx.send(script_errors.entries.clone());
+            }
+            ApiCommand::ClearScriptErrors(tx) => {
+                script_errors.entries.clear();
+                let _ = tx.send(());
             }
             ApiCommand::GetScriptVars(tx) => {
                 let _ = tx.send(
@@ -1093,13 +1116,20 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         camera_config.deadzone =
                             Vec2::new(deadzone[0].max(0.0), deadzone[1].max(0.0));
                     }
-                    if let Some(bounds) = req.bounds {
-                        camera_config.bounds = Some(crate::camera::CameraBounds {
-                            min_x: bounds.min_x,
-                            max_x: bounds.max_x,
-                            min_y: bounds.min_y,
-                            max_y: bounds.max_y,
-                        });
+                    if let Some(bounds_opt) = req.bounds {
+                        match bounds_opt {
+                            CameraBoundsOption::Clear(_) => {
+                                camera_config.bounds = None;
+                            }
+                            CameraBoundsOption::Set(bounds) => {
+                                camera_config.bounds = Some(crate::camera::CameraBounds {
+                                    min_x: bounds.min_x,
+                                    max_x: bounds.max_x,
+                                    min_y: bounds.min_y,
+                                    max_y: bounds.max_y,
+                                });
+                            }
+                        }
                     }
                     if let Some(look_at) = req.look_at {
                         camera_config.look_at = Some(Vec2::new(look_at[0], look_at[1]));
@@ -1349,6 +1379,118 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Ok(()));
                 });
             }
+            ApiCommand::GetDebugInput(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let vinput = world
+                        .get_resource::<crate::input::VirtualInput>()
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut active: Vec<String> = vinput.active.into_iter().collect();
+                    active.sort();
+                    let mut just_pressed: Vec<String> = vinput.just_pressed.into_iter().collect();
+                    just_pressed.sort();
+                    let mut just_released: Vec<String> = vinput.just_released.into_iter().collect();
+                    just_released.sort();
+                    let mouse = world
+                        .get_resource::<crate::input::MouseInput>()
+                        .cloned()
+                        .unwrap_or_default();
+                    let _ = tx.send(serde_json::json!({
+                        "active": active,
+                        "just_pressed": just_pressed,
+                        "just_released": just_released,
+                        "mouse": {
+                            "screen_x": mouse.screen_x,
+                            "screen_y": mouse.screen_y,
+                            "world_x": mouse.world_x,
+                            "world_y": mouse.world_y,
+                            "left": mouse.left,
+                            "right": mouse.right,
+                            "middle": mouse.middle,
+                            "left_just_pressed": mouse.left_just_pressed,
+                            "right_just_pressed": mouse.right_just_pressed,
+                        }
+                    }));
+                });
+            }
+            ApiCommand::GetScriptLogs(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let entries = world
+                        .get_resource::<crate::scripting::ScriptLogBuffer>()
+                        .map(|buf| buf.entries.clone())
+                        .unwrap_or_default();
+                    let _ = tx.send(entries);
+                });
+            }
+            ApiCommand::ClearScriptLogs(tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut buf) =
+                        world.get_resource_mut::<crate::scripting::ScriptLogBuffer>()
+                    {
+                        buf.entries.clear();
+                    }
+                    let _ = tx.send(());
+                });
+            }
+            ApiCommand::GetGamepadConfig(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let config = world
+                        .get_resource::<crate::input::GamepadConfig>()
+                        .cloned()
+                        .unwrap_or_default();
+                    let connected = world
+                        .query::<&bevy::input::gamepad::Gamepad>()
+                        .iter(world)
+                        .count();
+                    let _ = tx.send(GamepadConfigResponse {
+                        enabled: config.enabled,
+                        deadzone: config.deadzone,
+                        connected_count: connected,
+                    });
+                });
+            }
+            ApiCommand::SetGamepadConfig(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut config) =
+                        world.get_resource_mut::<crate::input::GamepadConfig>()
+                    {
+                        if let Some(enabled) = req.enabled {
+                            config.enabled = enabled;
+                        }
+                        if let Some(deadzone) = req.deadzone {
+                            config.deadzone = deadzone.clamp(0.0, 1.0);
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::SetEntityTween(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let _ = tx.send(crate::tween::apply_tween_command(world, entity_id, req));
+                });
+            }
+            ApiCommand::TriggerScreenEffect(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let _ = tx.send(crate::screen_effects::trigger_effect_command(world, req));
+                });
+            }
+            ApiCommand::GetScreenState(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let state = crate::screen_effects::get_screen_state(world);
+                    let _ = tx.send(state);
+                });
+            }
+            ApiCommand::SetLightingConfig(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let _ = tx.send(crate::lighting::apply_lighting_config(world, req));
+                });
+            }
+            ApiCommand::GetLightingState(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let state = crate::lighting::get_lighting_state(world);
+                    let _ = tx.send(state);
+                });
+            }
         }
     }
 }
@@ -1376,6 +1518,7 @@ struct EntityInfoExtras {
     animation_state: Option<String>,
     animation_frame: Option<usize>,
     animation_facing_right: Option<bool>,
+    render_layer: Option<i32>,
 }
 
 struct EntityInfoSource<'a> {
@@ -1490,6 +1633,7 @@ fn build_entity_info(source: EntityInfoSource<'_>, extras: EntityInfoExtras) -> 
         animation_state: extras.animation_state,
         animation_frame: extras.animation_frame,
         animation_facing_right: extras.animation_facing_right,
+        render_layer: extras.render_layer,
     }
 }
 
@@ -1694,6 +1838,7 @@ mod tests {
                     name: "broken".to_string(),
                     source: "function update(".to_string(),
                     global: false,
+                    always_run: None,
                 },
                 bad_tx,
             ))
@@ -1709,6 +1854,7 @@ mod tests {
                     name: "missing_update".to_string(),
                     source: "local x = 1".to_string(),
                     global: false,
+                    always_run: None,
                 },
                 missing_update_tx,
             ))
@@ -1739,6 +1885,7 @@ mod tests {
                     name: "ok".to_string(),
                     source: "function update(entity, world, dt) return end".to_string(),
                     global: false,
+                    always_run: None,
                 },
                 ok_tx,
             ))
@@ -2014,6 +2161,7 @@ mod tests {
                         playing: true,
                         facing_right: true,
                         auto_from_velocity: false,
+                        facing_direction: 5,
                     }],
                     script: None,
                     tags: vec![],
@@ -2071,9 +2219,11 @@ mod tests {
                     frame_width: 32,
                     frame_height: 32,
                     columns: 8,
+                    rows: 1,
                     animations: HashMap::from([(
                         "run".to_string(),
                         SpriteSheetAnimationRequest {
+                            path: None,
                             frames: vec![4, 5, 6, 7],
                             fps: 12.0,
                             looping: true,
@@ -2081,6 +2231,7 @@ mod tests {
                             events: Vec::new(),
                         },
                     )]),
+                    direction_map: None,
                 },
                 upsert_tx,
             ))
@@ -2366,7 +2517,9 @@ mod tests {
                 frame_width: 32,
                 frame_height: 32,
                 columns: 4,
+                rows: 1,
                 animations: HashMap::new(),
+                direction_map: None,
             },
         );
         save.particle_presets.insert(

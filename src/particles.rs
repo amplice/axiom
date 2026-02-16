@@ -62,6 +62,8 @@ pub struct ParticlePresetDef {
     pub one_shot: bool,
     #[serde(default)]
     pub burst_count: u32,
+    #[serde(default)]
+    pub base_angle: f32,
 }
 
 impl Default for ParticlePresetDef {
@@ -79,6 +81,7 @@ impl Default for ParticlePresetDef {
             gravity_multiplier: 0.2,
             one_shot: false,
             burst_count: 16,
+            base_angle: 0.0,
         }
     }
 }
@@ -122,6 +125,8 @@ pub struct ParticleEmitter {
     pub timer: f32,
     #[serde(default)]
     pub fired_once: bool,
+    #[serde(default)]
+    pub base_angle: f32,
 }
 
 #[derive(Component)]
@@ -153,6 +158,7 @@ impl ParticleEmitter {
             enabled: true,
             timer: 0.0,
             fired_once: false,
+            base_angle: preset.base_angle,
         }
     }
 
@@ -302,6 +308,7 @@ fn resolve_profile(
         gravity_multiplier: emitter.gravity_multiplier,
         one_shot: emitter.one_shot,
         burst_count: emitter.burst_count,
+        base_angle: emitter.base_angle,
     }
 }
 
@@ -314,12 +321,13 @@ fn spawn_one_particle(
     headless: bool,
 ) {
     let spread = profile.spread_angle.to_radians();
+    let base = profile.base_angle.to_radians();
     let t = if total <= 1 {
         0.5
     } else {
         index as f32 / (total - 1) as f32
     };
-    let angle = -spread * 0.5 + spread * t;
+    let angle = base + (-spread * 0.5 + spread * t);
     let dir = Vec2::new(angle.cos(), angle.sin());
     let speed = profile.speed_min + (profile.speed_max - profile.speed_min) * t;
     let velocity = dir * speed.max(0.0);

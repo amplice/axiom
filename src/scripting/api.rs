@@ -6,12 +6,17 @@ pub struct ScriptUpsertRequest {
     pub source: String,
     #[serde(default)]
     pub global: bool,
+    #[serde(default)]
+    pub always_run: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct ScriptInfo {
     pub name: String,
     pub global: bool,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 #[derive(Serialize, Clone)]

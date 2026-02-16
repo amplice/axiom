@@ -15,6 +15,7 @@ mod game_runtime;
 mod generation;
 mod input;
 mod interaction;
+pub mod lighting;
 mod particles;
 mod pathfinding;
 mod perf;
@@ -23,6 +24,7 @@ mod physics_core;
 mod player;
 mod raycast;
 mod render;
+pub mod screen_effects;
 mod scripting;
 mod simulation;
 mod spatial_hash;
@@ -30,6 +32,7 @@ mod spatial_hash;
 pub mod spawn;
 mod sprites;
 mod tilemap;
+pub mod tween;
 mod ui;
 #[cfg(any(feature = "web_export", feature = "desktop_export"))]
 mod web_bootstrap;
@@ -68,14 +71,27 @@ fn main() {
         println!("[Axiom] Starting in HEADLESS mode");
     } else {
         // Windowed mode: full rendering
-        app.add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Axiom".to_string(),
-                resolution: (960.0, 540.0).into(),
-                ..default()
-            }),
-            ..default()
-        }));
+        // AXIOM_ASSETS_DIR env var lets games point at their own assets folder.
+        let assets_dir = std::env::var("AXIOM_ASSETS_DIR").unwrap_or_else(|_| "assets".to_string());
+        if assets_dir != "assets" {
+            println!("[Axiom] Using game assets dir: {}", assets_dir);
+        }
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Axiom".to_string(),
+                        resolution: (960.0, 540.0).into(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(bevy::asset::AssetPlugin {
+                    file_path: assets_dir,
+                    ..default()
+                }),
+        );
+        app.insert_resource(ClearColor(Color::srgb(0.12, 0.18, 0.1)));
         app.add_plugins(sprites::SpritePlugin);
         app.add_plugins(render::RenderPlugin);
         println!("[Axiom] Starting in WINDOWED mode");
@@ -100,7 +116,10 @@ fn main() {
         .add_plugins(perf::PerfPlugin)
         .add_plugins(debug::DebugPlugin)
         .add_plugins(interaction::InteractionPlugin)
-        .add_plugins(scripting::ScriptingPlugin);
+        .add_plugins(scripting::ScriptingPlugin)
+        .add_plugins(tween::TweenPlugin)
+        .add_plugins(screen_effects::ScreenEffectsPlugin)
+        .add_plugins(lighting::LightingPlugin);
 
     #[cfg(any(feature = "web_export", feature = "desktop_export"))]
     app.add_plugins(web_bootstrap::WebBootstrapPlugin);

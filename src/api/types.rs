@@ -216,6 +216,8 @@ pub enum ComponentDef {
         facing_right: bool,
         #[serde(default)]
         auto_from_velocity: bool,
+        #[serde(default = "default_facing_direction")]
+        facing_direction: u8,
     },
     #[serde(rename = "path_follower")]
     PathFollower {
@@ -232,6 +234,20 @@ pub enum ComponentDef {
     ParticleEmitter {
         #[serde(flatten, default)]
         emitter: crate::particles::ParticleEmitter,
+    },
+    #[serde(rename = "render_layer")]
+    RenderLayer {
+        #[serde(default)]
+        layer: i32,
+    },
+    #[serde(rename = "point_light")]
+    PointLight {
+        #[serde(default = "default_f32_one")]
+        radius: f32,
+        #[serde(default = "default_f32_one")]
+        intensity: f32,
+        #[serde(default = "default_light_color")]
+        color: [f32; 3],
     },
 }
 
@@ -276,6 +292,12 @@ fn default_animation_state() -> String {
 }
 fn default_f32_one() -> f32 {
     1.0
+}
+fn default_facing_direction() -> u8 {
+    5 // South (facing camera)
+}
+fn default_light_color() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -402,6 +424,8 @@ pub struct EntityInfo {
     pub animation_frame: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub animation_facing_right: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_layer: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -727,6 +751,13 @@ pub struct CameraBoundsRequest {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(untagged)]
+pub enum CameraBoundsOption {
+    Clear(#[allow(dead_code)] String),
+    Set(CameraBoundsRequest),
+}
+
+#[derive(Deserialize, Clone)]
 pub struct CameraConfigRequest {
     #[serde(default)]
     pub follow_target: Option<u64>,
@@ -739,7 +770,7 @@ pub struct CameraConfigRequest {
     #[serde(default)]
     pub deadzone: Option<[f32; 2]>,
     #[serde(default)]
-    pub bounds: Option<CameraBoundsRequest>,
+    pub bounds: Option<CameraBoundsOption>,
     #[serde(default)]
     pub look_at: Option<[f32; 2]>,
 }
@@ -829,12 +860,22 @@ pub struct SpriteSheetUpsertRequest {
     pub frame_width: u32,
     pub frame_height: u32,
     pub columns: u32,
+    #[serde(default = "default_one_u32")]
+    pub rows: u32,
     #[serde(default)]
     pub animations: HashMap<String, SpriteSheetAnimationRequest>,
+    #[serde(default)]
+    pub direction_map: Option<Vec<u8>>,
+}
+
+fn default_one_u32() -> u32 {
+    1
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SpriteSheetAnimationRequest {
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub frames: Vec<usize>,
     pub fps: f32,
@@ -850,4 +891,68 @@ pub struct SpriteSheetAnimationRequest {
 pub struct ParticlePresetRequest {
     #[serde(default)]
     pub presets: HashMap<String, crate::particles::ParticlePresetDef>,
+}
+
+// === Tween API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct TweenRequest {
+    pub property: String,
+    pub to: f32,
+    #[serde(default)]
+    pub from: Option<f32>,
+    pub duration: f32,
+    #[serde(default)]
+    pub easing: Option<String>,
+    #[serde(default)]
+    pub tween_id: Option<String>,
+}
+
+// === Screen Effect API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct ScreenEffectRequest {
+    pub effect: String,
+    pub duration: f32,
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+}
+
+// === Gamepad API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct GamepadConfigRequest {
+    #[serde(default)]
+    pub deadzone: Option<f32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct GamepadConfigResponse {
+    pub enabled: bool,
+    pub deadzone: f32,
+    pub connected_count: usize,
+}
+
+// === Lighting API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct LightingConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub ambient_intensity: Option<f32>,
+    #[serde(default)]
+    pub ambient_color: Option<[f32; 3]>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct LightingStateResponse {
+    pub enabled: bool,
+    pub ambient_intensity: f32,
+    pub ambient_color: [f32; 3],
+    pub light_count: usize,
 }

@@ -16,10 +16,12 @@ use crate::api::types::{
 };
 use crate::components::{
     AiBehavior, AiState, Alive, AnimationController, Collider, GameConfig, GamePosition, Grounded,
-    Health, Hitbox, NetworkId, NextNetworkId, PathFollower, Player, Tags, Velocity,
+    Health, Hitbox, NetworkId, NextNetworkId, PathFollower, PendingDeath, Player, RenderLayer, Tags,
+    TopDownMover, Velocity,
 };
 use crate::events::{GameEvent, GameEventBus};
-use crate::input::VirtualInput;
+use crate::input::{MouseInput, VirtualInput};
+use crate::scripting::{ScriptLogBuffer, ScriptLogEntry};
 use crate::perf::PerfAccum;
 use crate::raycast::{raycast_aabbs, RaycastAabb};
 use crate::scripting::{ScriptError, ScriptEvent};
@@ -79,6 +81,7 @@ impl ScriptErrors {
 pub struct ScriptEngine {
     pub scripts: HashMap<String, String>,
     pub global_scripts: HashSet<String>,
+    pub always_run_scripts: HashSet<String>,
     pub vars: HashMap<String, serde_json::Value>,
     pub events: Vec<ScriptEvent>,
     pub pending_events: Vec<ScriptEvent>,
@@ -126,9 +129,21 @@ impl ScriptEngine {
         let mut items: Vec<_> = self
             .scripts
             .keys()
-            .map(|name| crate::scripting::api::ScriptInfo {
-                name: name.clone(),
-                global: self.global_scripts.contains(name),
+            .map(|name| {
+                let is_global = self.global_scripts.contains(name);
+                let disabled = self.disabled_global_scripts.contains(name);
+                let disabled_reason = if disabled {
+                    let streak = self.global_error_streaks.get(name).copied().unwrap_or(0);
+                    Some(format!("Disabled after {} consecutive errors", streak))
+                } else {
+                    None
+                };
+                crate::scripting::api::ScriptInfo {
+                    name: name.clone(),
+                    global: is_global,
+                    enabled: !disabled,
+                    disabled_reason,
+                }
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -291,6 +306,7 @@ impl Plugin for ScriptingPlugin {
         app.insert_resource(ScriptEngine::default())
             .insert_resource(ScriptErrors::default())
             .insert_resource(ScriptFrame::default())
+            .insert_resource(ScriptLogBuffer::default())
             .init_resource::<ScriptTilemapCache>()
             .init_resource::<ScriptEntitySnapshotCache>()
             .init_non_send_resource::<EntityLuaRuntime>()
@@ -305,9 +321,19 @@ impl Plugin for ScriptingPlugin {
                     refresh_script_entity_cache,
                     run_global_scripts,
                     flush_script_events_to_game_events,
+                    cleanup_pending_death,
                 )
                     .chain()
                     .run_if(crate::game_runtime::gameplay_systems_enabled),
+            )
+            // Always-run scripts execute even during pause/game_over
+            .add_systems(
+                FixedUpdate,
+                (
+                    tick_script_frame_always,
+                    run_always_global_scripts,
+                )
+                    .chain(),
             );
     }
 }
@@ -319,8 +345,12 @@ struct LuaExecutionCache {
 
 impl Default for LuaExecutionCache {
     fn default() -> Self {
+        let lua = Lua::new();
+        if let Err(e) = install_entity_snapshot_metatable(&lua) {
+            eprintln!("[Axiom] Failed to install entity snapshot metatable: {e}");
+        }
         Self {
-            lua: Lua::new(),
+            lua,
             compiled: HashMap::new(),
         }
     }
@@ -363,12 +393,22 @@ struct LuaEntitySnapshot {
     is_player: bool,
     aabb: Option<(Vec2, Vec2)>,
     tags: HashSet<String>,
+    health: Option<f32>,
+    max_health: Option<f32>,
 }
 
 #[derive(Clone, Default)]
 struct LuaInputSnapshot {
     active: HashSet<String>,
     just_pressed: HashSet<String>,
+    mouse_x: f32,
+    mouse_y: f32,
+    mouse_left: bool,
+    mouse_right: bool,
+    mouse_middle: bool,
+    mouse_left_just_pressed: bool,
+    mouse_right_just_pressed: bool,
+    mouse_middle_just_pressed: bool,
 }
 
 type ScriptEntityCacheQueryItem<'a> = (
@@ -381,6 +421,7 @@ type ScriptEntityCacheQueryItem<'a> = (
     Option<&'a Player>,
     Option<&'a Grounded>,
     Option<&'a Alive>,
+    Option<&'a Health>,
 );
 
 type ScriptEntityRuntimeQueryItem<'a> = (
@@ -396,6 +437,9 @@ type ScriptEntityRuntimeQueryItem<'a> = (
     Option<&'a mut PathFollower>,
     Option<&'a mut AiBehavior>,
     Option<&'a mut AnimationController>,
+    Option<&'a mut TopDownMover>,
+    Option<&'a PendingDeath>,
+    Option<&'a mut RenderLayer>,
 );
 
 type WorldTableBuildResult = mlua::Result<(
@@ -413,6 +457,7 @@ struct LuaEntitySnapshotParts<'a> {
     player: Option<&'a Player>,
     grounded: Option<&'a Grounded>,
     alive: Option<&'a Alive>,
+    health: Option<&'a Health>,
 }
 
 struct WorldBuildArgs<'a> {
@@ -439,6 +484,7 @@ struct EntityScriptSystemCtx<'w, 's> {
     frame: Res<'w, ScriptFrame>,
     time: Res<'w, Time<Fixed>>,
     vinput: Res<'w, VirtualInput>,
+    mouse_input: Res<'w, MouseInput>,
     event_bus: Res<'w, GameEventBus>,
     tilemap: ResMut<'w, Tilemap>,
     config: Res<'w, GameConfig>,
@@ -446,6 +492,7 @@ struct EntityScriptSystemCtx<'w, 's> {
     runtime_state: Res<'w, crate::game_runtime::RuntimeState>,
     tilemap_cache: ResMut<'w, ScriptTilemapCache>,
     entity_cache: Res<'w, ScriptEntitySnapshotCache>,
+    log_buffer: ResMut<'w, ScriptLogBuffer>,
     runtime: NonSendMut<'w, EntityLuaRuntime>,
     query: Query<'w, 's, ScriptEntityRuntimeQueryItem<'static>>,
 }
@@ -459,6 +506,7 @@ struct GlobalScriptSystemCtx<'w, 's> {
     frame: Res<'w, ScriptFrame>,
     time: Res<'w, Time<Fixed>>,
     vinput: Res<'w, VirtualInput>,
+    mouse_input: Res<'w, MouseInput>,
     event_bus: Res<'w, GameEventBus>,
     tilemap: ResMut<'w, Tilemap>,
     config: Res<'w, GameConfig>,
@@ -466,6 +514,7 @@ struct GlobalScriptSystemCtx<'w, 's> {
     runtime_state: Res<'w, crate::game_runtime::RuntimeState>,
     tilemap_cache: ResMut<'w, ScriptTilemapCache>,
     entity_cache: Res<'w, ScriptEntitySnapshotCache>,
+    log_buffer: ResMut<'w, ScriptLogBuffer>,
     runtime: NonSendMut<'w, GlobalLuaRuntime>,
 }
 
@@ -492,10 +541,58 @@ enum ScriptWorldCommand {
         preset: String,
         x: f32,
         y: f32,
+        angle: Option<f32>,
         script_name: String,
         source_entity: Option<u64>,
     },
+    DamageEntity {
+        target_id: u64,
+        amount: f32,
+    },
+    HealEntity {
+        target_id: u64,
+        amount: f32,
+    },
+    KnockbackEntity {
+        target_id: u64,
+        dx: f32,
+        dy: f32,
+    },
+    SetPosition {
+        target_id: u64,
+        x: f32,
+        y: f32,
+    },
+    SetVelocity {
+        target_id: u64,
+        vx: f32,
+        vy: f32,
+    },
+    SetAlive {
+        target_id: u64,
+        alive: bool,
+    },
+    TweenEntity {
+        target_id: u64,
+        property: String,
+        to: f32,
+        from: Option<f32>,
+        duration: f32,
+        easing: Option<String>,
+        tween_id: Option<String>,
+    },
+    ScreenEffect {
+        effect: String,
+        duration: f32,
+        color: Option<[f32; 3]>,
+    },
+    SetAmbient {
+        intensity: f32,
+        color: Option<[f32; 3]>,
+    },
 }
+
+
 
 fn source_hash(source: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -579,7 +676,7 @@ fn refresh_script_entity_cache(
     let entities = query
         .iter()
         .filter_map(
-            |(entity, pos, vel, collider, network_id, tags, player, grounded, alive)| {
+            |(entity, pos, vel, collider, network_id, tags, player, grounded, alive, health)| {
                 let snapshot = make_lua_entity_snapshot(LuaEntitySnapshotParts {
                     pos,
                     vel,
@@ -589,6 +686,7 @@ fn refresh_script_entity_cache(
                     player,
                     grounded,
                     alive,
+                    health,
                 })?;
                 network_lookup.insert(snapshot.id, entity);
                 Some(snapshot)
@@ -609,6 +707,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         frame,
         time,
         vinput,
+        mouse_input,
         event_bus,
         mut tilemap,
         config,
@@ -616,6 +715,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         runtime_state,
         mut tilemap_cache,
         entity_cache,
+        mut log_buffer,
         mut runtime,
         mut query,
     } = ctx;
@@ -628,12 +728,21 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
     let input_snapshot = Arc::new(LuaInputSnapshot {
         active: vinput.active.clone(),
         just_pressed: vinput.just_pressed.clone(),
+        mouse_x: mouse_input.world_x,
+        mouse_y: mouse_input.world_y,
+        mouse_left: mouse_input.left,
+        mouse_right: mouse_input.right,
+        mouse_middle: mouse_input.middle,
+        mouse_left_just_pressed: mouse_input.left_just_pressed,
+        mouse_right_just_pressed: mouse_input.right_just_pressed,
+        mouse_middle_just_pressed: mouse_input.middle_just_pressed,
     });
     let bus_events = &event_bus.recent;
     let mut used_entity_cursor_keys = HashSet::<(String, u64)>::new();
     let mut network_lookup = entity_cache.network_lookup.clone();
     let raycast_entities = entity_cache.entities.clone();
     let mut pending_world_commands = Vec::<ScriptWorldCommand>::new();
+    let mut pending_log_entries = Vec::<ScriptLogEntry>::new();
 
     for (
         network_id,
@@ -648,6 +757,9 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         mut path_follower,
         mut ai_behavior,
         mut animation_controller,
+        mut top_down_mover,
+        pending_death,
+        mut render_layer,
     ) in query.iter_mut()
     {
         lua.expire_registry_values();
@@ -660,8 +772,8 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             update,
             uses_world_api,
             uses_tag_helpers,
-            uses_damage_helpers,
-            uses_follow_path_helpers,
+            _uses_damage_helpers,
+            _uses_follow_path_helpers,
             uses_ai_helpers,
             uses_hitbox_helpers,
             uses_animation_helpers,
@@ -765,6 +877,10 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             let _ = entity_tbl.set("health", h.current);
             let _ = entity_tbl.set("max_health", h.max);
         }
+        if let Some(tdm) = top_down_mover.as_ref() {
+            let _ = entity_tbl.set("speed", tdm.speed);
+        }
+        let _ = entity_tbl.set("render_layer", render_layer.as_ref().map_or(0, |r| r.0));
         let _ = entity_tbl.set("state", lua.to_value(&script.state).unwrap_or(Value::Nil));
         if uses_tag_helpers {
             let tags_tbl = match lua.create_table() {
@@ -794,72 +910,8 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             for tag in &current_tags {
                 let _ = tags_tbl.set(tag.as_str(), true);
             }
-            let _ = entity_tbl.set("tags", tags_tbl.clone());
-
-            let has_tag_tbl = tags_tbl.clone();
-            let has_tag_fn = lua.create_function(move |_lua, tag: String| {
-                Ok(has_tag_tbl.get::<bool>(tag).unwrap_or(false))
-            });
-            if let Ok(f) = has_tag_fn {
-                let _ = entity_tbl.set("has_tag", f);
-            }
-            let add_tag_tbl = tags_tbl.clone();
-            let add_tag_fn = lua.create_function_mut(move |_lua, tag: String| {
-                add_tag_tbl.set(tag, true)?;
-                Ok(())
-            });
-            if let Ok(f) = add_tag_fn {
-                let _ = entity_tbl.set("add_tag", f);
-            }
-            let remove_tag_tbl = tags_tbl.clone();
-            let remove_tag_fn = lua.create_function_mut(move |_lua, tag: String| {
-                remove_tag_tbl.set(tag, Value::Nil)?;
-                Ok(())
-            });
-            if let Ok(f) = remove_tag_fn {
-                let _ = entity_tbl.set("remove_tag", f);
-            }
-        }
-        if uses_damage_helpers {
-            let damage_tbl = entity_tbl.clone();
-            let damage_fn = lua.create_function_mut(move |_lua, amount: f32| {
-                let amount = amount.max(0.0);
-                let current = damage_tbl.get::<f32>("health").unwrap_or(0.0);
-                let next = (current - amount).max(0.0);
-                damage_tbl.set("health", next)?;
-                if next <= 0.0 {
-                    damage_tbl.set("alive", false)?;
-                }
-                Ok(next)
-            });
-            if let Ok(f) = damage_fn {
-                let _ = entity_tbl.set("damage", f);
-            }
-            let heal_tbl = entity_tbl.clone();
-            let heal_fn = lua.create_function_mut(move |_lua, amount: f32| {
-                let amount = amount.max(0.0);
-                let current = heal_tbl.get::<f32>("health").unwrap_or(0.0);
-                let max = heal_tbl
-                    .get::<f32>("max_health")
-                    .unwrap_or(current + amount);
-                let next = (current + amount).min(max.max(0.0));
-                heal_tbl.set("health", next)?;
-                Ok(next)
-            });
-            if let Ok(f) = heal_fn {
-                let _ = entity_tbl.set("heal", f);
-            }
-            let knock_tbl = entity_tbl.clone();
-            let knockback_fn = lua.create_function_mut(move |_lua, (dx, dy): (f32, f32)| {
-                let vx = knock_tbl.get::<f32>("vx").unwrap_or(0.0) + dx;
-                let vy = knock_tbl.get::<f32>("vy").unwrap_or(0.0) + dy;
-                knock_tbl.set("vx", vx)?;
-                knock_tbl.set("vy", vy)?;
-                Ok(())
-            });
-            if let Ok(f) = knockback_fn {
-                let _ = entity_tbl.set("knockback", f);
-            }
+            let _ = entity_tbl.set("tags", tags_tbl);
+            // has_tag, add_tag, remove_tag are now in __axiom_entity_mt metatable
         }
         if uses_hitbox_helpers {
             if let Some(hb) = hitbox.as_ref() {
@@ -875,20 +927,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                 }
             }
         }
-        if uses_follow_path_helpers {
-            let follow_path_tbl = entity_tbl.clone();
-            let follow_path_fn =
-                lua.create_function_mut(move |_lua, (path, speed): (mlua::Table, Option<f32>)| {
-                    follow_path_tbl.set("__axiom_follow_path", path)?;
-                    if let Some(speed) = speed {
-                        follow_path_tbl.set("__axiom_follow_speed", speed.max(0.0))?;
-                    }
-                    Ok(())
-                });
-            if let Ok(f) = follow_path_fn {
-                let _ = entity_tbl.set("follow_path", f);
-            }
-        }
+        // damage, heal, knockback, follow_path are now in __axiom_entity_mt metatable
         if uses_ai_helpers {
             if let Some(ai) = ai_behavior.as_ref() {
                 if let Ok(ai_tbl) = lua.create_table() {
@@ -896,31 +935,18 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                     if let Some(target_id) = ai_state_target_id(&ai.state) {
                         let _ = ai_tbl.set("target_id", target_id);
                     }
-
-                    let ai_cmd_tbl = entity_tbl.clone();
-                    let chase_fn = lua.create_function_mut(move |lua_ctx, target_id: u64| {
-                        let cmd = lua_ctx.create_table()?;
-                        cmd.set("mode", "chase")?;
-                        cmd.set("target_id", target_id)?;
-                        ai_cmd_tbl.set("__axiom_ai_override", cmd)?;
-                        Ok(())
-                    });
-                    if let Ok(f) = chase_fn {
-                        let _ = ai_tbl.set("chase", f);
-                    }
-
-                    let ai_cmd_tbl = entity_tbl.clone();
-                    let idle_fn =
-                        lua.create_function_mut(move |lua_ctx, _: Option<mlua::Table>| {
-                            let cmd = lua_ctx.create_table()?;
-                            cmd.set("mode", "idle")?;
-                            ai_cmd_tbl.set("__axiom_ai_override", cmd)?;
-                            Ok(())
-                        });
-                    if let Ok(f) = idle_fn {
-                        let _ = ai_tbl.set("idle", f);
-                    }
-
+                    // Store back-reference to entity for chase/idle methods.
+                    // This is a Lua-only reference (no Rust Table handle clone)
+                    // so Lua GC can collect the cycle.
+                    let _ = lua.load(r#"
+                        local ai, entity = ...
+                        function ai.chase(target_id)
+                            entity.__axiom_ai_override = { mode = "chase", target_id = target_id }
+                        end
+                        function ai.idle()
+                            entity.__axiom_ai_override = { mode = "idle" }
+                        end
+                    "#).call::<()>((&ai_tbl, &entity_tbl));
                     let _ = entity_tbl.set("ai", ai_tbl);
                 }
             }
@@ -930,7 +956,16 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                 let _ = entity_tbl.set("animation", anim.state.clone());
                 let _ = entity_tbl.set("animation_frame", anim.frame);
                 let _ = entity_tbl.set("flip_x", !anim.facing_right);
+                let _ = entity_tbl.set("animation_graph", anim.graph.clone());
+                let _ = entity_tbl.set("facing_direction", anim.facing_direction);
             }
+        }
+
+        // Install entity methods via a pre-compiled Lua function.
+        // This creates pure Lua closures (no Rust Table handle captures),
+        // so Lua GC can collect the entity_tbl → closure → entity_tbl cycle.
+        if let Ok(setup_fn) = lua.globals().raw_get::<Function>("__axiom_setup_entity_methods") {
+            let _ = setup_fn.call::<()>(entity_tbl.clone());
         }
 
         let world_tbl = if uses_world_api {
@@ -1118,7 +1153,6 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                     anim.frame = 0;
                     anim.timer = 0.0;
                     anim.playing = true;
-                    anim.auto_from_velocity = false;
                 }
             }
             if let Ok(frame_override) = entity_tbl.get::<usize>("animation_frame") {
@@ -1126,6 +1160,48 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             }
             if let Ok(flip_x) = entity_tbl.get::<bool>("flip_x") {
                 anim.facing_right = !flip_x;
+            }
+            // Write back animation_graph (switch sprite sheet, e.g. bat → shotgun)
+            if let Ok(next_graph) = entity_tbl.get::<String>("animation_graph") {
+                let graph = next_graph.trim();
+                if !graph.is_empty() && graph != anim.graph {
+                    anim.graph = graph.to_string();
+                    anim.frame = 0;
+                    anim.timer = 0.0;
+                    anim.playing = true;
+                }
+            }
+            // Write back facing_direction (0-7)
+            if let Ok(dir) = entity_tbl.get::<u8>("facing_direction") {
+                anim.facing_direction = dir.min(7);
+            }
+        }
+        // Write back speed to TopDownMover
+        if let Some(tdm) = top_down_mover.as_deref_mut() {
+            if let Ok(speed) = entity_tbl.get::<f32>("speed") {
+                tdm.speed = speed.max(0.0);
+            }
+        }
+        // Write back render_layer
+        if let Ok(layer) = entity_tbl.get::<i32>("render_layer") {
+            if let Some(rl) = render_layer.as_deref_mut() {
+                rl.0 = layer;
+            }
+        }
+        // on_death lifecycle hook: if entity has PendingDeath, call on_death() if defined
+        if pending_death.is_some() {
+            if let Some(source) = engine.scripts.get(&script.script_name) {
+                if source.contains("on_death") {
+                    let on_death_result: Result<Function, _> = lua.globals().get("on_death");
+                    if let Ok(on_death_fn) = on_death_result {
+                        let _ = call_lua_with_budget(
+                            lua,
+                            Duration::from_millis(limits.entity_budget_ms),
+                            limits.instruction_interval,
+                            || on_death_fn.call::<()>((entity_tbl.clone(), world_tbl.clone())),
+                        );
+                    }
+                }
             }
         }
         if let Ok(state_val) = entity_tbl.get::<Value>("state") {
@@ -1157,7 +1233,28 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         for cmd in pending_commands.borrow().iter() {
             pending_world_commands.push(cmd.clone());
         }
+        if let Ok(logs_tbl) = world_tbl.get::<Value>("__axiom_pending_logs") {
+            if let Ok(logs) = lua.from_value::<Vec<ScriptLogEntry>>(logs_tbl) {
+                for entry in logs {
+                    pending_log_entries.push(entry);
+                }
+            }
+        }
         engine.entity_event_cursors.insert(cursor_key, frame.frame);
+
+        // Drop tables to release closure registry refs. Multiple GC passes
+        // are needed because closures captured Table handles that only get
+        // queued for expiry when the closure itself is collected.
+        drop(world_tbl);
+        drop(entity_tbl);
+        for _ in 0..3 {
+            lua.expire_registry_values();
+            let _ = lua.gc_collect();
+        }
+    }
+
+    for entry in pending_log_entries {
+        log_buffer.push(entry);
     }
 
     engine
@@ -1181,6 +1278,12 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         .0
         .compiled
         .retain(|script_name, _| used_scripts.contains(script_name));
+
+    // Force a GC cycle to reclaim the many temporary tables and closures created
+    // per entity per frame (entity_tbl, world_tbl, ~35 closures each).
+    // Without this, the Lua auxiliary stack fills up and panics at 8000 slots.
+    let _ = runtime.0.lua.gc_collect();
+
     perf.script_time_ms += start.elapsed().as_secs_f32() * 1000.0;
 }
 
@@ -1202,6 +1305,7 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         frame,
         time,
         vinput,
+        mouse_input,
         event_bus,
         mut tilemap,
         config,
@@ -1209,6 +1313,7 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         runtime_state,
         mut tilemap_cache,
         entity_cache,
+        mut log_buffer,
         mut runtime,
     } = ctx;
     let start = std::time::Instant::now();
@@ -1220,6 +1325,14 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
     let input_snapshot = Arc::new(LuaInputSnapshot {
         active: vinput.active.clone(),
         just_pressed: vinput.just_pressed.clone(),
+        mouse_x: mouse_input.world_x,
+        mouse_y: mouse_input.world_y,
+        mouse_left: mouse_input.left,
+        mouse_right: mouse_input.right,
+        mouse_middle: mouse_input.middle,
+        mouse_left_just_pressed: mouse_input.left_just_pressed,
+        mouse_right_just_pressed: mouse_input.right_just_pressed,
+        mouse_middle_just_pressed: mouse_input.middle_just_pressed,
     });
     let bus_events = &event_bus.recent;
     let mut used_global_cursor_keys = HashSet::<String>::new();
@@ -1350,9 +1463,21 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         for cmd in pending_commands.borrow().iter() {
             pending_world_commands.push(cmd.clone());
         }
+        if let Ok(logs_tbl) = world_tbl.get::<Value>("__axiom_pending_logs") {
+            if let Ok(logs) = lua.from_value::<Vec<ScriptLogEntry>>(logs_tbl) {
+                for entry in logs {
+                    log_buffer.push(entry);
+                }
+            }
+        }
         engine
             .global_event_cursors
             .insert(script_name.clone(), frame.frame);
+
+        // Drop world_tbl to release closure registry refs, then GC
+        drop(world_tbl);
+        lua.expire_registry_values();
+        let _ = lua.gc_collect();
     }
 
     engine
@@ -1376,6 +1501,10 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         .0
         .compiled
         .retain(|script_name, _| used_scripts.contains(script_name));
+
+    // Force a GC cycle to reclaim temporary tables and closures from global scripts.
+    let _ = runtime.0.lua.gc_collect();
+
     perf.script_time_ms += start.elapsed().as_secs_f32() * 1000.0;
 }
 
@@ -1389,6 +1518,7 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
         player,
         grounded,
         alive,
+        health,
     } = parts;
     let network_id = network_id?;
     let tags_set = tags.map(|t| t.0.clone()).unwrap_or_default();
@@ -1409,6 +1539,8 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
         is_player: player.is_some() || tags_set.contains("player"),
         aabb,
         tags: tags_set,
+        health: health.map(|h| h.current),
+        max_health: health.map(|h| h.max),
     })
 }
 
@@ -1501,6 +1633,7 @@ fn component_from_name(name: &str, config: &GameConfig) -> Option<ComponentDef> 
             playing: true,
             facing_right: true,
             auto_from_velocity: true,
+            facing_direction: 5,
         }),
         "pathfollower" => Some(ComponentDef::PathFollower {
             target: Vec2Def { x: 0.0, y: 0.0 },
@@ -1684,6 +1817,7 @@ fn apply_script_world_commands(
                 preset,
                 x,
                 y,
+                angle,
                 script_name,
                 source_entity,
             } => {
@@ -1720,12 +1854,126 @@ fn apply_script_world_commands(
                     emitter.timer = 0.0;
                     emitter.fired_once = false;
                     emitter.burst_count = emitter.burst_count.max(1);
+                    if let Some(deg) = angle {
+                        emitter.base_angle = deg;
+                    }
 
                     world.spawn((
                         GamePosition { x, y },
                         emitter,
                         crate::particles::TransientParticleEmitter,
                     ));
+                });
+            }
+            ScriptWorldCommand::DamageEntity { target_id, amount } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut health) = world.get_mut::<Health>(entity) {
+                            health.current = (health.current - amount.max(0.0)).max(0.0);
+                            let dead = health.current <= 0.0;
+                            drop(health);
+                            if dead {
+                                if let Some(mut alive) = world.get_mut::<Alive>(entity) {
+                                    alive.0 = false;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::HealEntity { target_id, amount } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut health) = world.get_mut::<Health>(entity) {
+                            health.current =
+                                (health.current + amount.max(0.0)).min(health.max.max(0.0));
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::KnockbackEntity { target_id, dx, dy } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut vel) = world.get_mut::<Velocity>(entity) {
+                            vel.x += dx;
+                            vel.y += dy;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetPosition { target_id, x, y } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut pos) = world.get_mut::<GamePosition>(entity) {
+                            pos.x = x;
+                            pos.y = y;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetVelocity { target_id, vx, vy } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut vel) = world.get_mut::<Velocity>(entity) {
+                            vel.x = vx;
+                            vel.y = vy;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetAlive { target_id, alive } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut a) = world.get_mut::<Alive>(entity) {
+                            a.0 = alive;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::TweenEntity {
+                target_id,
+                property,
+                to,
+                from,
+                duration,
+                easing,
+                tween_id,
+            } => {
+                let req = crate::api::types::TweenRequest {
+                    property,
+                    to,
+                    from,
+                    duration,
+                    easing,
+                    tween_id,
+                };
+                commands.queue(move |world: &mut World| {
+                    let _ = crate::tween::apply_tween_command(world, target_id, req);
+                });
+            }
+            ScriptWorldCommand::ScreenEffect {
+                effect,
+                duration,
+                color,
+            } => {
+                let req = crate::api::types::ScreenEffectRequest {
+                    effect,
+                    duration,
+                    color,
+                    alpha: None,
+                };
+                commands.queue(move |world: &mut World| {
+                    let _ = crate::screen_effects::trigger_effect_command(world, req);
+                });
+            }
+            ScriptWorldCommand::SetAmbient { intensity, color } => {
+                let req = crate::api::types::LightingConfigRequest {
+                    enabled: Some(true),
+                    ambient_intensity: Some(intensity),
+                    ambient_color: color,
+                };
+                commands.queue(move |world: &mut World| {
+                    let _ = crate::lighting::apply_lighting_config(world, req);
                 });
             }
         }
@@ -1740,20 +1988,258 @@ fn entity_matches_tag(entity: &LuaEntitySnapshot, tag: Option<&str>) -> bool {
     }
 }
 
-fn lua_entity_table(lua: &Lua, entity: &LuaEntitySnapshot) -> mlua::Result<mlua::Table> {
+/// Install a shared metatable and dispatch function for entity snapshots.
+/// Called once per Lua runtime. The metatable routes method calls through
+/// a single `__dispatch` closure stored on each table, reducing registry refs
+/// from ~9 per entity to ~1.
+fn install_entity_snapshot_metatable(lua: &Lua) -> mlua::Result<()> {
+    // Shared metatables installed once per Lua runtime.
+    // Entity snapshot methods route through a single __dispatch closure.
+    // Entity script methods are pure Lua (no Rust closures needed).
+    lua.load(r##"
+        -- Entity snapshot metatable (read-only, methods via dispatch)
+        -- __index is a FUNCTION so dot syntax works: snapshot.set_alive(false)
+        -- When __index is a table, dot calls pass the first arg as self which breaks dispatch.
+        __axiom_snap_mt = {
+            __newindex = function(_, key, _)
+                error("Cannot set '" .. tostring(key) .. "' on entity snapshot. Use methods like heal()/damage()/set_position()/set_velocity()/set_alive().")
+            end,
+            __index = function(tbl, key)
+                local v = rawget(tbl, key)
+                if v ~= nil then return v end
+
+                if key == "has_tag" then
+                    return function(tag_or_self, tag)
+                        local t = tag
+                        if type(tag_or_self) == "string" then t = tag_or_self end
+                        local tags = rawget(tbl, "tags")
+                        if tags and type(t) == "string" then return tags[t] == true end
+                        return false
+                    end
+                end
+
+                local dispatch = rawget(tbl, "__dispatch")
+                if not dispatch then return nil end
+                if key == "damage" or key == "heal" or key == "knockback"
+                   or key == "set_position" or key == "set_velocity" or key == "set_alive" then
+                    return function(first, ...)
+                        if first == tbl then
+                            return dispatch(key, tbl, ...)
+                        else
+                            return dispatch(key, tbl, first, ...)
+                        end
+                    end
+                end
+                return nil
+            end,
+        }
+
+        -- Entity script setup: installs methods directly on entity table as Lua closures.
+        -- These capture `entity` via Lua upvalues (NOT Rust Table handles), so Lua GC
+        -- can collect the cycle. Supports both dot and colon syntax.
+        local function _get_num(...)
+            for i = 1, select("#", ...) do
+                local v = select(i, ...)
+                if type(v) == "number" then return v end
+            end
+            return 0
+        end
+        local function _get_num2(...)
+            local a, b = nil, nil
+            for i = 1, select("#", ...) do
+                local v = select(i, ...)
+                if type(v) == "number" then
+                    if a == nil then a = v else b = v; break end
+                end
+            end
+            return a or 0, b or 0
+        end
+        function __axiom_setup_entity_methods(entity)
+            rawset(entity, "has_tag", function(tag_or_self, tag)
+                local t = tag
+                if type(tag_or_self) == "string" then t = tag_or_self end
+                local tags = rawget(entity, "tags")
+                if tags and type(t) == "string" then return tags[t] == true end
+                return false
+            end)
+            rawset(entity, "add_tag", function(tag_or_self, tag)
+                local t = tag
+                if type(tag_or_self) == "string" then t = tag_or_self end
+                local tags = rawget(entity, "tags")
+                if tags and type(t) == "string" then tags[t] = true end
+            end)
+            rawset(entity, "remove_tag", function(tag_or_self, tag)
+                local t = tag
+                if type(tag_or_self) == "string" then t = tag_or_self end
+                local tags = rawget(entity, "tags")
+                if tags and type(t) == "string" then tags[t] = nil end
+            end)
+            rawset(entity, "damage", function(...)
+                local amount = math.max(_get_num(...), 0)
+                local current = rawget(entity, "health") or 0
+                local nxt = math.max(current - amount, 0)
+                rawset(entity, "health", nxt)
+                if nxt <= 0 then rawset(entity, "alive", false) end
+                return nxt
+            end)
+            rawset(entity, "heal", function(...)
+                local amount = math.max(_get_num(...), 0)
+                local current = rawget(entity, "health") or 0
+                local max = rawget(entity, "max_health") or (current + amount)
+                local nxt = math.min(current + amount, math.max(max, 0))
+                rawset(entity, "health", nxt)
+                return nxt
+            end)
+            rawset(entity, "knockback", function(...)
+                local dx, dy = _get_num2(...)
+                rawset(entity, "vx", (rawget(entity, "vx") or 0) + dx)
+                rawset(entity, "vy", (rawget(entity, "vy") or 0) + dy)
+            end)
+            rawset(entity, "follow_path", function(path_or_self, path_or_speed, speed)
+                local p, s
+                if type(path_or_self) == "table" and path_or_self ~= entity then
+                    p = path_or_self; s = path_or_speed
+                else
+                    p = path_or_speed; s = speed
+                end
+                rawset(entity, "__axiom_follow_path", p)
+                if s then rawset(entity, "__axiom_follow_speed", math.max(s, 0)) end
+            end)
+        end
+    "##).exec()?;
+    Ok(())
+}
+
+fn lua_entity_table(
+    lua: &Lua,
+    entity: &LuaEntitySnapshot,
+    pending_commands: &Rc<RefCell<Vec<ScriptWorldCommand>>>,
+) -> mlua::Result<mlua::Table> {
     let tbl = lua.create_table()?;
-    tbl.set("id", entity.id)?;
-    tbl.set("x", entity.x)?;
-    tbl.set("y", entity.y)?;
-    tbl.set("vx", entity.vx)?;
-    tbl.set("vy", entity.vy)?;
-    tbl.set("grounded", entity.grounded)?;
-    tbl.set("alive", entity.alive)?;
-    let tags = lua.create_table()?;
-    for tag in &entity.tags {
-        tags.set(tag.as_str(), true)?;
+    tbl.raw_set("id", entity.id)?;
+    tbl.raw_set("x", entity.x)?;
+    tbl.raw_set("y", entity.y)?;
+    tbl.raw_set("vx", entity.vx)?;
+    tbl.raw_set("vy", entity.vy)?;
+    tbl.raw_set("grounded", entity.grounded)?;
+    tbl.raw_set("alive", entity.alive)?;
+    if let Some(h) = entity.health {
+        tbl.raw_set("health", h)?;
     }
-    tbl.set("tags", tags)?;
+    if let Some(mh) = entity.max_health {
+        tbl.raw_set("max_health", mh)?;
+    }
+
+    let tags_tbl = lua.create_table()?;
+    for tag in &entity.tags {
+        tags_tbl.raw_set(tag.as_str(), true)?;
+    }
+    tbl.raw_set("tags", tags_tbl)?;
+
+    // Single dispatch closure — handles ALL method calls for this entity
+    let entity_id = entity.id;
+    let dispatch_tbl = tbl.clone();
+    let cmds = pending_commands.clone();
+    let dispatch = lua.create_function_mut(move |_lua, args: mlua::MultiValue| -> mlua::Result<Value> {
+        // First arg is method name (String), rest are method args
+        let args_vec: Vec<Value> = args.into_iter().collect();
+        let method = match args_vec.first() {
+            Some(Value::String(s)) => s.to_string_lossy().to_string(),
+            _ => return Ok(Value::Nil),
+        };
+        // Skip method name and self table to get actual args
+        let num_args: Vec<f32> = args_vec.iter().skip(2).filter_map(|v| match v {
+            Value::Integer(n) => Some(*n as f32),
+            Value::Number(n) => Some(*n as f32),
+            _ => None,
+        }).collect();
+
+        match method.as_str() {
+            "damage" => {
+                let amount = num_args.first().copied().unwrap_or(0.0).max(0.0);
+                let current = dispatch_tbl.raw_get::<f32>("health").unwrap_or(0.0);
+                let next = (current - amount).max(0.0);
+                dispatch_tbl.raw_set("health", next)?;
+                if next <= 0.0 {
+                    dispatch_tbl.raw_set("alive", false)?;
+                }
+                cmds.borrow_mut().push(ScriptWorldCommand::DamageEntity {
+                    target_id: entity_id,
+                    amount,
+                });
+                Ok(Value::Number(next as f64))
+            }
+            "heal" => {
+                let amount = num_args.first().copied().unwrap_or(0.0).max(0.0);
+                let current = dispatch_tbl.raw_get::<f32>("health").unwrap_or(0.0);
+                let max = dispatch_tbl.raw_get::<f32>("max_health").unwrap_or(current + amount);
+                let next = (current + amount).min(max.max(0.0));
+                dispatch_tbl.raw_set("health", next)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::HealEntity {
+                    target_id: entity_id,
+                    amount,
+                });
+                Ok(Value::Number(next as f64))
+            }
+            "knockback" => {
+                let dx = num_args.first().copied().unwrap_or(0.0);
+                let dy = num_args.get(1).copied().unwrap_or(0.0);
+                let vx = dispatch_tbl.raw_get::<f32>("vx").unwrap_or(0.0) + dx;
+                let vy = dispatch_tbl.raw_get::<f32>("vy").unwrap_or(0.0) + dy;
+                dispatch_tbl.raw_set("vx", vx)?;
+                dispatch_tbl.raw_set("vy", vy)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::KnockbackEntity {
+                    target_id: entity_id,
+                    dx,
+                    dy,
+                });
+                Ok(Value::Nil)
+            }
+            "set_position" => {
+                let x = num_args.first().copied().unwrap_or(0.0);
+                let y = num_args.get(1).copied().unwrap_or(0.0);
+                dispatch_tbl.raw_set("x", x)?;
+                dispatch_tbl.raw_set("y", y)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::SetPosition {
+                    target_id: entity_id,
+                    x,
+                    y,
+                });
+                Ok(Value::Nil)
+            }
+            "set_velocity" => {
+                let vx = num_args.first().copied().unwrap_or(0.0);
+                let vy = num_args.get(1).copied().unwrap_or(0.0);
+                dispatch_tbl.raw_set("vx", vx)?;
+                dispatch_tbl.raw_set("vy", vy)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::SetVelocity {
+                    target_id: entity_id,
+                    vx,
+                    vy,
+                });
+                Ok(Value::Nil)
+            }
+            "set_alive" => {
+                let alive = match args_vec.get(2) {
+                    Some(Value::Boolean(b)) => *b,
+                    _ => true,
+                };
+                dispatch_tbl.raw_set("alive", alive)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::SetAlive {
+                    target_id: entity_id,
+                    alive,
+                });
+                Ok(Value::Nil)
+            }
+            _ => Ok(Value::Nil),
+        }
+    })?;
+    tbl.raw_set("__dispatch", dispatch)?;
+
+    // Apply shared metatable (installed once at runtime init)
+    let mt: mlua::Table = lua.globals().raw_get("__axiom_snap_mt")?;
+    tbl.set_metatable(Some(mt));
+
     Ok(tbl)
 }
 
@@ -2027,8 +2513,36 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
         Ok(just_pressed_actions.contains(action.trim()))
     })?;
     input_tbl.set("just_pressed", input_just_pressed)?;
+    // Mouse input
+    input_tbl.set("mouse_x", input.mouse_x)?;
+    input_tbl.set("mouse_y", input.mouse_y)?;
+    let mouse_left = input.mouse_left;
+    let mouse_right = input.mouse_right;
+    let mouse_middle = input.mouse_middle;
+    let mouse_left_jp = input.mouse_left_just_pressed;
+    let mouse_right_jp = input.mouse_right_just_pressed;
+    let mouse_middle_jp = input.mouse_middle_just_pressed;
+    let mouse_pressed_fn = lua.create_function(move |_lua, button: String| {
+        Ok(match button.trim().to_lowercase().as_str() {
+            "left" => mouse_left,
+            "right" => mouse_right,
+            "middle" => mouse_middle,
+            _ => false,
+        })
+    })?;
+    input_tbl.set("mouse_pressed", mouse_pressed_fn)?;
+    let mouse_just_pressed_fn = lua.create_function(move |_lua, button: String| {
+        Ok(match button.trim().to_lowercase().as_str() {
+            "left" => mouse_left_jp,
+            "right" => mouse_right_jp,
+            "middle" => mouse_middle_jp,
+            _ => false,
+        })
+    })?;
+    input_tbl.set("mouse_just_pressed", mouse_just_pressed_fn)?;
     world_tbl.set("input", input_tbl)?;
     let entities_for_all = entities.clone();
+    let cmds_for_all = pending_commands.clone();
     let find_all_fn = lua.create_function(move |lua_ctx, tag: Option<String>| {
         let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
         let out = lua_ctx.create_table()?;
@@ -2037,13 +2551,14 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
             .iter()
             .filter(|e| entity_matches_tag(e, tag))
         {
-            out.set(index, lua_entity_table(lua_ctx, entity)?)?;
+            out.set(index, lua_entity_table(lua_ctx, entity, &cmds_for_all)?)?;
             index += 1;
         }
         Ok(out)
     })?;
     world_tbl.set("find_all", find_all_fn)?;
     let entities_for_radius = entities.clone();
+    let cmds_for_radius = pending_commands.clone();
     let find_in_radius_fn = lua.create_function(
         move |lua_ctx, (x, y, radius, tag): (f32, f32, f32, Option<String>)| {
             let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
@@ -2057,7 +2572,7 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
                 let dx = entity.x - x;
                 let dy = entity.y - y;
                 if dx * dx + dy * dy <= max_d2 {
-                    out.set(index, lua_entity_table(lua_ctx, entity)?)?;
+                    out.set(index, lua_entity_table(lua_ctx, entity, &cmds_for_radius)?)?;
                     index += 1;
                 }
             }
@@ -2066,6 +2581,7 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
     )?;
     world_tbl.set("find_in_radius", find_in_radius_fn)?;
     let entities_for_nearest = entities.clone();
+    let cmds_for_nearest = pending_commands.clone();
     let find_nearest_fn =
         lua.create_function(move |lua_ctx, (x, y, tag): (f32, f32, Option<String>)| {
             let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
@@ -2082,23 +2598,25 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
                     da.total_cmp(&db)
                 });
             match nearest {
-                Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity)?)),
+                Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_nearest)?)),
                 None => Ok(Value::Nil),
             }
         })?;
     world_tbl.set("find_nearest", find_nearest_fn)?;
     let entities_for_get = entities.clone();
+    let cmds_for_get = pending_commands.clone();
     let get_entity_fn = lua.create_function(move |lua_ctx, id: u64| {
         match entities_for_get.iter().find(|e| e.id == id) {
-            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity)?)),
+            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_get)?)),
             None => Ok(Value::Nil),
         }
     })?;
     world_tbl.set("get_entity", get_entity_fn)?;
     let entities_for_player = entities.clone();
+    let cmds_for_player = pending_commands.clone();
     let player_fn = lua.create_function(move |lua_ctx, _: Option<mlua::Table>| {
         match entities_for_player.iter().find(|e| e.is_player) {
-            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity)?)),
+            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_player)?)),
             None => Ok(Value::Nil),
         }
     })?;
@@ -2352,7 +2870,7 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
     let spawn_particles_commands_ref = pending_commands.clone();
     let spawn_particles_script_name = script_name.to_string();
     let spawn_particles_fn =
-        lua.create_function_mut(move |lua_ctx, (preset, x, y): (String, f32, f32)| {
+        lua.create_function_mut(move |lua_ctx, (preset, x, y, angle): (String, f32, f32, Option<f32>)| {
             let preset = preset.trim().to_string();
             if preset.is_empty() {
                 return Ok(());
@@ -2363,6 +2881,7 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
                     preset: preset.clone(),
                     x,
                     y,
+                    angle,
                     script_name: spawn_particles_script_name.clone(),
                     source_entity,
                 });
@@ -2394,6 +2913,121 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
         Ok(())
     })?;
     world_tbl.set("despawn", despawn_fn)?;
+
+    // world.tween(entity_id, {property="x", to=100, duration=0.5, easing="ease_out"})
+    let tween_commands_ref = pending_commands.clone();
+    let tween_fn = lua.create_function_mut(move |_lua, (entity_id, opts): (u64, mlua::Table)| {
+        let property: String = opts.get("property")?;
+        let to: f32 = opts.get("to")?;
+        let from: Option<f32> = opts.get("from").ok();
+        let duration: f32 = opts.get("duration").unwrap_or(0.5);
+        let easing: Option<String> = opts.get("easing").ok();
+        let tween_id: Option<String> = opts.get("tween_id").ok();
+        tween_commands_ref
+            .borrow_mut()
+            .push(ScriptWorldCommand::TweenEntity {
+                target_id: entity_id,
+                property,
+                to,
+                from,
+                duration,
+                easing,
+                tween_id,
+            });
+        Ok(())
+    })?;
+    world_tbl.set("tween", tween_fn)?;
+
+    // world.screen_flash(duration, color?)
+    let flash_commands_ref = pending_commands.clone();
+    let screen_flash_fn =
+        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+            let color_arr = if let Some(tbl) = color {
+                let r: f32 = tbl.get(1).unwrap_or(1.0);
+                let g: f32 = tbl.get(2).unwrap_or(1.0);
+                let b: f32 = tbl.get(3).unwrap_or(1.0);
+                Some([r, g, b])
+            } else {
+                None
+            };
+            flash_commands_ref
+                .borrow_mut()
+                .push(ScriptWorldCommand::ScreenEffect {
+                    effect: "flash".to_string(),
+                    duration,
+                    color: color_arr,
+                });
+            Ok(())
+        })?;
+    world_tbl.set("screen_flash", screen_flash_fn)?;
+
+    // world.screen_fade_out(duration, color?)
+    let fade_out_commands_ref = pending_commands.clone();
+    let screen_fade_out_fn =
+        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+            let color_arr = if let Some(tbl) = color {
+                let r: f32 = tbl.get(1).unwrap_or(0.0);
+                let g: f32 = tbl.get(2).unwrap_or(0.0);
+                let b: f32 = tbl.get(3).unwrap_or(0.0);
+                Some([r, g, b])
+            } else {
+                None
+            };
+            fade_out_commands_ref
+                .borrow_mut()
+                .push(ScriptWorldCommand::ScreenEffect {
+                    effect: "fade_out".to_string(),
+                    duration,
+                    color: color_arr,
+                });
+            Ok(())
+        })?;
+    world_tbl.set("screen_fade_out", screen_fade_out_fn)?;
+
+    // world.screen_fade_in(duration, color?)
+    let fade_in_commands_ref = pending_commands.clone();
+    let screen_fade_in_fn =
+        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+            let color_arr = if let Some(tbl) = color {
+                let r: f32 = tbl.get(1).unwrap_or(0.0);
+                let g: f32 = tbl.get(2).unwrap_or(0.0);
+                let b: f32 = tbl.get(3).unwrap_or(0.0);
+                Some([r, g, b])
+            } else {
+                None
+            };
+            fade_in_commands_ref
+                .borrow_mut()
+                .push(ScriptWorldCommand::ScreenEffect {
+                    effect: "fade_in".to_string(),
+                    duration,
+                    color: color_arr,
+                });
+            Ok(())
+        })?;
+    world_tbl.set("screen_fade_in", screen_fade_in_fn)?;
+
+    // world.set_ambient(intensity, color?)
+    let ambient_commands_ref = pending_commands.clone();
+    let set_ambient_fn =
+        lua.create_function_mut(move |_lua, (intensity, color): (f32, Option<mlua::Table>)| {
+            let color_arr = if let Some(tbl) = color {
+                let r: f32 = tbl.get(1).unwrap_or(1.0);
+                let g: f32 = tbl.get(2).unwrap_or(1.0);
+                let b: f32 = tbl.get(3).unwrap_or(1.0);
+                Some([r, g, b])
+            } else {
+                None
+            };
+            ambient_commands_ref
+                .borrow_mut()
+                .push(ScriptWorldCommand::SetAmbient {
+                    intensity,
+                    color: color_arr,
+                });
+            Ok(())
+        })?;
+    world_tbl.set("set_ambient", set_ambient_fn)?;
 
     let game_tbl = lua.create_table()?;
     game_tbl.set("state", game_state)?;
@@ -2461,6 +3095,49 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
         Ok(())
     })?;
     world_tbl.set("emit", emit_fn)?;
+
+    // Script logging: world.log(msg) or world.log(level, msg)
+    let log_entries = lua.create_table()?;
+    let log_idx = Rc::new(RefCell::new(0usize));
+    let log_entries_ref = log_entries.clone();
+    let log_script_name = script_name.to_string();
+    let log_fn = lua.create_function_mut(move |lua_ctx, args: mlua::MultiValue| {
+        let args_vec: Vec<Value> = args.into_iter().collect();
+        let (level, message) = if args_vec.len() >= 2 {
+            // Skip leading table arg from colon syntax
+            let mut str_args = Vec::new();
+            for val in &args_vec {
+                if let Value::String(s) = val {
+                    str_args.push(s.to_string_lossy().to_string());
+                }
+            }
+            if str_args.len() >= 2 {
+                (str_args[0].clone(), str_args[1].clone())
+            } else if str_args.len() == 1 {
+                ("info".to_string(), str_args[0].clone())
+            } else {
+                ("info".to_string(), format!("{:?}", args_vec))
+            }
+        } else if let Some(Value::String(s)) = args_vec.first() {
+            ("info".to_string(), s.to_string_lossy().to_string())
+        } else if let Some(val) = args_vec.first() {
+            ("info".to_string(), format!("{:?}", val))
+        } else {
+            return Ok(());
+        };
+        let entry = lua_ctx.create_table()?;
+        entry.set("level", level)?;
+        entry.set("message", message)?;
+        entry.set("script_name", log_script_name.as_str())?;
+        entry.set("frame", frame)?;
+        entry.set("entity_id", source_entity)?;
+        let mut idx = log_idx.borrow_mut();
+        *idx += 1;
+        log_entries_ref.set(*idx, entry)?;
+        Ok(())
+    })?;
+    world_tbl.set("log", log_fn)?;
+    world_tbl.set("__axiom_pending_logs", log_entries)?;
 
     let on_events = world_events.clone();
     let on_fn =
@@ -2732,6 +3409,239 @@ fn build_min_world_table(
     Ok((world_tbl, pending_events, pending_commands))
 }
 
+/// Despawn entities that have been marked with PendingDeath for at least 1 frame.
+fn cleanup_pending_death(
+    mut commands: Commands,
+    frame: Res<ScriptFrame>,
+    query: Query<(Entity, &PendingDeath)>,
+) {
+    for (entity, pending) in query.iter() {
+        // Wait at least 1 frame so entity scripts can run on_death()
+        if frame.frame > pending.frame_marked {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// Tick the script frame counter even when gameplay is paused.
+/// This runs unconditionally so always-run scripts have an accurate frame count.
+fn tick_script_frame_always(
+    mut frame: ResMut<ScriptFrame>,
+    time: Res<Time<Fixed>>,
+    runtime_state: Res<crate::game_runtime::RuntimeState>,
+) {
+    // Only tick if gameplay systems did NOT already tick (to avoid double-counting)
+    if !runtime_state.is_gameplay_active() {
+        frame.frame = frame.frame.saturating_add(1);
+        frame.seconds += time.delta_secs_f64();
+    }
+}
+
+/// Run global scripts marked as always_run, even during pause/game_over.
+/// Skips scripts that were already run by the normal gated system.
+fn run_always_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
+    // Only run if gameplay is NOT enabled (otherwise the normal system already ran them)
+    if ctx.runtime_state.is_gameplay_active() {
+        return;
+    }
+
+    let GlobalScriptSystemCtx {
+        mut commands,
+        mut engine,
+        mut errors,
+        mut perf,
+        frame,
+        time,
+        vinput,
+        mouse_input,
+        event_bus,
+        mut tilemap,
+        config,
+        mut next_network_id,
+        runtime_state,
+        mut tilemap_cache,
+        entity_cache,
+        mut log_buffer,
+        mut runtime,
+    } = ctx;
+    let start = std::time::Instant::now();
+    let dt = time.delta_secs();
+    let cache = &mut runtime.0;
+    let shared_tilemap = tilemap_cache.tilemap.clone();
+    let lua = &cache.lua;
+    let input_snapshot = Arc::new(LuaInputSnapshot {
+        active: vinput.active.clone(),
+        just_pressed: vinput.just_pressed.clone(),
+        mouse_x: mouse_input.world_x,
+        mouse_y: mouse_input.world_y,
+        mouse_left: mouse_input.left,
+        mouse_right: mouse_input.right,
+        mouse_middle: mouse_input.middle,
+        mouse_left_just_pressed: mouse_input.left_just_pressed,
+        mouse_right_just_pressed: mouse_input.right_just_pressed,
+        mouse_middle_just_pressed: mouse_input.middle_just_pressed,
+    });
+    let bus_events = &event_bus.recent;
+    let mut network_lookup = entity_cache.network_lookup.clone();
+    let raycast_entities = entity_cache.entities.clone();
+    let mut pending_world_commands = Vec::<ScriptWorldCommand>::new();
+
+    let always_run_names: Vec<String> = engine
+        .always_run_scripts
+        .iter()
+        .filter(|name| engine.global_scripts.contains(*name))
+        .cloned()
+        .collect();
+
+    for script_name in always_run_names {
+        lua.expire_registry_values();
+        if engine.disabled_global_scripts.contains(&script_name) {
+            continue;
+        }
+        let update = {
+            let Some(source) = engine.scripts.get(&script_name) else {
+                continue;
+            };
+            match get_or_compile_update(lua, &mut cache.compiled, &script_name, source) {
+                Ok(f) => f,
+                Err(err_msg) => {
+                    let streak = engine
+                        .global_error_streaks
+                        .entry(script_name.clone())
+                        .or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    errors.push(ScriptError {
+                        script_name: script_name.clone(),
+                        entity_id: None,
+                        error_message: err_msg,
+                        frame: frame.frame,
+                    });
+                    if *streak >= MAX_GLOBAL_SCRIPT_ERROR_STREAK {
+                        engine.disabled_global_scripts.insert(script_name.clone());
+                    }
+                    continue;
+                }
+            }
+        };
+        let last_event_frame = engine
+            .global_event_cursors
+            .get(&script_name)
+            .copied()
+            .unwrap_or(0);
+        let world_events = Arc::new(
+            bus_events
+                .iter()
+                .filter(|ev| ev.frame > last_event_frame)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+
+        let globals = lua.globals();
+        let _ = globals.set("__axiom_current_script", script_name.as_str());
+
+        let world_tbl = build_world_table(
+            lua,
+            &WorldBuildArgs {
+                vars: &engine.vars,
+                script_name: &script_name,
+                frame: frame.frame,
+                seconds: frame.seconds,
+                dt,
+                source_entity: None,
+                tilemap: &shared_tilemap,
+                config: &config,
+                entities: &raycast_entities,
+                input: &input_snapshot,
+                world_events: &world_events,
+                game_state: &runtime_state.state,
+            },
+        );
+        let (world_tbl, pending_events, pending_commands) = match world_tbl {
+            Ok(v) => v,
+            Err(err) => {
+                let streak = engine
+                    .global_error_streaks
+                    .entry(script_name.clone())
+                    .or_insert(0);
+                *streak = streak.saturating_add(1);
+                errors.push(ScriptError {
+                    script_name: script_name.clone(),
+                    entity_id: None,
+                    error_message: err.to_string(),
+                    frame: frame.frame,
+                });
+                if *streak >= MAX_GLOBAL_SCRIPT_ERROR_STREAK {
+                    engine.disabled_global_scripts.insert(script_name.clone());
+                }
+                continue;
+            }
+        };
+        let limits = script_execution_limits();
+        let run_result = call_lua_with_budget(
+            lua,
+            Duration::from_millis(limits.global_budget_ms),
+            limits.instruction_interval,
+            || update.call::<()>((world_tbl.clone(), dt)),
+        );
+        if let Err(err) = run_result {
+            let streak = engine
+                .global_error_streaks
+                .entry(script_name.clone())
+                .or_insert(0);
+            *streak = streak.saturating_add(1);
+            errors.push(ScriptError {
+                script_name: script_name.clone(),
+                entity_id: None,
+                error_message: err.to_string(),
+                frame: frame.frame,
+            });
+            if *streak >= MAX_GLOBAL_SCRIPT_ERROR_STREAK {
+                engine.disabled_global_scripts.insert(script_name.clone());
+            }
+            continue;
+        }
+        engine.global_error_streaks.insert(script_name.clone(), 0);
+
+        if let Ok(vars_val) = world_tbl.get::<Value>("vars") {
+            if let Ok(vars) = lua.from_value::<HashMap<String, serde_json::Value>>(vars_val) {
+                engine.vars = vars;
+            }
+        }
+        for event in pending_events.borrow().iter() {
+            engine.push_event(event.clone());
+        }
+        for cmd in pending_commands.borrow().iter() {
+            pending_world_commands.push(cmd.clone());
+        }
+        if let Ok(logs_tbl) = world_tbl.get::<Value>("__axiom_pending_logs") {
+            if let Ok(logs) = lua.from_value::<Vec<ScriptLogEntry>>(logs_tbl) {
+                for entry in logs {
+                    log_buffer.push(entry);
+                }
+            }
+        }
+        engine
+            .global_event_cursors
+            .insert(script_name.clone(), frame.frame);
+    }
+
+    let tilemap_changed = apply_script_world_commands(
+        &mut commands,
+        &mut tilemap,
+        &mut next_network_id,
+        &mut network_lookup,
+        &mut errors,
+        frame.frame,
+        pending_world_commands,
+    );
+    if tilemap_changed {
+        tilemap_cache.tilemap = Arc::new(tilemap.clone());
+    }
+
+    let _ = runtime.0.lua.gc_collect();
+    perf.script_time_ms += start.elapsed().as_secs_f32() * 1000.0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2823,6 +3733,7 @@ mod tests {
     #[test]
     fn world_tile_and_entity_raycast_bindings_work() {
         let lua = Lua::new();
+        install_entity_snapshot_metatable(&lua).expect("install metatable");
         let vars = HashMap::new();
         let mut tiles = vec![crate::components::TileType::Empty as u8; 6 * 4];
         tiles[6 + 2] = crate::components::TileType::Solid as u8;
@@ -2846,6 +3757,8 @@ mod tests {
                 is_player: false,
                 aabb: Some((Vec2::new(20.0, 0.0), Vec2::new(30.0, 20.0))),
                 tags: HashSet::from(["enemy".to_string()]),
+                health: Some(5.0),
+                max_health: Some(5.0),
             },
             LuaEntitySnapshot {
                 id: 202,
@@ -2858,11 +3771,14 @@ mod tests {
                 is_player: false,
                 aabb: Some((Vec2::new(40.0, 0.0), Vec2::new(50.0, 20.0))),
                 tags: HashSet::from(["pickup".to_string()]),
+                health: None,
+                max_health: None,
             },
         ]);
         let input = Arc::new(LuaInputSnapshot {
             active: HashSet::from(["left".to_string()]),
             just_pressed: HashSet::from(["jump".to_string()]),
+            ..Default::default()
         });
         let world_events = Arc::new(Vec::<GameEvent>::new());
         let (world, _pending, _commands) = build_world_table(
