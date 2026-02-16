@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rust check
+        shell: pwsh
+        run: cargo check -q
+
+      - name: Rust tests
+        shell: pwsh
+        run: cargo test -q
+
+      - name: Rust fmt check
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Rust clippy guardrails
+        shell: pwsh
+        run: cargo clippy -q --all-targets --all-features -- -D clippy::erasing_op
+
+      - name: WASM check
+        shell: pwsh
+        run: cargo check -q --target wasm32-unknown-unknown --features web_export
+
+      - name: Python syntax check
+        shell: pwsh
+        run: |
+          python -m py_compile demo.py demo_client.py demo_examples.py demo_replay.py demo_perf.py demo_export.py demo_fighting.py demo_rts.py demo_topdown.py load_topdown.py tools/web_export_runtime_smoke.py tools/perf_long_horizon.py
+
+      - name: Build headless binary
+        shell: pwsh
+        run: cargo build -q
+
+      - name: Headless smoke demos
+        shell: pwsh
+        env:
+          AXIOM_API_RATE_LIMIT_PER_SEC: "5000"
+          AXIOM_ENGINE_CMD: target\debug\axiom.exe --headless
+        run: |
+          python demo_examples.py --start-engine --startup-timeout 120
+          python demo_replay.py --start-engine --startup-timeout 120
+          python demo_perf.py --start-engine --startup-timeout 120
+          python demo_topdown.py --start-engine --startup-timeout 120
+          python demo_rts.py --start-engine --startup-timeout 120
+          python demo_fighting.py --start-engine --startup-timeout 120
+          python load_topdown.py --start-engine --startup-timeout 120
+          python demo.py --start-engine --startup-timeout 120

@@ -3,3 +3,14 @@ build_output.txt
 *.exe
 /samurai_sprite
 screenshot.png
+__pycache__/
+*.pyc
+run_headless_*.out.txt
+run_headless_*.err.txt
+perf_headless_*.out.txt
+perf_headless_*.err.txt
+replays/
+saves/
+export/
+artifacts/
+tmp_level.json

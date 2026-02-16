@@ -8,9 +8,46 @@ pub struct SpritePlugin;
 impl Plugin for SpritePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(SpriteAssets::default())
+            .insert_resource(SpriteSheetRegistry::default())
             .insert_resource(PlayerAnimations::default())
             .add_systems(PreStartup, init_sprites)
-            .add_systems(Update, (animate_player, update_player_animation_state).chain());
+            .add_systems(PostStartup, setup_player_sprite)
+            .add_systems(Update, apply_player_animation_from_controller);
+    }
+}
+
+/// After player is spawned, add AnimationState and set up sprite from loaded animations
+fn setup_player_sprite(
+    mut commands: Commands,
+    player_anims: Res<PlayerAnimations>,
+    query: Query<Entity, With<crate::components::Player>>,
+) {
+    let Ok(entity) = query.get_single() else {
+        return;
+    };
+    let mut entity_cmd = commands.entity(entity);
+    entity_cmd.insert(crate::components::AnimationController {
+        graph: "samurai_player".to_string(),
+        state: "idle".to_string(),
+        frame: 0,
+        timer: 0.0,
+        speed: 1.0,
+        playing: true,
+        facing_right: true,
+        auto_from_velocity: true,
+    });
+    // If samurai sprites loaded, set up the initial sprite
+    if let Some(ref idle_data) = player_anims.idle {
+        let mut s = Sprite::from_atlas_image(
+            idle_data.texture.clone(),
+            TextureAtlas {
+                layout: idle_data.layout.clone(),
+                index: 0,
+            },
+        );
+        s.custom_size = Some(Vec2::new(140.0, 140.0));
+        s.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.29));
+        entity_cmd.insert(s);
     }
 }
 
@@ -36,6 +73,10 @@ impl SpriteAssets {
             crate::components::TileType::Solid => "tile_solid",
             crate::components::TileType::Spike => "tile_spike",
             crate::components::TileType::Goal => "tile_goal",
+            crate::components::TileType::Platform => "tile_platform",
+            crate::components::TileType::SlopeUp => "tile_slope_up",
+            crate::components::TileType::SlopeDown => "tile_slope_down",
+            crate::components::TileType::Ladder => "tile_ladder",
             crate::components::TileType::Empty => return None,
         };
         self.get(name)
@@ -47,6 +88,38 @@ impl SpriteAssets {
 pub struct SpriteManifest {
     pub player: Option<SpriteEntry>,
     pub tiles: HashMap<String, SpriteEntry>,
+}
+
+#[derive(Resource, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SpriteSheetRegistry {
+    pub sheets: HashMap<String, SpriteSheetDef>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpriteSheetDef {
+    pub path: String,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub columns: u32,
+    #[serde(default)]
+    pub animations: HashMap<String, SpriteSheetAnimationDef>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpriteSheetAnimationDef {
+    #[serde(default)]
+    pub frames: Vec<usize>,
+    pub fps: f32,
+    #[serde(default = "default_true")]
+    pub looping: bool,
+    #[serde(default)]
+    pub next: Option<String>,
+    #[serde(default)]
+    pub events: Vec<crate::animation::AnimFrameEventDef>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -71,34 +144,6 @@ pub struct AnimationData {
     pub texture: Handle<Image>,
     pub layout: Handle<TextureAtlasLayout>,
     pub frame_count: usize,
-}
-
-/// Component tracking player's current animation state
-#[derive(Component)]
-pub struct AnimationState {
-    pub current: AnimationType,
-    pub frame: usize,
-    pub timer: f32,
-    pub fps: f32,
-    pub facing_right: bool,
-}
-
-impl Default for AnimationState {
-    fn default() -> Self {
-        Self {
-            current: AnimationType::Idle,
-            frame: 0,
-            timer: 0.0,
-            fps: 10.0,
-            facing_right: true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AnimationType {
-    Idle,
-    Run,
 }
 
 fn init_sprites(
@@ -177,58 +222,29 @@ fn load_samurai_sprites(
     });
 }
 
-/// Update animation state based on player velocity
-fn update_player_animation_state(
-    mut query: Query<(&crate::components::Velocity, &mut AnimationState), With<crate::components::Player>>,
-) {
-    for (vel, mut anim) in query.iter_mut() {
-        // Determine facing direction
-        if vel.x > 1.0 {
-            anim.facing_right = true;
-        } else if vel.x < -1.0 {
-            anim.facing_right = false;
-        }
-
-        // Determine animation type
-        let new_anim = if vel.x.abs() > 1.0 {
-            AnimationType::Run
-        } else {
-            AnimationType::Idle
-        };
-
-        if new_anim != anim.current {
-            anim.current = new_anim;
-            anim.frame = 0;
-            anim.timer = 0.0;
-            anim.fps = match new_anim {
-                AnimationType::Idle => 8.0,
-                AnimationType::Run => 12.0,
-            };
-        }
-    }
-}
-
-/// Advance animation frames and update sprite
-fn animate_player(
-    time: Res<Time>,
+fn apply_player_animation_from_controller(
     player_anims: Res<PlayerAnimations>,
-    mut query: Query<(&mut Sprite, &mut AnimationState), With<crate::components::Player>>,
+    library: Option<Res<crate::animation::AnimationLibrary>>,
+    mut query: Query<
+        (&mut Sprite, &crate::components::AnimationController),
+        With<crate::components::Player>,
+    >,
 ) {
-    for (mut sprite, mut anim) in query.iter_mut() {
-        let anim_data = match anim.current {
-            AnimationType::Idle => player_anims.idle.as_ref(),
-            AnimationType::Run => player_anims.run.as_ref(),
+    for (mut sprite, anim) in query.iter_mut() {
+        let anim_data = match anim.state.as_str() {
+            "run" => player_anims.run.as_ref(),
+            "attack" => player_anims.attack.as_ref(),
+            "hurt" => player_anims.hurt.as_ref(),
+            _ => player_anims.idle.as_ref(),
         };
 
         let Some(data) = anim_data else { continue };
-
-        // Advance timer
-        anim.timer += time.delta_secs();
-        let frame_time = 1.0 / anim.fps;
-        if anim.timer >= frame_time {
-            anim.timer -= frame_time;
-            anim.frame = (anim.frame + 1) % data.frame_count;
-        }
+        let render_frame = library
+            .as_ref()
+            .and_then(|lib| lib.graphs.get(&anim.graph))
+            .and_then(|graph| graph.states.get(&anim.state))
+            .map(|clip| crate::animation::resolve_clip_frame(clip, anim.frame))
+            .unwrap_or(anim.frame % data.frame_count.max(1));
 
         // Character is ~23x34 px at y=47-81 in 96x96 frame (91% padding)
         // Anchor offset puts character feet (image y=81) at hitbox bottom
@@ -237,7 +253,7 @@ fn animate_player(
         sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.29));
         sprite.texture_atlas = Some(TextureAtlas {
             layout: data.layout.clone(),
-            index: anim.frame,
+            index: render_frame % data.frame_count.max(1),
         });
         sprite.flip_x = !anim.facing_right;
     }
@@ -249,46 +265,42 @@ fn load_from_manifest(
     sprite_assets: &mut SpriteAssets,
 ) {
     if let Some(ref entry) = manifest.player {
-        sprite_assets.textures.insert(
-            "player".to_string(),
-            asset_server.load(&entry.path),
-        );
+        sprite_assets
+            .textures
+            .insert("player".to_string(), asset_server.load(&entry.path));
     }
 
     for (name, entry) in &manifest.tiles {
         let key = format!("tile_{}", name);
-        sprite_assets.textures.insert(
-            key,
-            asset_server.load(&entry.path),
-        );
+        sprite_assets
+            .textures
+            .insert(key, asset_server.load(&entry.path));
     }
 }
 
-fn generate_placeholders(
-    images: &mut Assets<Image>,
-    sprite_assets: &mut SpriteAssets,
-) {
+fn generate_placeholders(images: &mut Assets<Image>, sprite_assets: &mut SpriteAssets) {
     let ts = 16u32;
 
-    sprite_assets.textures.insert(
-        "tile_solid".to_string(),
-        images.add(make_brick_tile(ts)),
-    );
+    sprite_assets
+        .textures
+        .insert("tile_solid".to_string(), images.add(make_brick_tile(ts)));
 
-    sprite_assets.textures.insert(
-        "tile_spike".to_string(),
-        images.add(make_spike_tile(ts)),
-    );
+    sprite_assets
+        .textures
+        .insert("tile_spike".to_string(), images.add(make_spike_tile(ts)));
 
-    sprite_assets.textures.insert(
-        "tile_goal".to_string(),
-        images.add(make_goal_tile(ts)),
-    );
+    sprite_assets
+        .textures
+        .insert("tile_goal".to_string(), images.add(make_goal_tile(ts)));
 }
 
 fn make_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     Image::new(
-        Extent3d { width, height, depth_or_array_layers: 1 },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         data,
         TextureFormat::Rgba8UnormSrgb,
@@ -296,13 +308,16 @@ fn make_image(width: u32, height: u32, data: Vec<u8>) -> Image {
     )
 }
 
-fn set_pixel(data: &mut [u8], width: u32, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
+#[derive(Clone, Copy)]
+struct Rgba(u8, u8, u8, u8);
+
+fn set_pixel(data: &mut [u8], width: u32, x: u32, y: u32, color: Rgba) {
     let idx = ((y * width + x) * 4) as usize;
     if idx + 3 < data.len() {
-        data[idx] = r;
-        data[idx + 1] = g;
-        data[idx + 2] = b;
-        data[idx + 3] = a;
+        data[idx] = color.0;
+        data[idx + 1] = color.1;
+        data[idx + 2] = color.2;
+        data[idx + 3] = color.3;
     }
 }
 
@@ -318,10 +333,10 @@ fn make_brick_tile(size: u32) -> Image {
             let by = y % brick_h;
             let is_mortar = bx == 0 || by == 0;
             if is_mortar {
-                set_pixel(&mut data, size, x, y, 60, 58, 55, 255);
+                set_pixel(&mut data, size, x, y, Rgba(60, 58, 55, 255));
             } else {
                 let base = 90 + ((row * 7) % 20) as u8;
-                set_pixel(&mut data, size, x, y, base + 10, base, base - 5, 255);
+                set_pixel(&mut data, size, x, y, Rgba(base + 10, base, base - 5, 255));
             }
         }
     }
@@ -342,9 +357,9 @@ fn make_spike_tile(size: u32) -> Image {
                 let t = iy as f32 / size as f32;
                 let r = (220.0 - t * 80.0) as u8;
                 let g = (40.0 - t * 30.0).max(10.0) as u8;
-                set_pixel(&mut data, size, x, y, r, g, 15, 255);
+                set_pixel(&mut data, size, x, y, Rgba(r, g, 15, 255));
             } else {
-                set_pixel(&mut data, size, x, y, 30, 20, 20, 255);
+                set_pixel(&mut data, size, x, y, Rgba(30, 20, 20, 255));
             }
         }
     }
@@ -364,11 +379,11 @@ fn make_goal_tile(size: u32) -> Image {
                 let t = dist / mid;
                 let g = (255.0 - t * 80.0) as u8;
                 let r = (80.0 + t * 40.0) as u8;
-                set_pixel(&mut data, size, x, y, r, g, 60, 255);
+                set_pixel(&mut data, size, x, y, Rgba(r, g, 60, 255));
             } else if dist <= mid {
-                set_pixel(&mut data, size, x, y, 200, 255, 200, 255);
+                set_pixel(&mut data, size, x, y, Rgba(200, 255, 200, 255));
             } else {
-                set_pixel(&mut data, size, x, y, 0, 0, 0, 0);
+                set_pixel(&mut data, size, x, y, Rgba(0, 0, 0, 0));
             }
         }
     }

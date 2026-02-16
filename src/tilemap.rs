@@ -1,6 +1,6 @@
-use bevy::prelude::*;
 use crate::components::*;
 use crate::sprites::SpriteAssets;
+use bevy::prelude::*;
 
 pub struct TilemapPlugin;
 
@@ -21,21 +21,45 @@ pub struct Tilemap {
 }
 
 impl Tilemap {
-    pub fn get(&self, x: i32, y: i32) -> TileType {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return TileType::Empty;
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn get_tile(&self, x: i32, y: i32) -> u8 {
+        if x < 0 || y < 0 || x >= self.width() as i32 || y >= self.height() as i32 {
+            return TileType::Empty as u8;
         }
-        TileType::from_u8(self.tiles[y as usize * self.width + x as usize])
+        self.tiles[y as usize * self.width() + x as usize]
+    }
+
+    pub fn tile_id(&self, x: i32, y: i32) -> u8 {
+        self.get_tile(x, y)
+    }
+
+    pub fn get(&self, x: i32, y: i32) -> TileType {
+        TileType::from_u8(self.tile_id(x, y))
+    }
+
+    pub fn set_tile(&mut self, x: i32, y: i32, tile_id: u8) {
+        if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
+            self.tiles[y as usize * self.width + x as usize] = tile_id;
+        }
     }
 
     pub fn set(&mut self, x: i32, y: i32, tile: TileType) {
-        if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
-            self.tiles[y as usize * self.width + x as usize] = tile as u8;
-        }
+        self.set_tile(x, y, tile as u8);
     }
 
     pub fn is_solid(&self, x: i32, y: i32) -> bool {
         self.get(x, y).is_solid()
+    }
+
+    pub fn is_ground(&self, x: i32, y: i32) -> bool {
+        self.get(x, y).is_ground_like()
     }
 
     /// A simple test level for development
@@ -45,21 +69,21 @@ impl Tilemap {
         let mut tiles = vec![0u8; width * height];
 
         // Ground floor (y=0, bottom row)
-        for x in 0..width {
-            tiles[0 * width + x] = TileType::Solid as u8;
+        for tile in tiles.iter_mut().take(width) {
+            *tile = TileType::Solid as u8;
         }
 
         // Gap in ground (x=15..18)
-        for x in 15..18 {
-            tiles[0 * width + x] = TileType::Empty as u8;
+        for tile in tiles.iter_mut().take(18).skip(15) {
+            *tile = TileType::Empty as u8;
         }
 
         // Spikes at bottom of gap
         // (gap is at y=0, spikes don't make sense at y=0 since it's the floor)
         // Instead, make the gap deeper and add spikes below - but we only have y>=0
         // So let's put spikes at the gap positions as the floor
-        for x in 15..18 {
-            tiles[0 * width + x] = TileType::Spike as u8;
+        for tile in tiles.iter_mut().take(18).skip(15) {
+            *tile = TileType::Spike as u8;
         }
 
         // Platforms
@@ -96,7 +120,7 @@ impl Tilemap {
 
         // Goal platform and goal tile
         for x in 50..55 {
-            tiles[1 * width + x] = TileType::Solid as u8;
+            tiles[width + x] = TileType::Solid as u8;
         }
         tiles[2 * width + 52] = TileType::Goal as u8;
 
@@ -117,9 +141,13 @@ pub struct TileEntity;
 fn spawn_tilemap(
     mut commands: Commands,
     tilemap: Res<Tilemap>,
-    physics: Res<PhysicsConfig>,
-    sprite_assets: Res<SpriteAssets>,
+    physics: Res<GameConfig>,
+    headless: Res<HeadlessMode>,
+    sprite_assets: Option<Res<SpriteAssets>>,
 ) {
+    if headless.0 {
+        return;
+    } // No visual tiles in headless mode
     let ts = physics.tile_size;
     for y in 0..tilemap.height {
         for x in 0..tilemap.width {
@@ -128,33 +156,44 @@ fn spawn_tilemap(
                 continue;
             }
 
-            let sprite = if let Some(handle) = sprite_assets.get_tile(tile_type) {
-                Sprite {
-                    image: handle.clone(),
-                    custom_size: Some(Vec2::new(ts, ts)),
-                    ..default()
+            let sprite = if let Some(ref sa) = sprite_assets {
+                if let Some(handle) = sa.get_tile(tile_type) {
+                    Sprite {
+                        image: handle.clone(),
+                        custom_size: Some(Vec2::new(ts, ts)),
+                        ..default()
+                    }
+                } else {
+                    tile_color_sprite(tile_type, ts)
                 }
             } else {
-                let color = match tile_type {
-                    TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
-                    TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
-                    TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
-                    TileType::Empty => unreachable!(),
-                };
-                Sprite::from_color(color, Vec2::new(ts, ts))
+                tile_color_sprite(tile_type, ts)
             };
 
             commands.spawn((
                 TileEntity,
                 Tile { tile_type },
-                GridPosition { x: x as i32, y: y as i32 },
+                GridPosition {
+                    x: x as i32,
+                    y: y as i32,
+                },
                 sprite,
-                Transform::from_xyz(
-                    x as f32 * ts + ts / 2.0,
-                    y as f32 * ts + ts / 2.0,
-                    0.0,
-                ),
+                Transform::from_xyz(x as f32 * ts + ts / 2.0, y as f32 * ts + ts / 2.0, 0.0),
             ));
         }
     }
+}
+
+pub fn tile_color_sprite(tile_type: TileType, ts: f32) -> Sprite {
+    let color = match tile_type {
+        TileType::Solid => Color::srgb(0.4, 0.4, 0.45),
+        TileType::Spike => Color::srgb(0.9, 0.15, 0.15),
+        TileType::Goal => Color::srgb(0.15, 0.9, 0.3),
+        TileType::Platform => Color::srgb(0.85, 0.7, 0.2),
+        TileType::SlopeUp => Color::srgb(0.2, 0.65, 0.9),
+        TileType::SlopeDown => Color::srgb(0.18, 0.52, 0.82),
+        TileType::Ladder => Color::srgb(0.72, 0.47, 0.2),
+        TileType::Empty => Color::NONE,
+    };
+    Sprite::from_color(color, Vec2::new(ts, ts))
 }

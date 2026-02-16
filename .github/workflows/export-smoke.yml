@@ -1,0 +1,52 @@
+name: Export Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install wasm-bindgen-cli
+        shell: pwsh
+        run: cargo install wasm-bindgen-cli --locked
+
+      - name: Install Playwright
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install chromium
+
+      - name: Build headless binary
+        shell: pwsh
+        run: cargo build -q
+
+      - name: Export + browser runtime smoke
+        shell: pwsh
+        env:
+          AXIOM_API_RATE_LIMIT_PER_SEC: "5000"
+        run: |
+          $exe = Join-Path (Get-Location) 'target\debug\axiom.exe'
+          $proc = Start-Process -FilePath $exe -ArgumentList '--headless' -PassThru
+          try {
+            Start-Sleep -Seconds 3
+            python demo_export.py --require-ready
+            python tools/web_export_runtime_smoke.py export/web --timeout 90
+          } finally {
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+            }
+          }

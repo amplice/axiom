@@ -1,0 +1,44 @@
+name: perf-long-horizon
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+
+jobs:
+  perf-long-horizon:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build (debug)
+        run: cargo build --quiet
+
+      - name: Run long-horizon perf profiler
+        run: >
+          python tools/perf_long_horizon.py
+          --start-engine
+          --duration-per-example 6
+          --warmup-seconds 1.5
+          --sample-interval 0.25
+          --output artifacts/perf_long_horizon.json
+          --write-thresholds artifacts/perf_thresholds.autogen.json
+          --apply-thresholds artifacts/perf_thresholds.calibrated.json
+          --thresholds-file tools/perf_thresholds.example.json
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-long-horizon-report
+          path: |
+            artifacts/perf_long_horizon.json
+            artifacts/perf_thresholds.autogen.json
+            artifacts/perf_thresholds.calibrated.json

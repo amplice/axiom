@@ -1,7 +1,7 @@
-use serde::Serialize;
-use crate::components::PhysicsConfig;
+use crate::components::GameConfig;
+use crate::simulation::{self, SimInput, SimulationRequest};
 use crate::tilemap::Tilemap;
-use crate::simulation::{self, SimulationRequest, SimInput};
+use serde::Serialize;
 
 #[derive(Serialize, Clone)]
 pub struct JumpProfile {
@@ -34,7 +34,7 @@ pub struct JumpDeviations {
 
 #[derive(Serialize)]
 pub struct TuneResult {
-    pub physics: PhysicsConfig,
+    pub physics: GameConfig,
     pub before: JumpProfile,
     pub after: JumpProfile,
     pub target: JumpProfile,
@@ -42,15 +42,15 @@ pub struct TuneResult {
 }
 
 /// Measure jump feel by running a simulation with a jump input
-pub fn measure_jump(tilemap: &Tilemap, physics: &PhysicsConfig) -> JumpProfile {
+pub fn measure_jump(_tilemap: &Tilemap, physics: &GameConfig) -> JumpProfile {
     let ts = physics.tile_size;
 
     // Create a flat floor tilemap for measurement
     let width = 40;
     let height = 20;
     let mut tiles = vec![0u8; width * height];
-    for x in 0..width {
-        tiles[x] = 1; // solid ground at y=0
+    for tile in tiles.iter_mut().take(width) {
+        *tile = 1; // solid ground at y=0
     }
 
     let measure_map = Tilemap {
@@ -65,12 +65,25 @@ pub fn measure_jump(tilemap: &Tilemap, physics: &PhysicsConfig) -> JumpProfile {
     let req = SimulationRequest {
         tilemap: None,
         inputs: vec![
-            SimInput { frame: 0, action: "jump".to_string(), duration: 60 },
-            SimInput { frame: 0, action: "right".to_string(), duration: 120 },
+            SimInput {
+                frame: 0,
+                action: "jump".to_string(),
+                duration: 60,
+            },
+            SimInput {
+                frame: 0,
+                action: "right".to_string(),
+                duration: 120,
+            },
         ],
         max_frames: 180,
         record_interval: 1,
         physics: None,
+        goal_position: None,
+        goal_radius: None,
+        initial_game_state: None,
+        state_transitions: Vec::new(),
+        moving_platforms: Vec::new(),
     };
     let result = simulation::run_simulation(&measure_map, physics, &req);
 
@@ -80,7 +93,6 @@ pub fn measure_jump(tilemap: &Tilemap, physics: &PhysicsConfig) -> JumpProfile {
     let mut max_y = f32::MIN;
     let mut start_y = 0.0f32;
     let mut apex_frame = 0u32;
-    let mut landed = false;
     let mut land_x = 0.0f32;
 
     if let Some(first) = result.trace.first() {
@@ -93,7 +105,6 @@ pub fn measure_jump(tilemap: &Tilemap, physics: &PhysicsConfig) -> JumpProfile {
             apex_frame = frame.frame;
         }
         if i > 0 && frame.grounded && !result.trace[i - 1].grounded && frame.frame > 5 {
-            landed = true;
             land_x = frame.x;
             break;
         }
@@ -132,15 +143,32 @@ pub fn measure_jump(tilemap: &Tilemap, physics: &PhysicsConfig) -> JumpProfile {
     let short_req = SimulationRequest {
         tilemap: None,
         inputs: vec![
-            SimInput { frame: 0, action: "jump".to_string(), duration: 3 },
-            SimInput { frame: 0, action: "right".to_string(), duration: 120 },
+            SimInput {
+                frame: 0,
+                action: "jump".to_string(),
+                duration: 3,
+            },
+            SimInput {
+                frame: 0,
+                action: "right".to_string(),
+                duration: 120,
+            },
         ],
         max_frames: 180,
         record_interval: 1,
         physics: None,
+        goal_position: None,
+        goal_radius: None,
+        initial_game_state: None,
+        state_transitions: Vec::new(),
+        moving_platforms: Vec::new(),
     };
     let short_result = simulation::run_simulation(&measure_map, physics, &short_req);
-    let short_max_y = short_result.trace.iter().map(|f| f.y).fold(f32::MIN, f32::max);
+    let short_max_y = short_result
+        .trace
+        .iter()
+        .map(|f| f.y)
+        .fold(f32::MIN, f32::max);
     let variable_height = (max_y - short_max_y).abs() > ts * 0.5;
 
     JumpProfile {
@@ -200,8 +228,10 @@ pub fn compare(current: &JumpProfile, target: &JumpProfile) -> FeelComparison {
     };
 
     // Calculate match percentage
-    let rise_match = 1.0 - (devs.rise_frames.abs() as f32 / target.rise_frames.max(1) as f32).min(1.0);
-    let fall_match = 1.0 - (devs.fall_frames.abs() as f32 / target.fall_frames.max(1) as f32).min(1.0);
+    let rise_match =
+        1.0 - (devs.rise_frames.abs() as f32 / target.rise_frames.max(1) as f32).min(1.0);
+    let fall_match =
+        1.0 - (devs.fall_frames.abs() as f32 / target.fall_frames.max(1) as f32).min(1.0);
     let height_match = 1.0 - (devs.max_height.abs() / target.max_height_tiles.max(0.1)).min(1.0);
     let ratio_match = 1.0 - (devs.gravity_ratio.abs() / target.gravity_ratio.max(0.1)).min(1.0);
 
@@ -217,10 +247,9 @@ pub fn compare(current: &JumpProfile, target: &JumpProfile) -> FeelComparison {
 }
 
 /// Auto-tune physics to match target jump profile
-pub fn auto_tune(tilemap: &Tilemap, physics: &PhysicsConfig, target: &JumpProfile) -> TuneResult {
+pub fn auto_tune(tilemap: &Tilemap, physics: &GameConfig, target: &JumpProfile) -> TuneResult {
     let before = measure_jump(tilemap, physics);
     let mut best_physics = physics.clone();
-    let mut best_match = 0.0f32;
 
     // Target max height in world units
     let ts = physics.tile_size;
@@ -233,7 +262,7 @@ pub fn auto_tune(tilemap: &Tilemap, physics: &PhysicsConfig, target: &JumpProfil
         let tuned_gravity = 2.0 * target_height / (target_rise_time * target_rise_time);
         let tuned_jump_vel = tuned_gravity * target_rise_time;
 
-        best_physics.gravity = tuned_gravity;
+        best_physics.gravity = bevy::prelude::Vec2::new(0.0, -tuned_gravity);
         best_physics.jump_velocity = tuned_jump_vel;
 
         // Fall multiplier from gravity ratio

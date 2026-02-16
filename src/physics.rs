@@ -1,164 +1,383 @@
-use bevy::prelude::*;
 use crate::components::*;
+use crate::input::LocalPlayerId;
+use crate::input::VirtualInput;
+use crate::perf::PerfAccum;
+use crate::physics_core::{self, PhysicsCounters};
 use crate::tilemap::Tilemap;
+use bevy::prelude::*;
+use bevy::utils::Instant;
 
 pub struct PhysicsPlugin;
 
 impl Plugin for PhysicsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(FixedUpdate, (
-            apply_gravity,
-            player_movement,
-            apply_velocity,
-            check_grounded,
-            update_coyote_timer,
-        ).chain());
+        app.add_systems(
+            FixedUpdate,
+            (
+                moving_platform_system,
+                ladder_movement,
+                apply_gravity,
+                horizontal_movement,
+                top_down_movement,
+                jump_system,
+                apply_velocity,
+                check_grounded,
+                update_coyote_timer,
+            )
+                .chain()
+                .run_if(crate::game_runtime::gameplay_systems_enabled),
+        );
     }
 }
 
-const PLAYER_WIDTH: f32 = 12.0;
-const PLAYER_HEIGHT: f32 = 14.0;
+type PlatformRiderQueryItem<'a> = (
+    &'a mut GamePosition,
+    &'a Collider,
+    Option<&'a mut Velocity>,
+    Option<&'a mut Grounded>,
+);
 
-/// Player AABB in world space
-struct Aabb {
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
-}
+type HorizontalMovementQueryItem<'a> = (
+    &'a GamePosition,
+    &'a Collider,
+    &'a Grounded,
+    &'a mut Velocity,
+    &'a HorizontalMover,
+    Option<&'a NetworkId>,
+    Option<&'a Player>,
+);
 
-impl Aabb {
-    fn from_center(x: f32, y: f32) -> Self {
-        let hw = PLAYER_WIDTH / 2.0;
-        let hh = PLAYER_HEIGHT / 2.0;
-        Self {
-            min_x: x - hw,
-            min_y: y - hh,
-            max_x: x + hw,
-            max_y: y + hh,
+type LadderMovementQueryItem<'a> = (
+    &'a GamePosition,
+    &'a Collider,
+    &'a mut Velocity,
+    &'a mut Grounded,
+    Option<&'a TopDownMover>,
+    Option<&'a NetworkId>,
+    Option<&'a Player>,
+);
+
+type JumpSystemQueryItem<'a> = (
+    &'a mut Velocity,
+    &'a Grounded,
+    &'a mut CoyoteTimer,
+    &'a mut JumpBuffer,
+    &'a Jumper,
+    Option<&'a NetworkId>,
+    Option<&'a Player>,
+);
+
+fn moving_platform_system(
+    time: Res<Time<Fixed>>,
+    mut platforms: Query<(&mut GamePosition, &Collider, &mut MovingPlatform)>,
+    mut riders: Query<PlatformRiderQueryItem<'_>, Without<MovingPlatform>>,
+) {
+    let dt = time.delta_secs();
+    let mut motions = Vec::<physics_core::PlatformMotion>::new();
+
+    for (mut pos, collider, mut platform) in platforms.iter_mut() {
+        if platform.waypoints.len() < 2 {
+            continue;
+        }
+        if platform.current_waypoint >= platform.waypoints.len() {
+            platform.current_waypoint = 0;
+        }
+        if platform.direction == 0 {
+            platform.direction = 1;
+        }
+        if platform.pause_timer > 0 {
+            platform.pause_timer -= 1;
+            continue;
+        }
+
+        let prev = Vec2::new(pos.x, pos.y);
+        let target = platform.waypoints[platform.current_waypoint];
+        let to_target = target - prev;
+        let dist = to_target.length();
+        let max_step = platform.speed.max(0.0) * dt;
+        if max_step <= 0.0 {
+            continue;
+        }
+
+        let reached = dist <= max_step + 0.001;
+        let next = if reached {
+            target
+        } else {
+            prev + to_target.normalize_or_zero() * max_step
+        };
+        let delta = next - prev;
+        if delta.length_squared() > 0.000001 {
+            pos.x = next.x;
+            pos.y = next.y;
+            if platform.carry_riders {
+                motions.push(physics_core::PlatformMotion {
+                    prev_x: prev.x,
+                    prev_y: prev.y,
+                    delta_x: delta.x,
+                    delta_y: delta.y,
+                    width: collider.width,
+                    height: collider.height,
+                });
+            }
+        }
+
+        if reached {
+            advance_platform_waypoint(&mut platform);
+        }
+    }
+
+    if motions.is_empty() {
+        return;
+    }
+
+    for (mut rider_pos, rider_collider, mut rider_vel, mut rider_grounded) in riders.iter_mut() {
+        for motion in &motions {
+            if !physics_core::rider_on_platform_top(
+                rider_pos.x,
+                rider_pos.y,
+                rider_collider.width,
+                rider_collider.height,
+                motion,
+            ) {
+                continue;
+            }
+
+            rider_pos.x += motion.delta_x;
+            rider_pos.y += motion.delta_y;
+            if let Some(vel) = rider_vel.as_deref_mut() {
+                if motion.delta_y > 0.0 {
+                    vel.y = vel.y.max(0.0);
+                }
+            }
+            if let Some(grounded) = rider_grounded.as_deref_mut() {
+                grounded.0 = true;
+            }
+            break;
         }
     }
 }
 
-fn tile_aabb(tx: i32, ty: i32, tile_size: f32) -> (f32, f32, f32, f32) {
-    let x = tx as f32 * tile_size;
-    let y = ty as f32 * tile_size;
-    (x, y, x + tile_size, y + tile_size)
+fn advance_platform_waypoint(platform: &mut MovingPlatform) {
+    let len = platform.waypoints.len();
+    if len <= 1 {
+        platform.current_waypoint = 0;
+        return;
+    }
+    match platform.loop_mode {
+        PlatformLoopMode::Loop => {
+            platform.current_waypoint = (platform.current_waypoint + 1) % len;
+        }
+        PlatformLoopMode::PingPong => {
+            let dir = if platform.direction >= 0 {
+                1isize
+            } else {
+                -1isize
+            };
+            let next = platform.current_waypoint as isize + dir;
+            if next < 0 || next >= len as isize {
+                platform.direction = -platform.direction;
+                let new_dir = if platform.direction >= 0 {
+                    1isize
+                } else {
+                    -1isize
+                };
+                let bounced = platform.current_waypoint as isize + new_dir;
+                platform.current_waypoint = bounced.clamp(0, len as isize - 1) as usize;
+            } else {
+                platform.current_waypoint = next as usize;
+            }
+        }
+    }
+    if platform.pause_frames > 0 {
+        platform.pause_timer = platform.pause_frames;
+    }
 }
 
 fn apply_gravity(
-    config: Res<PhysicsConfig>,
+    config: Res<GameConfig>,
     time: Res<Time<Fixed>>,
-    mut query: Query<(&mut Velocity, &Grounded), With<Player>>,
+    mut query: Query<(&mut Velocity, &Grounded, Option<&Jumper>), With<GravityBody>>,
 ) {
     let dt = time.delta_secs();
-    for (mut vel, grounded) in query.iter_mut() {
-        if !grounded.0 {
-            let mult = if vel.y < 0.0 { config.fall_multiplier } else { 1.0 };
-            vel.y -= config.gravity * mult * dt;
+    let grav = config.gravity_magnitude();
+    for (mut vel, grounded, jumper) in query.iter_mut() {
+        let fall_mult = jumper.map_or(config.fall_multiplier, |j| j.fall_multiplier);
+        physics_core::apply_gravity(&mut vel.y, grounded.0, grav, fall_mult, dt);
+    }
+}
+
+fn horizontal_movement(
+    config: Res<GameConfig>,
+    tilemap: Res<Tilemap>,
+    vinput: Res<VirtualInput>,
+    local_player: Res<LocalPlayerId>,
+    mut query: Query<HorizontalMovementQueryItem<'_>>,
+) {
+    for (pos, collider, grounded, mut vel, mover, network_id, player) in query.iter_mut() {
+        if !entity_uses_local_input(player, network_id, &local_player) {
+            continue;
+        }
+        let left = vinput.pressed(&mover.left_action);
+        let right = vinput.pressed(&mover.right_action);
+        if left || right {
+            vel.x = physics_core::horizontal_velocity(left, right, mover.speed);
+            continue;
+        }
+        if grounded.0 {
+            let friction = physics_core::surface_friction(
+                &tilemap,
+                &config,
+                pos.x,
+                pos.y,
+                collider.width,
+                collider.height,
+            );
+            physics_core::apply_surface_friction(&mut vel.x, friction);
         }
     }
 }
 
-fn player_movement(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    config: Res<PhysicsConfig>,
-    mut query: Query<(&mut Velocity, &Grounded, &mut CoyoteTimer, &mut JumpBuffer), With<Player>>,
+fn ladder_movement(
+    config: Res<GameConfig>,
+    tilemap: Res<Tilemap>,
+    vinput: Res<VirtualInput>,
+    local_player: Res<LocalPlayerId>,
+    mut query: Query<LadderMovementQueryItem<'_>>,
 ) {
-    for (mut vel, grounded, mut coyote, mut jump_buf) in query.iter_mut() {
-        // Horizontal
-        let mut dir = 0.0f32;
-        if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
-            dir -= 1.0;
+    for (pos, collider, mut vel, mut grounded, top_down, network_id, player) in query.iter_mut() {
+        if !entity_uses_local_input(player, network_id, &local_player) {
+            continue;
         }
-        if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
-            dir += 1.0;
+        if !overlaps_climbable(&tilemap, &config, pos, collider) {
+            continue;
         }
-        vel.x = dir * config.move_speed;
+        let climb_up = vinput.pressed("up") || vinput.pressed("jump");
+        let climb_down = vinput.pressed("down");
+        let speed = top_down.map(|m| m.speed).unwrap_or(config.move_speed * 0.8);
+        if climb_up && !climb_down {
+            vel.y = speed;
+            grounded.0 = true;
+        } else if climb_down && !climb_up {
+            vel.y = -speed;
+            grounded.0 = true;
+        } else {
+            vel.y = 0.0;
+            grounded.0 = true;
+        }
+    }
+}
 
-        // Jump buffer
-        if keyboard.just_pressed(KeyCode::Space) || keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::ArrowUp) {
-            jump_buf.0 = config.jump_buffer_frames;
+fn top_down_movement(
+    vinput: Res<VirtualInput>,
+    local_player: Res<LocalPlayerId>,
+    mut query: Query<(
+        &mut Velocity,
+        &TopDownMover,
+        Option<&NetworkId>,
+        Option<&Player>,
+    )>,
+) {
+    for (mut vel, mover, network_id, player) in query.iter_mut() {
+        if !entity_uses_local_input(player, network_id, &local_player) {
+            continue;
         }
-        if jump_buf.0 > 0 {
-            jump_buf.0 -= 1;
+        let mut dx = 0.0f32;
+        let mut dy = 0.0f32;
+        if vinput.pressed(&mover.left_action) {
+            dx -= 1.0;
         }
+        if vinput.pressed(&mover.right_action) {
+            dx += 1.0;
+        }
+        if vinput.pressed(&mover.up_action) {
+            dy += 1.0;
+        }
+        if vinput.pressed(&mover.down_action) {
+            dy -= 1.0;
+        }
+        let dir = Vec2::new(dx, dy);
+        let dir = if dir.length() > 0.0 {
+            dir.normalize()
+        } else {
+            dir
+        };
+        vel.x = dir.x * mover.speed;
+        vel.y = dir.y * mover.speed;
+    }
+}
 
-        // Jump
-        let can_jump = grounded.0 || coyote.0 > 0;
-        let wants_jump = jump_buf.0 > 0 || keyboard.just_pressed(KeyCode::Space) || keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::ArrowUp);
-
-        if can_jump && wants_jump {
-            vel.y = config.jump_velocity;
-            coyote.0 = 0;
-            jump_buf.0 = 0;
+fn jump_system(
+    vinput: Res<VirtualInput>,
+    local_player: Res<LocalPlayerId>,
+    mut query: Query<JumpSystemQueryItem<'_>>,
+) {
+    for (mut vel, grounded, mut coyote, mut jump_buf, jumper, network_id, player) in
+        query.iter_mut()
+    {
+        if !entity_uses_local_input(player, network_id, &local_player) {
+            continue;
         }
-
-        // Variable jump height: release early = cut velocity
-        if !keyboard.pressed(KeyCode::Space) && !keyboard.pressed(KeyCode::KeyW) && !keyboard.pressed(KeyCode::ArrowUp) {
-            if vel.y > 0.0 {
-                vel.y *= 0.5; // Cut upward velocity when jump button released
-            }
-        }
+        let jump_just_pressed = vinput.just_pressed(&jumper.action);
+        let jump_pressed = vinput.pressed(&jumper.action);
+        physics_core::update_jump_buffer(jump_just_pressed, &mut jump_buf.0, jumper.buffer_frames);
+        let _jumped = physics_core::try_jump(
+            grounded.0,
+            &mut coyote.0,
+            &mut jump_buf.0,
+            jump_just_pressed,
+            jumper.velocity,
+            &mut vel.y,
+        );
+        physics_core::apply_variable_jump(&mut vel.y, jump_pressed, jumper.variable_height);
     }
 }
 
 fn apply_velocity(
-    config: Res<PhysicsConfig>,
+    config: Res<GameConfig>,
     time: Res<Time<Fixed>>,
     tilemap: Res<Tilemap>,
-    mut query: Query<(&mut GamePosition, &mut Velocity, &mut Alive), With<Player>>,
+    mut perf: ResMut<PerfAccum>,
+    mut query: Query<(&mut GamePosition, &mut Velocity, &mut Alive, &Collider)>,
 ) {
+    let start = Instant::now();
     let dt = time.delta_secs();
     let ts = config.tile_size;
+    let mut counters = PhysicsCounters::default();
 
-    for (mut pos, mut vel, mut alive) in query.iter_mut() {
-        // Move X first, then Y (separate axis resolution)
-        let dx = vel.x * dt;
-        let dy = vel.y * dt;
-
-        // Resolve X
-        let new_x = pos.x + dx;
-        let aabb = Aabb::from_center(new_x, pos.y);
-        if !collides_solid(&tilemap, &aabb, ts) {
-            pos.x = new_x;
-        } else {
-            // Snap to edge of tile
-            if dx > 0.0 {
-                // Moving right, snap to left edge of blocking tile
-                let tile_x = ((aabb.max_x) / ts).floor() as i32;
-                pos.x = tile_x as f32 * ts - PLAYER_WIDTH / 2.0 - 0.01;
-            } else if dx < 0.0 {
-                // Moving left, snap to right edge of blocking tile
-                let tile_x = ((aabb.min_x) / ts).floor() as i32;
-                pos.x = (tile_x + 1) as f32 * ts + PLAYER_WIDTH / 2.0 + 0.01;
-            }
-            vel.x = 0.0;
-        }
-
-        // Resolve Y
-        let new_y = pos.y + dy;
-        let aabb = Aabb::from_center(pos.x, new_y);
-        if !collides_solid(&tilemap, &aabb, ts) {
-            pos.y = new_y;
-        } else {
-            if dy < 0.0 {
-                // Falling, snap to top of tile
-                let tile_y = ((aabb.min_y) / ts).floor() as i32;
-                pos.y = (tile_y + 1) as f32 * ts + PLAYER_HEIGHT / 2.0;
-            } else if dy > 0.0 {
-                // Rising, snap to bottom of tile (head bonk)
-                let tile_y = ((aabb.max_y) / ts).floor() as i32;
-                pos.y = tile_y as f32 * ts - PLAYER_HEIGHT / 2.0 - 0.01;
-            }
-            vel.y = 0.0;
-        }
+    for (mut pos, mut vel, mut alive, collider) in query.iter_mut() {
+        let motion = physics_core::resolve_motion(
+            &tilemap,
+            physics_core::MotionParams {
+                tile_size: ts,
+                dt,
+                x: pos.x,
+                y: pos.y,
+                vx: vel.x,
+                vy: vel.y,
+                width: collider.width,
+                height: collider.height,
+            },
+            &mut counters,
+        );
+        pos.x = motion.x;
+        pos.y = motion.y;
+        vel.x = motion.vx;
+        vel.y = motion.vy;
 
         // Check spikes
-        let aabb = Aabb::from_center(pos.x, pos.y);
-        if collides_type(&tilemap, &aabb, ts, TileType::Spike) {
+        if physics_core::collides_type(
+            &tilemap,
+            physics_core::CollisionQuery {
+                x: pos.x,
+                y: pos.y,
+                width: collider.width,
+                height: collider.height,
+                tile_size: ts,
+                target: TileType::Spike,
+            },
+            &mut counters,
+        ) {
             alive.0 = false;
-            // Respawn
             pos.x = tilemap.player_spawn.0;
             pos.y = tilemap.player_spawn.1;
             vel.x = 0.0;
@@ -166,13 +385,7 @@ fn apply_velocity(
             alive.0 = true;
         }
 
-        // Check goal
-        if collides_type(&tilemap, &aabb, ts, TileType::Goal) {
-            // For now just print
-            // In the full game this would trigger level completion
-        }
-
-        // Fall out of world → respawn
+        // Fall out of world -> respawn
         if pos.y < -100.0 {
             pos.x = tilemap.player_spawn.0;
             pos.y = tilemap.player_spawn.1;
@@ -180,89 +393,236 @@ fn apply_velocity(
             vel.y = 0.0;
         }
     }
+
+    perf.physics_time_ms += start.elapsed().as_secs_f32() * 1000.0;
+    perf.collision_checks = perf
+        .collision_checks
+        .saturating_add(counters.collision_checks);
 }
 
 fn check_grounded(
-    config: Res<PhysicsConfig>,
+    config: Res<GameConfig>,
     tilemap: Res<Tilemap>,
-    mut query: Query<(&GamePosition, &mut Grounded), With<Player>>,
+    mut perf: ResMut<PerfAccum>,
+    mut query: Query<(&GamePosition, &mut Grounded, &Collider)>,
 ) {
+    let start = Instant::now();
     let ts = config.tile_size;
-    for (pos, mut grounded) in query.iter_mut() {
-        // Check one pixel below player feet
-        let check_y = pos.y - PLAYER_HEIGHT / 2.0 - 0.5;
-        let left_x = pos.x - PLAYER_WIDTH / 2.0 + 1.0;
-        let right_x = pos.x + PLAYER_WIDTH / 2.0 - 1.0;
+    let mut counters = PhysicsCounters::default();
+    for (pos, mut grounded, collider) in query.iter_mut() {
+        grounded.0 = physics_core::compute_grounded(
+            &tilemap,
+            ts,
+            pos.x,
+            pos.y,
+            collider.width,
+            collider.height,
+            &mut counters,
+        );
+    }
+    perf.physics_time_ms += start.elapsed().as_secs_f32() * 1000.0;
+    perf.collision_checks = perf
+        .collision_checks
+        .saturating_add(counters.collision_checks);
+}
 
-        let left_tile_x = (left_x / ts).floor() as i32;
-        let right_tile_x = (right_x / ts).floor() as i32;
-        let tile_y = (check_y / ts).floor() as i32;
-
-        let mut on_ground = false;
-        for tx in left_tile_x..=right_tile_x {
-            if tilemap.is_solid(tx, tile_y) {
-                on_ground = true;
-                break;
-            }
-        }
-        grounded.0 = on_ground;
+fn update_coyote_timer(mut query: Query<(&Grounded, &mut CoyoteTimer, &Jumper)>) {
+    for (grounded, mut coyote, jumper) in query.iter_mut() {
+        physics_core::update_coyote_timer(grounded.0, &mut coyote.0, jumper.coyote_frames);
     }
 }
 
-fn update_coyote_timer(
-    config: Res<PhysicsConfig>,
-    mut query: Query<(&Grounded, &mut CoyoteTimer), With<Player>>,
-) {
-    for (grounded, mut coyote) in query.iter_mut() {
-        if grounded.0 {
-            coyote.0 = config.coyote_frames;
-        } else if coyote.0 > 0 {
-            coyote.0 -= 1;
-        }
+fn entity_uses_local_input(
+    player: Option<&Player>,
+    network_id: Option<&NetworkId>,
+    local_player: &LocalPlayerId,
+) -> bool {
+    if player.is_some() {
+        return true;
     }
+    if let (Some(network_id), Some(local_id)) = (network_id, local_player.0) {
+        return network_id.0 == local_id;
+    }
+    false
 }
 
-/// Check if AABB overlaps any solid tiles
-fn collides_solid(tilemap: &Tilemap, aabb: &Aabb, tile_size: f32) -> bool {
-    let min_tx = (aabb.min_x / tile_size).floor() as i32;
-    let max_tx = ((aabb.max_x - 0.01) / tile_size).floor() as i32;
-    let min_ty = (aabb.min_y / tile_size).floor() as i32;
-    let max_ty = ((aabb.max_y - 0.01) / tile_size).floor() as i32;
-
-    for ty in min_ty..=max_ty {
-        for tx in min_tx..=max_tx {
-            if tilemap.is_solid(tx, ty) {
-                // Check AABB overlap with this tile
-                let (t_min_x, t_min_y, t_max_x, t_max_y) = tile_aabb(tx, ty, tile_size);
-                if aabb.max_x > t_min_x && aabb.min_x < t_max_x
-                    && aabb.max_y > t_min_y && aabb.min_y < t_max_y
-                {
-                    return true;
-                }
+fn overlaps_climbable(
+    tilemap: &Tilemap,
+    config: &GameConfig,
+    pos: &GamePosition,
+    collider: &Collider,
+) -> bool {
+    let ts = config.tile_size.max(0.001);
+    let min_x = ((pos.x - collider.width / 2.0) / ts).floor() as i32;
+    let max_x = ((pos.x + collider.width / 2.0 - 0.01) / ts).floor() as i32;
+    let min_y = ((pos.y - collider.height / 2.0) / ts).floor() as i32;
+    let max_y = ((pos.y + collider.height / 2.0 - 0.01) / ts).floor() as i32;
+    for ty in min_y..=max_y {
+        for tx in min_x..=max_x {
+            if config.tile_types.is_climbable(tilemap.get_tile(tx, ty)) {
+                return true;
             }
         }
     }
     false
 }
 
-/// Check if AABB overlaps any tiles of a specific type
-fn collides_type(tilemap: &Tilemap, aabb: &Aabb, tile_size: f32, target: TileType) -> bool {
-    let min_tx = (aabb.min_x / tile_size).floor() as i32;
-    let max_tx = ((aabb.max_x - 0.01) / tile_size).floor() as i32;
-    let min_ty = (aabb.min_y / tile_size).floor() as i32;
-    let max_ty = ((aabb.max_y - 0.01) / tile_size).floor() as i32;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use std::time::Duration;
 
-    for ty in min_ty..=max_ty {
-        for tx in min_tx..=max_tx {
-            if tilemap.get(tx, ty) == target {
-                let (t_min_x, t_min_y, t_max_x, t_max_y) = tile_aabb(tx, ty, tile_size);
-                if aabb.max_x > t_min_x && aabb.min_x < t_max_x
-                    && aabb.max_y > t_min_y && aabb.min_y < t_max_y
-                {
-                    return true;
-                }
-            }
-        }
+    fn run_moving_platform_once(world: &mut World) {
+        world
+            .resource_mut::<Time<Fixed>>()
+            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        world
+            .run_system_once(moving_platform_system)
+            .expect("run moving_platform_system");
     }
-    false
+
+    #[test]
+    fn moving_platform_carries_rider_when_enabled() {
+        let mut world = World::new();
+        world.insert_resource(Time::<Fixed>::from_hz(60.0));
+
+        world.spawn((
+            GamePosition { x: 0.0, y: 0.0 },
+            Collider {
+                width: 32.0,
+                height: 8.0,
+            },
+            MovingPlatform {
+                waypoints: vec![Vec2::new(0.0, 0.0), Vec2::new(16.0, 0.0)],
+                speed: 960.0,
+                loop_mode: PlatformLoopMode::PingPong,
+                current_waypoint: 1,
+                direction: 1,
+                pause_frames: 0,
+                pause_timer: 0,
+                carry_riders: true,
+            },
+        ));
+
+        let rider = world
+            .spawn((
+                GamePosition { x: 0.0, y: 11.0 },
+                Collider {
+                    width: 12.0,
+                    height: 14.0,
+                },
+                Velocity::default(),
+                Grounded(true),
+            ))
+            .id();
+
+        run_moving_platform_once(&mut world);
+
+        let rider_pos = world
+            .get::<GamePosition>(rider)
+            .expect("rider position after move");
+        assert!((rider_pos.x - 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn moving_platform_does_not_carry_rider_when_disabled() {
+        let mut world = World::new();
+        world.insert_resource(Time::<Fixed>::from_hz(60.0));
+
+        world.spawn((
+            GamePosition { x: 0.0, y: 0.0 },
+            Collider {
+                width: 32.0,
+                height: 8.0,
+            },
+            MovingPlatform {
+                waypoints: vec![Vec2::new(0.0, 0.0), Vec2::new(16.0, 0.0)],
+                speed: 960.0,
+                loop_mode: PlatformLoopMode::PingPong,
+                current_waypoint: 1,
+                direction: 1,
+                pause_frames: 0,
+                pause_timer: 0,
+                carry_riders: false,
+            },
+        ));
+
+        let rider = world
+            .spawn((
+                GamePosition { x: 0.0, y: 11.0 },
+                Collider {
+                    width: 12.0,
+                    height: 14.0,
+                },
+                Velocity::default(),
+                Grounded(true),
+            ))
+            .id();
+
+        run_moving_platform_once(&mut world);
+
+        let rider_pos = world
+            .get::<GamePosition>(rider)
+            .expect("rider position after move");
+        assert!((rider_pos.x - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn horizontal_movement_only_consumes_input_for_local_player_entity() {
+        let mut world = World::new();
+        world.insert_resource(GameConfig::default());
+        world.insert_resource(Tilemap::test_level());
+        world.insert_resource(VirtualInput {
+            active: std::collections::HashSet::from(["left".to_string()]),
+            just_pressed: std::collections::HashSet::new(),
+            just_released: std::collections::HashSet::new(),
+        });
+        world.insert_resource(LocalPlayerId(Some(1)));
+
+        let local = world
+            .spawn((
+                NetworkId(1),
+                GamePosition { x: 20.0, y: 20.0 },
+                Collider {
+                    width: 12.0,
+                    height: 14.0,
+                },
+                Grounded(true),
+                Velocity::default(),
+                HorizontalMover {
+                    speed: 120.0,
+                    left_action: "left".to_string(),
+                    right_action: "right".to_string(),
+                },
+            ))
+            .id();
+
+        let npc = world
+            .spawn((
+                NetworkId(2),
+                GamePosition { x: 30.0, y: 20.0 },
+                Collider {
+                    width: 12.0,
+                    height: 14.0,
+                },
+                Grounded(true),
+                Velocity::default(),
+                HorizontalMover {
+                    speed: 120.0,
+                    left_action: "left".to_string(),
+                    right_action: "right".to_string(),
+                },
+            ))
+            .id();
+
+        world
+            .run_system_once(horizontal_movement)
+            .expect("run horizontal movement");
+
+        let local_vel = world.get::<Velocity>(local).expect("local velocity");
+        let npc_vel = world.get::<Velocity>(npc).expect("npc velocity");
+        assert!(local_vel.x < -0.1, "local entity should receive input");
+        assert!(npc_vel.x.abs() < 0.001, "npc should ignore keyboard input");
+    }
 }

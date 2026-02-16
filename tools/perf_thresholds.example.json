@@ -1,0 +1,16 @@
+{
+  "default": {
+    "min_fps_p50": 30,
+    "max_frame_ms_p95": 33,
+    "max_script_ms_p95": 25,
+    "max_physics_ms_p95": 25
+  },
+  "examples": {
+    "platformer_campaign": {
+      "min_fps_p50": 45
+    },
+    "puzzle_platformer_trials": {
+      "max_script_ms_p95": 20
+    }
+  }
+}
