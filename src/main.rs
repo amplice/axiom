@@ -48,6 +48,36 @@ mod world_text;
 use bevy::prelude::*;
 use components::{GameConfig, HeadlessMode, NextNetworkId};
 
+#[derive(serde::Deserialize, Default)]
+struct StartupConfig {
+    window_title: Option<String>,
+    window_width: Option<f32>,
+    window_height: Option<f32>,
+    background_color: Option<[f32; 3]>,
+    texture_filter: Option<String>,
+    assets_dir: Option<String>,
+}
+
+fn load_startup_config() -> StartupConfig {
+    let path = std::env::var("AXIOM_GAME_CONFIG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "game.json".to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<StartupConfig>(&contents) {
+            Ok(cfg) => {
+                println!("[Axiom] Loaded startup config from {}", path);
+                cfg
+            }
+            Err(e) => {
+                eprintln!("[Axiom] Failed to parse {}: {}", path, e);
+                StartupConfig::default()
+            }
+        },
+        Err(_) => StartupConfig::default(),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "--headless");
@@ -68,6 +98,7 @@ fn main() {
         }
     }
 
+    let startup_config = load_startup_config();
     let mut app = App::new();
 
     app.insert_resource(HeadlessMode(headless));
@@ -79,27 +110,48 @@ fn main() {
         println!("[Axiom] Starting in HEADLESS mode");
     } else {
         // Windowed mode: full rendering
-        // AXIOM_ASSETS_DIR env var lets games point at their own assets folder.
-        let assets_dir = std::env::var("AXIOM_ASSETS_DIR").unwrap_or_else(|_| "assets".to_string());
+        // Env vars override game.json values
+        let assets_dir = std::env::var("AXIOM_ASSETS_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or(startup_config.assets_dir)
+            .unwrap_or_else(|| "assets".to_string());
         if assets_dir != "assets" {
             println!("[Axiom] Using game assets dir: {}", assets_dir);
         }
-        app.add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Axiom".to_string(),
-                        resolution: (960.0, 540.0).into(),
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(bevy::asset::AssetPlugin {
-                    file_path: assets_dir,
+        let nearest_filter = std::env::var("AXIOM_TEXTURE_FILTER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or(startup_config.texture_filter)
+            .map_or(false, |v| v.eq_ignore_ascii_case("nearest"));
+
+        let window_title = startup_config.window_title.unwrap_or_else(|| "Axiom".to_string());
+        let window_width = startup_config.window_width.unwrap_or(960.0);
+        let window_height = startup_config.window_height.unwrap_or(540.0);
+
+        let mut plugins = DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: window_title,
+                    resolution: (window_width, window_height).into(),
+                    present_mode: bevy::window::PresentMode::AutoVsync,
                     ..default()
                 }),
-        );
-        app.insert_resource(ClearColor(Color::srgb(0.12, 0.18, 0.1)));
+                ..default()
+            })
+            .set(bevy::asset::AssetPlugin {
+                file_path: assets_dir,
+                ..default()
+            });
+
+        if nearest_filter {
+            plugins = plugins.set(bevy::render::texture::ImagePlugin::default_nearest());
+            println!("[Axiom] Texture filter: nearest (pixel-art mode)");
+        }
+
+        app.add_plugins(plugins);
+        let bg = startup_config.background_color.unwrap_or([0.12, 0.18, 0.1]);
+        app.insert_resource(ClearColor(Color::srgb(bg[0], bg[1], bg[2])));
         app.add_plugins(sprites::SpritePlugin);
         app.add_plugins(render::RenderPlugin);
         println!("[Axiom] Starting in WINDOWED mode");
@@ -127,7 +179,15 @@ fn main() {
         .add_plugins(scripting::ScriptingPlugin)
         .add_plugins(tween::TweenPlugin)
         .add_plugins(screen_effects::ScreenEffectsPlugin)
-        .add_plugins(lighting::LightingPlugin);
+        .add_plugins(lighting::LightingPlugin)
+        .add_plugins(parallax::ParallaxPlugin)
+        .add_plugins(weather::WeatherPlugin)
+        .add_plugins(cutscene::CutscenePlugin)
+        .add_plugins(inventory::InventoryPlugin)
+        .add_plugins(state_machine::StateMachinePlugin)
+        .add_plugins(trail::TrailPlugin)
+        .add_plugins(world_text::WorldTextPlugin)
+        .add_plugins(telemetry::TelemetryPlugin);
 
     #[cfg(any(feature = "web_export", feature = "desktop_export"))]
     app.add_plugins(web_bootstrap::WebBootstrapPlugin);

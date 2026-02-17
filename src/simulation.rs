@@ -828,6 +828,9 @@ fn advance_sim_platform_waypoint(platform: &mut SimPlatformState) {
 #[derive(Resource, Default)]
 pub struct PendingRealSim {
     pub active: Option<ActiveRealSim>,
+    /// When a real sim finishes, the saved state is moved here for restoration
+    /// by `process_api_commands` (which has the right system params).
+    pub restore_pending: Option<Box<crate::api::SaveGameData>>,
 }
 
 pub struct ActiveRealSim {
@@ -937,7 +940,7 @@ pub fn finalize_real_sim(
         });
     }
 
-    // If done, send result
+    // If done, send result and restore state
     if sim.frames_remaining == 0 {
         let events: Vec<crate::events::GameEvent> = event_bus.recent.iter().cloned().collect();
         let errors: Vec<crate::scripting::ScriptError> = script_errors.entries.iter().cloned().collect();
@@ -955,9 +958,17 @@ pub fn finalize_real_sim(
             }));
         }
 
-        // Restore runtime state
-        runtime.state = sim.saved_runtime_state.clone();
-        pending.active = None;
+        // Extract what we need before releasing the borrow on sim
+        let saved_runtime = sim.saved_runtime_state.clone();
+        let _ = sim;
+
+        // Restore runtime state immediately
+        runtime.state = saved_runtime;
+
+        // Take the active sim and move saved_state to restore_pending
+        if let Some(finished) = pending.active.take() {
+            pending.restore_pending = Some(Box::new(finished.saved_state));
+        }
     }
 }
 
@@ -1100,8 +1111,25 @@ pub fn tick_playtest_agent(
 
     let ts = config.tile_size;
 
+    // Goal-directed: determine goal position if using ReachGoal
+    let goal_pos: Option<(f32, f32)> = if pt.goal == PlaytestGoal::ReachGoal {
+        tilemap.goal.map(|(gx, gy)| {
+            let (wx, wy) = config.tile_mode.grid_to_world(gx as f32, gy as f32, ts);
+            (wx, wy)
+        })
+    } else {
+        None
+    };
+
     match pt.mode {
         PlaytestMode::Platformer => {
+            // Goal-aware: set direction toward goal if ReachGoal
+            if let Some((goal_x, _goal_y)) = goal_pos {
+                if (goal_x - px).abs() > ts {
+                    pt.direction = if goal_x > px { 1 } else { -1 };
+                }
+            }
+
             let dir_action = if pt.direction > 0 { "right" } else { "left" };
             vinput.active.insert(dir_action.to_string());
             *pt.input_counts.entry(dir_action.to_string()).or_insert(0) += 1;
@@ -1142,41 +1170,81 @@ pub fn tick_playtest_agent(
                 }
             }
 
-            if nearest_enemy_dist < 60.0 {
+            // Survive mode: be more cautious near enemies
+            let attack_range = if pt.goal == PlaytestGoal::Survive { 40.0 } else { 60.0 };
+            if nearest_enemy_dist < attack_range {
                 vinput.active.insert("attack".to_string());
                 vinput.just_pressed.insert("attack".to_string());
                 *pt.input_counts.entry("attack".to_string()).or_insert(0) += 1;
             }
+
+            // Check if reached goal tile
+            if let Some((goal_x, goal_y)) = goal_pos {
+                let dist_to_goal = ((px - goal_x).powi(2) + (py - goal_y).powi(2)).sqrt();
+                if dist_to_goal < ts * 1.5 {
+                    pt.events.push(crate::api::types::PlaytestEvent {
+                        frame: current_frame,
+                        event_type: "goal_reached".to_string(),
+                        x: px, y: py,
+                        detail: "player reached goal".to_string(),
+                    });
+                    pt.frames_remaining = 0;
+                    return;
+                }
+            }
         }
         PlaytestMode::TopDown => {
-            let phase = (current_frame / 120) % 4;
-            let (dir_x, dir_y): (f32, f32) = match phase {
-                0 => (1.0, 0.0),
-                1 => (0.0, 1.0),
-                2 => (-1.0, 0.0),
-                _ => (0.0, -1.0),
+            // Goal-aware: move toward goal in top-down mode
+            let (dir_x, dir_y): (f32, f32) = if let Some((goal_x, goal_y)) = goal_pos {
+                let dx = goal_x - px;
+                let dy = goal_y - py;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > ts * 1.5 {
+                    (dx / len, dy / len)
+                } else {
+                    // Reached goal
+                    pt.events.push(crate::api::types::PlaytestEvent {
+                        frame: current_frame,
+                        event_type: "goal_reached".to_string(),
+                        x: px, y: py,
+                        detail: "player reached goal".to_string(),
+                    });
+                    pt.frames_remaining = 0;
+                    return;
+                }
+            } else {
+                // Default exploration spiral
+                let phase = (current_frame / 120) % 4;
+                match phase {
+                    0 => (1.0, 0.0),
+                    1 => (0.0, 1.0),
+                    2 => (-1.0, 0.0),
+                    _ => (0.0, -1.0),
+                }
             };
 
-            if nearest_enemy_dist < 100.0 {
-                let flee_x = if nearest_enemy_dx > 0.0 { -1.0 } else { 1.0 };
-                let flee_y = if nearest_enemy_dy > 0.0 { -1.0 } else { 1.0 };
-                if flee_x > 0.0 { vinput.active.insert("right".to_string()); }
-                else { vinput.active.insert("left".to_string()); }
-                if flee_y > 0.0 { vinput.active.insert("up".to_string()); }
-                else { vinput.active.insert("down".to_string()); }
+            // Survive mode: prioritize fleeing over attacking
+            let flee_threshold = if pt.goal == PlaytestGoal::Survive { 150.0 } else { 100.0 };
+            let attack_threshold = if pt.goal == PlaytestGoal::Survive { 30.0 } else { 50.0 };
+
+            if nearest_enemy_dist < flee_threshold {
+                if nearest_enemy_dx > 0.0 { vinput.active.insert("left".to_string()); }
+                else { vinput.active.insert("right".to_string()); }
+                if nearest_enemy_dy > 0.0 { vinput.active.insert("down".to_string()); }
+                else { vinput.active.insert("up".to_string()); }
                 vinput.active.insert("sprint".to_string());
                 *pt.input_counts.entry("sprint".to_string()).or_insert(0) += 1;
 
-                if nearest_enemy_dist < 50.0 {
+                if nearest_enemy_dist < attack_threshold {
                     vinput.active.insert("attack".to_string());
                     vinput.just_pressed.insert("attack".to_string());
                     *pt.input_counts.entry("attack".to_string()).or_insert(0) += 1;
                 }
             } else {
-                if dir_x > 0.0 { vinput.active.insert("right".to_string()); *pt.input_counts.entry("right".to_string()).or_insert(0) += 1; }
-                if dir_x < 0.0 { vinput.active.insert("left".to_string()); *pt.input_counts.entry("left".to_string()).or_insert(0) += 1; }
-                if dir_y > 0.0 { vinput.active.insert("up".to_string()); *pt.input_counts.entry("up".to_string()).or_insert(0) += 1; }
-                if dir_y < 0.0 { vinput.active.insert("down".to_string()); *pt.input_counts.entry("down".to_string()).or_insert(0) += 1; }
+                if dir_x > 0.5 { vinput.active.insert("right".to_string()); *pt.input_counts.entry("right".to_string()).or_insert(0) += 1; }
+                if dir_x < -0.5 { vinput.active.insert("left".to_string()); *pt.input_counts.entry("left".to_string()).or_insert(0) += 1; }
+                if dir_y > 0.5 { vinput.active.insert("up".to_string()); *pt.input_counts.entry("up".to_string()).or_insert(0) += 1; }
+                if dir_y < -0.5 { vinput.active.insert("down".to_string()); *pt.input_counts.entry("down".to_string()).or_insert(0) += 1; }
             }
 
             // Wall check
@@ -1186,9 +1254,13 @@ pub fn tick_playtest_agent(
             let tile_cy = (check_y / ts) as i32;
             if tilemap.get(tile_cx, tile_cy) == TileType::Solid {
                 vinput.active.clear();
-                let perp_action = match phase { 0 | 2 => "up", _ => "right" };
-                vinput.active.insert(perp_action.to_string());
-                *pt.input_counts.entry(perp_action.to_string()).or_insert(0) += 1;
+                if dir_x.abs() > dir_y.abs() {
+                    vinput.active.insert("up".to_string());
+                    *pt.input_counts.entry("up".to_string()).or_insert(0) += 1;
+                } else {
+                    vinput.active.insert("right".to_string());
+                    *pt.input_counts.entry("right".to_string()).or_insert(0) += 1;
+                }
             }
 
             if pt.stuck_frames > 60 {
@@ -1250,10 +1322,13 @@ pub fn finalize_playtest(
     if stuck_count > 5 { notes.push(format!("Agent got stuck {} times - level may have navigation issues", stuck_count)); }
     if pt.total_damage > 0.0 { notes.push(format!("Total damage taken: {:.1}", pt.total_damage)); }
 
+    let goal_reached = pt.events.iter().any(|e| e.event_type == "goal_reached");
+
     if let Some(sender) = pt.sender.take() {
         let _ = sender.send(Ok(crate::api::types::PlaytestResult {
             frames_played,
             alive: player_alive,
+            goal_reached,
             deaths: std::mem::take(&mut pt.deaths),
             damage_taken: pt.total_damage,
             distance_traveled: pt.distance_traveled,

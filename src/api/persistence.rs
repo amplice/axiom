@@ -1,7 +1,7 @@
 use crate::components::GameConfig;
 use crate::tilemap::Tilemap;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub(crate) struct SaveGameData {
     pub version: u32,
     pub config: GameConfig,

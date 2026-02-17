@@ -1475,6 +1475,7 @@ fn default_playtest_frames() -> u32 {
 pub struct PlaytestResult {
     pub frames_played: u32,
     pub alive: bool,
+    pub goal_reached: bool,
     pub deaths: Vec<PlaytestEvent>,
     pub damage_taken: f32,
     pub distance_traveled: f32,
@@ -1624,4 +1625,35 @@ fn default_asset_gen_size() -> u32 {
 
 fn default_asset_color() -> [u8; 3] {
     [128, 128, 128]
+}
+
+// === Window Config API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct WindowConfigRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub background: Option<[f32; 3]>,
+}
+
+// === Evaluation API types ===
+
+#[derive(Serialize, Clone)]
+pub struct EvaluationResult {
+    pub scores: EvaluationScores,
+    pub issues: Vec<String>,
+    pub overall: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct EvaluationScores {
+    pub has_player: bool,
+    pub has_enemies: bool,
+    pub has_scripts: bool,
+    pub script_errors: usize,
+    pub entity_count: usize,
+    pub tile_variety: usize,
+    pub has_goal: bool,
+    pub game_vars_count: usize,
 }

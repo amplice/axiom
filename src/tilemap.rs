@@ -197,10 +197,11 @@ fn spawn_tilemap(
     let ts = physics.tile_size;
     for y in 0..tilemap.height {
         for x in 0..tilemap.width {
-            let tile_type = tilemap.get(x as i32, y as i32);
-            if tile_type == TileType::Empty {
+            let tile_id = tilemap.tile_id(x as i32, y as i32);
+            if tile_id == 0 {
                 continue;
             }
+            let tile_type = TileType::from_u8(tile_id);
 
             let sprite = if let Some(ref sa) = sprite_assets {
                 if let Some(handle) = sa.get_tile(tile_type) {
@@ -210,12 +211,13 @@ fn spawn_tilemap(
                         ..default()
                     }
                 } else {
-                    tile_color_sprite(tile_type, ts)
+                    tile_color_sprite_by_id(tile_id, &physics.tile_types, ts)
                 }
             } else {
-                tile_color_sprite(tile_type, ts)
+                tile_color_sprite_by_id(tile_id, &physics.tile_types, ts)
             };
 
+            let (wx, wy) = physics.tile_mode.grid_to_world(x as f32, y as f32, ts);
             commands.spawn((
                 TileEntity,
                 Tile { tile_type },
@@ -224,10 +226,21 @@ fn spawn_tilemap(
                     y: y as i32,
                 },
                 sprite,
-                Transform::from_xyz(x as f32 * ts + ts / 2.0, y as f32 * ts + ts / 2.0, 0.0),
+                Transform::from_xyz(wx, wy, 0.0),
             ));
         }
     }
+}
+
+/// Look up color from TileTypeRegistry, falling back to legacy TileType colors then gray.
+pub fn tile_color_sprite_by_id(tile_id: u8, registry: &TileTypeRegistry, ts: f32) -> Sprite {
+    if let Some(def) = registry.types.get(tile_id as usize) {
+        if let Some([r, g, b]) = def.color {
+            return Sprite::from_color(Color::srgb(r, g, b), Vec2::new(ts, ts));
+        }
+    }
+    // Fallback to legacy hardcoded colors for built-in types
+    tile_color_sprite(TileType::from_u8(tile_id), ts)
 }
 
 pub fn tile_color_sprite(tile_type: TileType, ts: f32) -> Sprite {
@@ -239,7 +252,7 @@ pub fn tile_color_sprite(tile_type: TileType, ts: f32) -> Sprite {
         TileType::SlopeUp => Color::srgb(0.2, 0.65, 0.9),
         TileType::SlopeDown => Color::srgb(0.18, 0.52, 0.82),
         TileType::Ladder => Color::srgb(0.72, 0.47, 0.2),
-        TileType::Empty => Color::NONE,
+        TileType::Empty => Color::srgb(0.5, 0.5, 0.5),
     };
     Sprite::from_color(color, Vec2::new(ts, ts))
 }

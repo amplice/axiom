@@ -182,6 +182,15 @@ pub(super) async fn take_screenshot_api(
     }
 }
 
+pub(super) fn analyze_screenshot_public(
+    path: &std::path::Path,
+    entities: &[EntityInfo],
+    cam_x: f32,
+    cam_y: f32,
+) -> Result<ScreenshotAnalysis, String> {
+    analyze_screenshot(path, entities, cam_x, cam_y)
+}
+
 fn analyze_screenshot(
     path: &std::path::Path,
     entities: &[EntityInfo],

@@ -1858,6 +1858,110 @@ pub(super) async fn get_pool_status(
 
 // === Playtest ===
 
+pub(super) async fn set_window_config(
+    State(state): State<AppState>,
+    Json(req): Json<WindowConfigRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetWindowConfig(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn evaluate_game(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<EvaluationResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::EvaluateGame(tx));
+    match rx.await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn evaluate_screenshot(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    // 1. Trigger screenshot
+    let (ss_tx, ss_rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::TakeScreenshot(ss_tx));
+    let _ = ss_rx.await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 2. Get screenshot path and analyze
+    let path = screenshot_path();
+    let screenshot_analysis = if path.exists() {
+        let (cam_x, cam_y) = {
+            let snap = state.snapshot.read().unwrap();
+            (snap.tilemap.player_spawn.0, snap.tilemap.player_spawn.1)
+        };
+        let (entities_tx, entities_rx) = tokio::sync::oneshot::channel();
+        let _ = state.sender.send(ApiCommand::ListEntities(entities_tx));
+        let entities = entities_rx.await.unwrap_or_default();
+        match analyze_screenshot_public(&path, &entities, cam_x, cam_y) {
+            Ok(a) => Some(serde_json::to_value(a).unwrap_or_default()),
+            Err(e) => Some(serde_json::json!({"error": e})),
+        }
+    } else {
+        None
+    };
+
+    // 3. Get scene state (entities, game state, vars)
+    let (state_tx, state_rx) = tokio::sync::oneshot::channel();
+    let (entities_tx2, entities_rx2) = tokio::sync::oneshot::channel();
+    let (vars_tx, vars_rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetState(state_tx));
+    let _ = state.sender.send(ApiCommand::ListEntities(entities_tx2));
+    let _ = state.sender.send(ApiCommand::GetScriptVars(vars_tx));
+
+    let game_state = state_rx.await.ok();
+    let entities = entities_rx2.await.ok().unwrap_or_default();
+    let vars = vars_rx.await.ok();
+
+    let runtime_state = {
+        let rt = state.game_runtime.read().unwrap();
+        rt.state.clone()
+    };
+
+    let entity_summary: Vec<serde_json::Value> = entities
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "pos": [e.x, e.y],
+                "tags": e.tags,
+                "alive": e.alive,
+                "health": e.health,
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "screenshot_path": path.to_string_lossy(),
+        "screenshot_exists": path.exists(),
+        "analysis": screenshot_analysis,
+        "scene": {
+            "game_state": runtime_state,
+            "entity_count": entities.len(),
+            "entities": entity_summary,
+            "vars": vars,
+            "tilemap": game_state.as_ref().map(|g| serde_json::json!({
+                "width": g.tilemap.width,
+                "height": g.tilemap.height,
+            })),
+        },
+    });
+
+    Json(ApiResponse::success(result))
+}
+
 pub(super) async fn run_playtest(
     State(state): State<AppState>,
     Json(req): Json<PlaytestRequest>,

@@ -181,10 +181,10 @@ fn drive_animation_state_from_velocity(
             let sector = ((angle + std::f32::consts::PI + std::f32::consts::FRAC_PI_8)
                 / std::f32::consts::FRAC_PI_4) as u8
                 % 8;
-            // Sector 0=W, 1=NW, 2=N, 3=NE, 4=E, 5=SE, 6=S, 7=SW
-            // Map to row (sprite sheets are X-mirrored):
-            // Row 0=NE, 1=N, 2=NW, 3=W, 4=SW, 5=S, 6=SE, 7=E
-            const SECTOR_TO_ROW: [u8; 8] = [3, 2, 1, 0, 7, 6, 5, 4];
+            // Sector 0=W, 1=SW, 2=S, 3=SE, 4=E, 5=NE, 6=N, 7=NW
+            // Map to sprite sheet row:
+            // Row 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
+            const SECTOR_TO_ROW: [u8; 8] = [4, 3, 2, 1, 0, 7, 6, 5];
             anim.facing_direction = SECTOR_TO_ROW[sector as usize];
             // Update facing_right for backward compat (E, NE, SE)
             anim.facing_right = matches!(anim.facing_direction, 0 | 7 | 6);
@@ -192,6 +192,12 @@ fn drive_animation_state_from_velocity(
         let Some(graph) = library.graphs.get(&anim.graph) else {
             continue;
         };
+        // Don't override non-looping animations (attack, hurt, die) that are still playing
+        if let Some(current_clip) = graph.states.get(&anim.state) {
+            if !current_clip.looping && anim.playing {
+                continue;
+            }
+        }
         let next_state = if vel.y > 1.0 && graph.states.contains_key("jump") {
             "jump"
         } else if vel.y < -1.0 && graph.states.contains_key("fall") {

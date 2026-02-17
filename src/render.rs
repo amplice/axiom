@@ -12,25 +12,78 @@ pub struct RenderPlugin;
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
+            FixedFirst,
+            save_previous_positions,
+        )
+        .add_systems(
             Update,
             (sync_game_position_to_transform, add_fallback_sprites),
         );
     }
 }
 
+/// At the start of each FixedUpdate tick, snapshot current positions so we can
+/// interpolate between them during rendering.
+fn save_previous_positions(
+    mut commands: Commands,
+    mut query: Query<(Entity, &GamePosition, Option<&mut PreviousGamePosition>)>,
+) {
+    for (entity, pos, prev) in query.iter_mut() {
+        if let Some(mut prev) = prev {
+            prev.x = pos.x;
+            prev.y = pos.y;
+        } else {
+            commands.entity(entity).insert(PreviousGamePosition {
+                x: pos.x,
+                y: pos.y,
+            });
+        }
+    }
+}
+
 /// Sync GamePosition -> Transform for all entities that have both.
 /// Computes z from RenderLayer + y-position for proper depth sorting.
-fn sync_game_position_to_transform(
+/// Supports pixel_snap (rounds to whole pixels) and interpolate_transforms
+/// (smooth blending between FixedUpdate ticks).
+pub(crate) fn sync_game_position_to_transform(
     mut perf: ResMut<PerfAccum>,
-    mut query: Query<
-        (&GamePosition, &mut Transform, Option<&RenderLayer>),
-        Or<(Changed<GamePosition>, Changed<RenderLayer>)>,
-    >,
+    config: Res<GameConfig>,
+    fixed_time: Res<Time<Fixed>>,
+    mut query: Query<(
+        &GamePosition,
+        &mut Transform,
+        Option<&RenderLayer>,
+        Option<&PreviousGamePosition>,
+    )>,
 ) {
     let start = Instant::now();
-    for (pos, mut transform, render_layer) in query.iter_mut() {
-        transform.translation.x = pos.x;
-        transform.translation.y = pos.y;
+    let alpha = if config.interpolate_transforms {
+        fixed_time.overstep_fraction()
+    } else {
+        1.0
+    };
+
+    for (pos, mut transform, render_layer, prev_pos) in query.iter_mut() {
+        let (mut x, mut y) = if alpha < 1.0 {
+            if let Some(prev) = prev_pos {
+                (
+                    prev.x + (pos.x - prev.x) * alpha,
+                    prev.y + (pos.y - prev.y) * alpha,
+                )
+            } else {
+                (pos.x, pos.y)
+            }
+        } else {
+            (pos.x, pos.y)
+        };
+
+        if config.pixel_snap {
+            x = x.round();
+            y = y.round();
+        }
+
+        transform.translation.x = x;
+        transform.translation.y = y;
         let layer = render_layer.map_or(0, |r| r.0);
         let base_z = 10.0 + layer as f32 * 5.0;
         transform.translation.z = base_z + (-pos.y * 0.001);

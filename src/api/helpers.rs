@@ -395,6 +395,24 @@ pub(super) fn apply_config_overrides(
                 config.tile_types = serde_json::from_value(value.clone())
                     .map_err(|e| format!("Invalid tile_types override: {e}"))?;
             }
+            "pixel_snap" => {
+                config.pixel_snap = value
+                    .as_bool()
+                    .ok_or("pixel_snap must be a boolean")?;
+            }
+            "interpolate_transforms" => {
+                config.interpolate_transforms = value
+                    .as_bool()
+                    .ok_or("interpolate_transforms must be a boolean")?;
+            }
+            "max_fall_speed" => {
+                config.max_fall_speed =
+                    value.as_f64().ok_or("max_fall_speed must be a number")? as f32;
+            }
+            "tile_mode" => {
+                config.tile_mode = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("Invalid tile_mode: {e}"))?;
+            }
             other => return Err(format!("Unsupported config override key: {other}")),
         }
     }

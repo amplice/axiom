@@ -14,7 +14,7 @@ pub fn docs_endpoints() -> Vec<serde_json::Value> {
         serde_json::json!({"method":"POST","path":"/ai/pathfind","description":"Find path waypoints between world points"}),
         serde_json::json!({"method":"POST","path":"/ai/line_of_sight","description":"Check line-of-sight between two world points"}),
         serde_json::json!({"method":"GET","path":"/config","description":"Get full config"}),
-        serde_json::json!({"method":"POST","path":"/config","description":"Set full config"}),
+        serde_json::json!({"method":"POST","path":"/config","description":"Set full config (includes pixel_snap, interpolate_transforms). Set AXIOM_TEXTURE_FILTER=nearest env var for pixel-art filtering."}),
         serde_json::json!({"method":"POST","path":"/config/tile_types","description":"Set tile type registry"}),
         serde_json::json!({"method":"POST","path":"/simulate","description":"Run headless simulation (supports optional goal_position/goal_radius)"}),
         serde_json::json!({"method":"POST","path":"/save","description":"Save current game state to slot"}),
@@ -176,6 +176,11 @@ pub fn docs_endpoints() -> Vec<serde_json::Value> {
         serde_json::json!({"method":"GET","path":"/docs/scripts","description":"Scripting API surface (Lua + Rhai helpers)"}),
         serde_json::json!({"method":"GET","path":"/docs/examples","description":"Built-in example recipes and defaults"}),
         serde_json::json!({"method":"GET","path":"/docs/security","description":"API auth and rate-limit configuration"}),
+        // Window config
+        serde_json::json!({"method":"POST","path":"/window","description":"Set window title and/or background color. Body: {title?: string, background?: [r,g,b]}"}),
+        // Evaluation
+        serde_json::json!({"method":"POST","path":"/evaluate","description":"Holistic game evaluation: entity census, script health, tilemap quality, game vars. Returns scores + issues + overall rating"}),
+        serde_json::json!({"method":"POST","path":"/evaluate/screenshot","description":"Take screenshot + analyze + describe scene in one call. Returns screenshot_path, analysis (quadrant colors, overlaps), and scene (entities, vars, game_state)"}),
     ]
 }
 

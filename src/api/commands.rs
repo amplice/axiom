@@ -338,6 +338,15 @@ pub enum ApiCommand {
         PlaytestRequest,
         tokio::sync::oneshot::Sender<Result<PlaytestResult, String>>,
     ),
+    // Window config
+    SetWindowConfig(
+        WindowConfigRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Holistic evaluation
+    EvaluateGame(
+        tokio::sync::oneshot::Sender<EvaluationResult>,
+    ),
 }
 
 #[derive(Resource, Default)]

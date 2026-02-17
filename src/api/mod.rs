@@ -81,6 +81,8 @@ impl Plugin for ApiPlugin {
 
         app.insert_resource(ApiChannels { receiver: rx })
             .init_resource::<crate::sprites::SpriteSheetRegistry>()
+            .insert_resource(crate::spawn::PresetRegistry::default())
+            .insert_resource(crate::spawn::EntityPool::default())
             .insert_resource(PendingLevelChange::default())
             .insert_resource(PendingPhysicsChange::default())
             .insert_resource(PendingScreenshot::default())

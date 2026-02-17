@@ -1,7 +1,7 @@
 use crate::components::{GameConfig, TileType};
 use crate::tilemap::Tilemap;
 
-/// Maximum downward velocity to prevent tunneling through floors at extreme speeds.
+/// Default maximum downward velocity to prevent tunneling through floors at extreme speeds.
 pub const MAX_FALL_SPEED: f32 = 800.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -81,12 +81,23 @@ pub struct PlatformMotion {
 }
 
 pub fn apply_gravity(vy: &mut f32, grounded: bool, gravity: f32, fall_multiplier: f32, dt: f32) {
+    apply_gravity_with_max(vy, grounded, gravity, fall_multiplier, dt, MAX_FALL_SPEED);
+}
+
+pub fn apply_gravity_with_max(
+    vy: &mut f32,
+    grounded: bool,
+    gravity: f32,
+    fall_multiplier: f32,
+    dt: f32,
+    max_fall_speed: f32,
+) {
     if grounded {
         return;
     }
     let mult = if *vy < 0.0 { fall_multiplier } else { 1.0 };
     *vy -= gravity * mult * dt;
-    *vy = vy.max(-MAX_FALL_SPEED);
+    *vy = vy.max(-max_fall_speed);
 }
 
 pub fn horizontal_velocity(left: bool, right: bool, speed: f32) -> f32 {

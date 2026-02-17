@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::components::{GamePosition, HeadlessMode, NetworkId, Player};
+use crate::components::{GameConfig, HeadlessMode, NetworkId, Player};
 use crate::events::GameEventBus;
 
 #[derive(Clone)]
@@ -82,7 +82,8 @@ impl Plugin for CameraPlugin {
                 Update,
                 (
                     apply_camera_events,
-                    camera_follow,
+                    camera_follow
+                        .after(crate::render::sync_game_position_to_transform),
                     camera_zoom,
                     camera_shake,
                 )
@@ -155,9 +156,12 @@ fn spawn_camera(mut commands: Commands, headless: Res<HeadlessMode>) {
 fn camera_follow(
     time: Res<Time>,
     config: Res<CameraConfig>,
+    game_config: Res<GameConfig>,
     mut runtime: ResMut<CameraRuntimeState>,
-    player_query: Query<&GamePosition, With<Player>>,
-    id_query: Query<(&GamePosition, &NetworkId)>,
+    // Read the player's Transform (already interpolated + pixel-snapped by render system)
+    // so the camera tracks the exact rendered position — no rounding mismatch.
+    player_transform_query: Query<&Transform, (With<Player>, Without<MainCamera>)>,
+    id_transform_query: Query<(&Transform, &NetworkId), Without<MainCamera>>,
     mut camera_query: Query<&mut Transform, With<MainCamera>>,
 ) {
     let Ok(mut cam_transform) = camera_query.get_single_mut() else {
@@ -166,8 +170,19 @@ fn camera_follow(
 
     let explicit_target = config
         .look_at
-        .or_else(|| resolve_follow_target(config.follow_target, &id_query))
-        .or_else(|| player_query.get_single().ok().map(|p| Vec2::new(p.x, p.y)));
+        .or_else(|| {
+            config.follow_target.and_then(|id| {
+                id_transform_query
+                    .iter()
+                    .find(|(_, nid)| nid.0 == id)
+                    .map(|(t, _)| Vec2::new(t.translation.x, t.translation.y))
+            })
+        })
+        .or_else(|| {
+            player_transform_query.get_single().ok().map(|t| {
+                Vec2::new(t.translation.x, t.translation.y)
+            })
+        });
     let Some(mut target) = explicit_target else {
         return;
     };
@@ -193,20 +208,16 @@ fn camera_follow(
     };
     let alpha = (follow_speed * time.delta_secs() * 60.0).clamp(0.0, 1.0);
     runtime.base = current.lerp(target, alpha);
-    cam_transform.translation.x = runtime.base.x;
-    cam_transform.translation.y = runtime.base.y;
+
+    let (cam_x, cam_y) = if game_config.pixel_snap {
+        (runtime.base.x.round(), runtime.base.y.round())
+    } else {
+        (runtime.base.x, runtime.base.y)
+    };
+    cam_transform.translation.x = cam_x;
+    cam_transform.translation.y = cam_y;
 }
 
-fn resolve_follow_target(
-    target_id: Option<u64>,
-    id_query: &Query<(&GamePosition, &NetworkId)>,
-) -> Option<Vec2> {
-    let id = target_id?;
-    id_query
-        .iter()
-        .find(|(_, network_id)| network_id.0 == id)
-        .map(|(pos, _)| Vec2::new(pos.x, pos.y))
-}
 
 fn camera_zoom(config: Res<CameraConfig>, mut query: Query<&mut Projection, With<MainCamera>>) {
     let Ok(mut projection) = query.get_single_mut() else {
@@ -220,12 +231,20 @@ fn camera_zoom(config: Res<CameraConfig>, mut query: Query<&mut Projection, With
 
 fn camera_shake(
     time: Res<Time>,
+    game_config: Res<GameConfig>,
     mut shake: ResMut<CameraShakeState>,
     runtime: Res<CameraRuntimeState>,
     mut camera_query: Query<&mut Transform, With<MainCamera>>,
 ) {
     let Ok(mut cam_transform) = camera_query.get_single_mut() else {
         return;
+    };
+
+    // Start from the pixel-snapped base (matching what camera_follow wrote)
+    let (base_x, base_y) = if game_config.pixel_snap {
+        (runtime.base.x.round(), runtime.base.y.round())
+    } else {
+        (runtime.base.x, runtime.base.y)
     };
 
     let mut offset = Vec2::ZERO;
@@ -242,8 +261,8 @@ fn camera_shake(
         offset.y = (t * 43.0).cos() * strength;
     }
 
-    cam_transform.translation.x = runtime.base.x + offset.x;
-    cam_transform.translation.y = runtime.base.y + offset.y;
+    cam_transform.translation.x = base_x + offset.x;
+    cam_transform.translation.y = base_y + offset.y;
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Marks the player entity
 #[derive(Component)]
@@ -81,6 +81,13 @@ pub struct GridPosition {
 /// Sub-tile precision position (world units)
 #[derive(Component, Clone, Copy, Default)]
 pub struct GamePosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Stores the previous tick's position for transform interpolation.
+#[derive(Component, Clone, Copy, Default)]
+pub struct PreviousGamePosition {
     pub x: f32,
     pub y: f32,
 }
@@ -406,12 +413,27 @@ fn default_tile_friction() -> f32 {
     1.0
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TilesetDef {
+    pub path: String,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub columns: u32,
+    pub rows: u32,
+    #[serde(default)]
+    pub variant_map: Option<HashMap<u8, usize>>,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TileTypeDef {
     pub name: String,
     pub flags: u8,
     #[serde(default = "default_tile_friction")]
     pub friction: f32,
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub tileset: Option<TilesetDef>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -427,41 +449,57 @@ impl Default for TileTypeRegistry {
                     name: "empty".into(),
                     flags: 0,
                     friction: 1.0,
+                    color: None,
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "solid".into(),
                     flags: TILE_SOLID,
                     friction: 1.0,
+                    color: Some([0.4, 0.4, 0.45]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "spike".into(),
                     flags: TILE_DAMAGE,
                     friction: 1.0,
+                    color: Some([0.9, 0.15, 0.15]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "goal".into(),
                     flags: TILE_TRIGGER,
                     friction: 1.0,
+                    color: Some([0.15, 0.9, 0.3]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "platform".into(),
                     flags: TILE_PLATFORM,
                     friction: 1.0,
+                    color: Some([0.85, 0.7, 0.2]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "slope_up".into(),
                     flags: TILE_SOLID,
                     friction: 1.0,
+                    color: Some([0.2, 0.65, 0.9]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "slope_down".into(),
                     flags: TILE_SOLID,
                     friction: 1.0,
+                    color: Some([0.18, 0.52, 0.82]),
+                    tileset: None,
                 },
                 TileTypeDef {
                     name: "ladder".into(),
                     flags: TILE_CLIMBABLE,
                     friction: 1.0,
+                    color: Some([0.72, 0.47, 0.2]),
+                    tileset: None,
                 },
             ],
         }
@@ -511,6 +549,53 @@ impl TileTypeRegistry {
     }
 }
 
+// === Tile Mode ===
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileMode {
+    #[default]
+    Square,
+    Isometric {
+        tile_width: f32,
+        tile_height: f32,
+    },
+}
+
+impl TileMode {
+    /// Convert grid (col, row) to world (x, y) pixel position
+    pub fn grid_to_world(&self, col: f32, row: f32, tile_size: f32) -> (f32, f32) {
+        match self {
+            TileMode::Square => (
+                col * tile_size + tile_size * 0.5,
+                row * tile_size + tile_size * 0.5,
+            ),
+            TileMode::Isometric {
+                tile_width,
+                tile_height,
+            } => {
+                let x = (col - row) * tile_width * 0.5;
+                let y = (col + row) * tile_height * 0.5;
+                (x, y)
+            }
+        }
+    }
+    /// Convert world (x, y) to grid (col, row)
+    pub fn world_to_grid(&self, wx: f32, wy: f32, tile_size: f32) -> (f32, f32) {
+        match self {
+            TileMode::Square => (wx / tile_size, wy / tile_size),
+            TileMode::Isometric {
+                tile_width,
+                tile_height,
+            } => {
+                let col = wx / tile_width + wy / tile_height;
+                let row = wy / tile_height - wx / tile_width;
+                (col, row)
+            }
+        }
+    }
+}
+
 // === GameConfig (replaces PhysicsConfig) ===
 
 #[derive(Resource, Clone, serde::Serialize, serde::Deserialize)]
@@ -524,6 +609,23 @@ pub struct GameConfig {
     pub fall_multiplier: f32,
     pub coyote_frames: u32,
     pub jump_buffer_frames: u32,
+    /// When true, entity and camera positions are rounded to whole pixels before rendering.
+    #[serde(default)]
+    pub pixel_snap: bool,
+    /// When true, entity transforms are interpolated between FixedUpdate ticks to
+    /// eliminate stutter at high display refresh rates.
+    #[serde(default)]
+    pub interpolate_transforms: bool,
+    /// Maximum downward velocity to prevent tunneling through floors.
+    #[serde(default = "default_max_fall_speed")]
+    pub max_fall_speed: f32,
+    /// Tile rendering mode: square grid or isometric diamond.
+    #[serde(default)]
+    pub tile_mode: TileMode,
+}
+
+fn default_max_fall_speed() -> f32 {
+    800.0
 }
 
 impl Default for GameConfig {
@@ -537,6 +639,10 @@ impl Default for GameConfig {
             fall_multiplier: 1.5,
             coyote_frames: 5,
             jump_buffer_frames: 4,
+            pixel_snap: false,
+            interpolate_transforms: false,
+            max_fall_speed: 800.0,
+            tile_mode: TileMode::default(),
         }
     }
 }

@@ -185,6 +185,11 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/assets/upload", post(upload_asset))
         .route("/assets/generate", post(generate_asset))
         .route("/assets/list", get(list_assets))
+        // Window config
+        .route("/window", post(set_window_config))
+        // Evaluation
+        .route("/evaluate", post(evaluate_game))
+        .route("/evaluate/screenshot", post(evaluate_screenshot))
         .route("/docs", get(get_docs))
         .route("/docs/html", get(get_docs_html))
         .route("/docs/endpoints", get(get_docs_endpoints))

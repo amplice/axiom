@@ -22,6 +22,7 @@ pub(super) struct ApiRuntimeCtx<'w, 's> {
     preset_registry: Res<'w, crate::spawn::PresetRegistry>,
     entity_query: Query<'w, 's, EntityQueryItem<'static>>,
     extras_query: Query<'w, 's, ExtrasQueryItem<'static>>,
+    pending_real_sim: ResMut<'w, crate::simulation::PendingRealSim>,
 }
 
 pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
@@ -43,7 +44,22 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
         preset_registry,
         entity_query,
         extras_query,
+        mut pending_real_sim,
     } = ctx;
+
+    // Restore game state after real simulation completes
+    if let Some(save) = pending_real_sim.restore_pending.take() {
+        apply_loaded_save_data(
+            *save,
+            &mut pending_level,
+            &mut pending_physics,
+            &mut script_engine,
+            &mut next_network_id,
+            &mut commands,
+            &entity_query,
+        );
+    }
+
     let player_state_snapshot = || -> PlayerState {
         for (
             _entity,
@@ -1961,9 +1977,29 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 let real = req.real;
 
                 if real {
+                    // Capture full save state before sim (system-level queries)
+                    let save_entities = collect_save_entities(&entity_query, &extras_query);
+                    let save_script_snapshot = script_engine.snapshot();
+                    let save_config = physics.clone();
+                    let save_tilemap = tilemap.clone();
+                    let save_next_nid = next_network_id.0;
+
                     // Real simulation: piggyback on the actual game loop
                     commands.queue(move |world: &mut World| {
                         let saved_runtime_state = world.resource::<crate::game_runtime::RuntimeState>().state.clone();
+
+                        let animation_graphs = world
+                            .get_resource::<crate::animation::AnimationLibrary>()
+                            .map(|lib| lib.graphs.clone())
+                            .unwrap_or_default();
+                        let sprite_sheets = world
+                            .get_resource::<crate::sprites::SpriteSheetRegistry>()
+                            .map(|registry| registry.sheets.clone())
+                            .unwrap_or_default();
+                        let particle_presets = world
+                            .get_resource::<crate::particles::ParticlePresetLibrary>()
+                            .map(|library| library.presets.clone())
+                            .unwrap_or_default();
 
                         let mut pending = world.resource_mut::<crate::simulation::PendingRealSim>();
                         if pending.active.is_some() {
@@ -1973,17 +2009,17 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         pending.active = Some(crate::simulation::ActiveRealSim {
                             saved_state: SaveGameData {
                                 version: 4,
-                                config: GameConfig::default(),
-                                tilemap: crate::tilemap::Tilemap::default(),
+                                config: save_config,
+                                tilemap: save_tilemap,
                                 game_state: saved_runtime_state.clone(),
-                                next_network_id: 1,
-                                entities: vec![],
-                                scripts: std::collections::HashMap::new(),
-                                global_scripts: vec![],
-                                game_vars: std::collections::HashMap::new(),
-                                animation_graphs: std::collections::HashMap::new(),
-                                sprite_sheets: std::collections::HashMap::new(),
-                                particle_presets: std::collections::HashMap::new(),
+                                next_network_id: save_next_nid,
+                                entities: save_entities,
+                                scripts: save_script_snapshot.scripts,
+                                global_scripts: save_script_snapshot.global_scripts.into_iter().collect(),
+                                game_vars: save_script_snapshot.vars,
+                                animation_graphs,
+                                sprite_sheets,
+                                particle_presets,
                             },
                             frames_remaining: frames,
                             frames_total: frames,
@@ -2495,6 +2531,97 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     });
                 });
             }
+            // ── Window Config ─────────────────────────────────────────────
+            ApiCommand::SetWindowConfig(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(title) = req.title {
+                        let mut window_q = world.query::<&mut bevy::window::Window>();
+                        for mut window in window_q.iter_mut(world) {
+                            window.title = title.clone();
+                        }
+                    }
+                    if let Some(bg) = req.background {
+                        let mut clear_color = world.resource_mut::<ClearColor>();
+                        *clear_color = ClearColor(Color::srgb(bg[0], bg[1], bg[2]));
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            // ── Holistic Evaluation ───────────────────────────────────────
+            ApiCommand::EvaluateGame(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let mut issues = Vec::new();
+
+                    // Entity census
+                    let mut has_player = false;
+                    let mut has_enemies = false;
+                    let mut entity_count = 0usize;
+                    {
+                        let mut q = world.query::<(
+                            Option<&crate::components::Player>,
+                            Option<&crate::components::Tags>,
+                        )>();
+                        for (player, tags) in q.iter(world) {
+                            entity_count += 1;
+                            if player.is_some() { has_player = true; }
+                            if let Some(tags) = tags {
+                                if tags.0.contains("enemy") { has_enemies = true; }
+                            }
+                        }
+                    }
+                    if !has_player { issues.push("No player entity".to_string()); }
+                    if !has_enemies { issues.push("No enemy entities".to_string()); }
+
+                    // Script health
+                    let script_errors = world.resource::<ScriptErrors>().entries.len();
+                    if script_errors > 0 {
+                        issues.push(format!("{} script errors", script_errors));
+                    }
+
+                    // Script presence
+                    let engine = world.resource::<ScriptEngine>();
+                    let snapshot = engine.snapshot();
+                    let has_scripts = !snapshot.scripts.is_empty();
+
+                    // Game vars
+                    let game_vars_count = snapshot.vars.len();
+
+                    // Tilemap quality
+                    let tm = world.resource::<Tilemap>();
+                    let has_goal = tm.goal.is_some();
+                    if !has_goal { issues.push("No goal tile set".to_string()); }
+                    let mut tile_types_seen = std::collections::HashSet::new();
+                    for &t in &tm.tiles {
+                        if t != 0 { tile_types_seen.insert(t); }
+                    }
+                    let tile_variety = tile_types_seen.len();
+
+                    let overall = if !has_player || script_errors > 2 {
+                        "poor"
+                    } else if !has_goal || script_errors > 0 || entity_count < 3 {
+                        "fair"
+                    } else if !has_enemies || tile_variety < 2 {
+                        "okay"
+                    } else {
+                        "good"
+                    };
+
+                    let _ = tx.send(EvaluationResult {
+                        scores: EvaluationScores {
+                            has_player,
+                            has_enemies,
+                            has_scripts,
+                            script_errors,
+                            entity_count,
+                            tile_variety,
+                            has_goal,
+                            game_vars_count,
+                        },
+                        issues,
+                        overall: overall.to_string(),
+                    });
+                });
+            }
         }
     }
 }
@@ -2867,10 +2994,11 @@ pub(super) fn apply_level_change(
         let ts = ctx.physics.tile_size;
         for y in 0..tilemap.height {
             for x in 0..tilemap.width {
-                let tile_type = tilemap.get(x as i32, y as i32);
-                if tile_type == TileType::Empty {
+                let tile_id = tilemap.tile_id(x as i32, y as i32);
+                if tile_id == 0 {
                     continue;
                 }
+                let tile_type = TileType::from_u8(tile_id);
 
                 let sprite = if let Some(ref sa) = ctx.sprite_assets {
                     if let Some(handle) = sa.get_tile(tile_type) {
@@ -2880,12 +3008,13 @@ pub(super) fn apply_level_change(
                             ..default()
                         }
                     } else {
-                        crate::tilemap::tile_color_sprite(tile_type, ts)
+                        crate::tilemap::tile_color_sprite_by_id(tile_id, &ctx.physics.tile_types, ts)
                     }
                 } else {
-                    crate::tilemap::tile_color_sprite(tile_type, ts)
+                    crate::tilemap::tile_color_sprite_by_id(tile_id, &ctx.physics.tile_types, ts)
                 };
 
+                let (wx, wy) = ctx.physics.tile_mode.grid_to_world(x as f32, y as f32, ts);
                 ctx.commands.spawn((
                     TileEntity,
                     Tile { tile_type },
@@ -2894,7 +3023,7 @@ pub(super) fn apply_level_change(
                         y: y as i32,
                     },
                     sprite,
-                    Transform::from_xyz(x as f32 * ts + ts / 2.0, y as f32 * ts + ts / 2.0, 0.0),
+                    Transform::from_xyz(wx, wy, 0.0),
                 ));
             }
         }
@@ -3020,6 +3149,7 @@ mod tests {
             .insert_resource(crate::particles::ParticlePresetLibrary::default())
             .insert_resource(crate::spawn::PresetRegistry::default())
             .insert_resource(crate::spawn::EntityPool::default())
+            .insert_resource(crate::simulation::PendingRealSim::default())
             .add_systems(Update, process_api_commands);
         app
     }

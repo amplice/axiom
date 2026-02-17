@@ -69,6 +69,8 @@ pub(super) async fn get_physics(
                 "fall_multiplier": cfg.fall_multiplier,
                 "coyote_frames": cfg.coyote_frames,
                 "jump_buffer_frames": cfg.jump_buffer_frames,
+                "max_fall_speed": cfg.max_fall_speed,
+                "tile_mode": serde_json::to_value(&cfg.tile_mode).unwrap_or_default(),
             });
             Json(ApiResponse::success(val))
         }
@@ -117,6 +119,18 @@ pub(super) async fn set_physics(
             .get("jump_buffer_frames")
             .and_then(|v| v.as_u64())
             .unwrap_or(4) as u32,
+        pixel_snap: false,
+        interpolate_transforms: false,
+        max_fall_speed: req
+            .get("max_fall_speed")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(800.0) as f32,
+        tile_mode: req
+            .get("tile_mode")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .unwrap_or(None)
+            .unwrap_or_default(),
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::SetPhysicsConfig(cfg, tx));

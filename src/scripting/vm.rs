@@ -4067,14 +4067,21 @@ fn build_min_world_table(
 }
 
 /// Despawn entities that have been marked with PendingDeath for at least 1 frame.
+/// If the entity has a "die" animation still playing, wait for it to finish.
 fn cleanup_pending_death(
     mut commands: Commands,
     frame: Res<ScriptFrame>,
-    query: Query<(Entity, &PendingDeath)>,
+    query: Query<(Entity, &PendingDeath, Option<&crate::components::AnimationController>)>,
 ) {
-    for (entity, pending) in query.iter() {
+    for (entity, pending, anim) in query.iter() {
         // Wait at least 1 frame so entity scripts can run on_death()
         if frame.frame > pending.frame_marked {
+            // If a die animation is still playing, let it finish before despawning
+            if let Some(anim) = anim {
+                if anim.state == "die" && anim.playing {
+                    continue;
+                }
+            }
             commands.entity(entity).despawn();
         }
     }

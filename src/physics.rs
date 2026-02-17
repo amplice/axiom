@@ -202,7 +202,7 @@ fn apply_gravity(
     let grav = config.gravity_magnitude();
     for (mut vel, grounded, jumper) in query.iter_mut() {
         let fall_mult = jumper.map_or(config.fall_multiplier, |j| j.fall_multiplier);
-        physics_core::apply_gravity(&mut vel.y, grounded.0, grav, fall_mult, dt);
+        physics_core::apply_gravity_with_max(&mut vel.y, grounded.0, grav, fall_mult, dt, config.max_fall_speed);
     }
 }
 

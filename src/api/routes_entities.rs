@@ -72,6 +72,26 @@ pub(super) async fn set_config(
             .transpose()?
             .unwrap_or_default();
 
+        let pixel_snap = req
+            .get("pixel_snap")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let interpolate_transforms = req
+            .get("interpolate_transforms")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let max_fall_speed = req
+            .get("max_fall_speed")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(800.0) as f32;
+        let tile_mode: crate::components::TileMode = req
+            .get("tile_mode")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .unwrap_or(None)
+            .unwrap_or_default();
+
         Ok(GameConfig {
             gravity: Vec2::new(gravity_x, gravity_y),
             tile_size,
@@ -81,6 +101,10 @@ pub(super) async fn set_config(
             fall_multiplier,
             coyote_frames,
             jump_buffer_frames,
+            pixel_snap,
+            interpolate_transforms,
+            max_fall_speed,
+            tile_mode,
         })
     })();
 
