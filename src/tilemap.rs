@@ -1,6 +1,7 @@
 use crate::components::*;
 use crate::sprites::SpriteAssets;
 use bevy::prelude::*;
+use std::collections::HashMap;
 
 pub struct TilemapPlugin;
 
@@ -184,40 +185,126 @@ impl Tilemap {
 #[derive(Component)]
 pub struct TileEntity;
 
-fn spawn_tilemap(
-    mut commands: Commands,
-    tilemap: Res<Tilemap>,
-    physics: Res<GameConfig>,
-    headless: Res<HeadlessMode>,
-    sprite_assets: Option<Res<SpriteAssets>>,
+/// Cached render data for a tileset (texture + atlas layout).
+pub struct TilesetRenderData {
+    pub texture: Handle<Image>,
+    pub layout: Handle<TextureAtlasLayout>,
+    pub tile_width: f32,
+    pub tile_height: f32,
+}
+
+/// Prepare tileset render data for all tile types that have a TilesetDef.
+pub fn prepare_tileset_data(
+    registry: &TileTypeRegistry,
+    asset_server: &AssetServer,
+    atlas_layouts: &mut Assets<TextureAtlasLayout>,
+) -> HashMap<u8, TilesetRenderData> {
+    let mut data = HashMap::new();
+    for (idx, def) in registry.types.iter().enumerate() {
+        if let Some(ref tileset) = def.tileset {
+            let texture: Handle<Image> = asset_server.load(&tileset.path);
+            let frame_size = UVec2::new(tileset.tile_width, tileset.tile_height);
+            let layout = TextureAtlasLayout::from_grid(
+                frame_size,
+                tileset.columns,
+                tileset.rows,
+                None,
+                None,
+            );
+            let layout_handle = atlas_layouts.add(layout);
+            data.insert(idx as u8, TilesetRenderData {
+                texture,
+                layout: layout_handle,
+                tile_width: tileset.tile_width as f32,
+                tile_height: tileset.tile_height as f32,
+            });
+        }
+    }
+    data
+}
+
+/// Build a Sprite for a tile, using tileset data when available.
+/// When a tileset is found, sets `sprite.texture_atlas` for atlas-based rendering.
+pub fn build_tile_sprite(
+    tile_id: u8,
+    visual_index: u16,
+    tileset_data: &HashMap<u8, TilesetRenderData>,
+    sprite_assets: Option<&SpriteAssets>,
+    registry: &TileTypeRegistry,
+    ts: f32,
+) -> Sprite {
+    // Priority 1: TilesetDef with texture atlas
+    if let Some(td) = tileset_data.get(&tile_id) {
+        let atlas_index = if visual_index > 0 {
+            visual_index as usize
+        } else if let Some(def) = registry.types.get(tile_id as usize) {
+            if let Some(ref tileset) = def.tileset {
+                if let Some(ref vmap) = tileset.variant_map {
+                    vmap.get(&tile_id).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        return Sprite {
+            image: td.texture.clone(),
+            custom_size: Some(Vec2::new(td.tile_width, td.tile_height)),
+            texture_atlas: Some(TextureAtlas {
+                layout: td.layout.clone(),
+                index: atlas_index,
+            }),
+            ..default()
+        };
+    }
+
+    // Priority 2: SpriteAssets built-in tile sprites
+    let tile_type = TileType::from_u8(tile_id);
+    if let Some(sa) = sprite_assets {
+        if let Some(handle) = sa.get_tile(tile_type) {
+            return Sprite {
+                image: handle.clone(),
+                custom_size: Some(Vec2::new(ts, ts)),
+                ..default()
+            };
+        }
+    }
+
+    // Priority 3: Colored rectangle fallback
+    tile_color_sprite_by_id(tile_id, registry, ts)
+}
+
+/// Spawn tile entities for a tile grid (main tilemap or extra layer).
+pub fn spawn_tile_layer(
+    commands: &mut Commands,
+    tiles: &[u8],
+    width: usize,
+    height: usize,
+    tile_visuals: &[u16],
+    z_offset: f32,
+    tileset_data: &HashMap<u8, TilesetRenderData>,
+    sprite_assets: Option<&SpriteAssets>,
+    registry: &TileTypeRegistry,
+    tile_mode: &TileMode,
+    ts: f32,
 ) {
-    if headless.0 {
-        return;
-    } // No visual tiles in headless mode
-    let ts = physics.tile_size;
-    for y in 0..tilemap.height {
-        for x in 0..tilemap.width {
-            let tile_id = tilemap.tile_id(x as i32, y as i32);
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let tile_id = tiles[idx];
             if tile_id == 0 {
                 continue;
             }
+            let visual_index = tile_visuals.get(idx).copied().unwrap_or(0);
+            let sprite = build_tile_sprite(
+                tile_id, visual_index, tileset_data, sprite_assets, registry, ts,
+            );
             let tile_type = TileType::from_u8(tile_id);
+            let (wx, wy) = tile_mode.grid_to_world(x as f32, y as f32, ts);
 
-            let sprite = if let Some(ref sa) = sprite_assets {
-                if let Some(handle) = sa.get_tile(tile_type) {
-                    Sprite {
-                        image: handle.clone(),
-                        custom_size: Some(Vec2::new(ts, ts)),
-                        ..default()
-                    }
-                } else {
-                    tile_color_sprite_by_id(tile_id, &physics.tile_types, ts)
-                }
-            } else {
-                tile_color_sprite_by_id(tile_id, &physics.tile_types, ts)
-            };
-
-            let (wx, wy) = physics.tile_mode.grid_to_world(x as f32, y as f32, ts);
             commands.spawn((
                 TileEntity,
                 Tile { tile_type },
@@ -226,9 +313,58 @@ fn spawn_tilemap(
                     y: y as i32,
                 },
                 sprite,
-                Transform::from_xyz(wx, wy, 0.0),
+                Transform::from_xyz(wx, wy, z_offset),
             ));
         }
+    }
+}
+
+fn spawn_tilemap(
+    mut commands: Commands,
+    tilemap: Res<Tilemap>,
+    physics: Res<GameConfig>,
+    headless: Res<HeadlessMode>,
+    sprite_assets: Option<Res<SpriteAssets>>,
+    asset_server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
+    if headless.0 {
+        return;
+    }
+    let ts = physics.tile_size;
+    let tileset_data = prepare_tileset_data(&physics.tile_types, &asset_server, &mut atlas_layouts);
+    let sa = sprite_assets.as_deref();
+
+    // Spawn main tilemap layer
+    spawn_tile_layer(
+        &mut commands,
+        &tilemap.tiles,
+        tilemap.width,
+        tilemap.height,
+        &tilemap.tile_visuals,
+        0.0,
+        &tileset_data,
+        sa,
+        &physics.tile_types,
+        &physics.tile_mode,
+        ts,
+    );
+
+    // Spawn extra decorative layers
+    for layer in &tilemap.extra_layers {
+        spawn_tile_layer(
+            &mut commands,
+            &layer.tiles,
+            tilemap.width,
+            tilemap.height,
+            &[],  // Extra layers don't have auto-tile visuals
+            layer.z_offset,
+            &tileset_data,
+            sa,
+            &physics.tile_types,
+            &physics.tile_mode,
+            ts,
+        );
     }
 }
 

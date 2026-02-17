@@ -100,6 +100,8 @@ pub struct EntitySpawnRequest {
     pub tags: Vec<String>,
     #[serde(default)]
     pub is_player: bool,
+    #[serde(default)]
+    pub invisible: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -290,6 +292,22 @@ pub enum ComponentDef {
         #[serde(default = "default_max_slots")]
         max_slots: usize,
     },
+    #[serde(rename = "invisible")]
+    Invisible,
+    #[serde(rename = "circle_collider")]
+    CircleCollider {
+        radius: f32,
+    },
+    #[serde(rename = "velocity_damping")]
+    VelocityDamping {
+        #[serde(default = "default_damping_factor")]
+        factor: f32,
+    },
+    #[serde(rename = "knockback_impulse")]
+    KnockbackImpulse {
+        vx: f32,
+        vy: f32,
+    },
 }
 
 fn default_left() -> String {
@@ -360,6 +378,9 @@ fn default_state_machine_initial() -> String {
 }
 fn default_max_slots() -> usize {
     20
+}
+fn default_damping_factor() -> f32 {
+    0.1
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -522,6 +543,8 @@ pub struct EntityInfo {
     pub hitbox_active: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hitbox_damage: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -962,6 +985,12 @@ pub struct SpriteSheetUpsertRequest {
     pub animations: HashMap<String, SpriteSheetAnimationRequest>,
     #[serde(default)]
     pub direction_map: Option<Vec<u8>>,
+    #[serde(default = "default_anchor_y")]
+    pub anchor_y: f32,
+}
+
+fn default_anchor_y() -> f32 {
+    -0.15
 }
 
 fn default_one_u32() -> u32 {

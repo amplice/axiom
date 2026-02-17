@@ -433,11 +433,26 @@ pub(super) async fn get_animation_states(
     }
 }
 
-pub(super) async fn get_docs() -> Json<ApiResponse<serde_json::Value>> {
+pub(super) async fn get_docs(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let endpoints = if let Some(category) = params.get("for") {
+        docs::docs_endpoints()
+            .into_iter()
+            .filter(|ep| {
+                ep.get("categories")
+                    .and_then(|c| c.as_array())
+                    .map(|cats| cats.iter().any(|cat| cat.as_str() == Some(category.as_str())))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        docs::docs_endpoints()
+    };
     Json(ApiResponse::success(serde_json::json!({
         "name": "Axiom API",
         "version": "0.1",
-        "endpoints": docs::docs_endpoints(),
+        "endpoints": endpoints,
         "components": docs::docs_components(),
         "presets": docs::docs_presets(),
         "templates": docs::docs_templates(),
@@ -446,6 +461,14 @@ pub(super) async fn get_docs() -> Json<ApiResponse<serde_json::Value>> {
         "examples": docs::docs_examples(),
         "security": docs::docs_security(),
     })))
+}
+
+pub(super) async fn get_docs_quickstart() -> Json<ApiResponse<serde_json::Value>> {
+    Json(ApiResponse::success(docs::docs_quickstart()))
+}
+
+pub(super) async fn get_docs_workflow() -> Json<ApiResponse<serde_json::Value>> {
+    Json(ApiResponse::success(docs::docs_workflow()))
 }
 
 pub(super) async fn get_docs_html() -> Html<String> {
@@ -1968,11 +1991,18 @@ pub(super) async fn evaluate_screenshot(
     // 1. Trigger screenshot
     let (ss_tx, ss_rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::TakeScreenshot(ss_tx));
-    let _ = ss_rx.await;
+    let path_str = match ss_rx.await {
+        Ok(Ok(p)) => p,
+        _ => return Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Failed to initiate screenshot".into()),
+        }),
+    };
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 2. Get screenshot path and analyze
-    let path = screenshot_path();
+    let path = std::path::PathBuf::from(&path_str);
     let screenshot_analysis = if path.exists() {
         let (cam_x, cam_y) = {
             let snap = state.snapshot.read().unwrap();
@@ -2019,9 +2049,18 @@ pub(super) async fn evaluate_screenshot(
         })
         .collect();
 
+    let screenshot_b64 = if path.exists() {
+        read_screenshot_base64(&path)
+    } else {
+        None
+    };
+
     let result = serde_json::json!({
         "screenshot_path": path.to_string_lossy(),
         "screenshot_exists": path.exists(),
+        "base64": screenshot_b64.as_ref().map(|(b64, _, _)| b64),
+        "width": screenshot_b64.as_ref().map(|(_, w, _)| w),
+        "height": screenshot_b64.as_ref().map(|(_, _, h)| h),
         "analysis": screenshot_analysis,
         "scene": {
             "game_state": runtime_state,

@@ -145,9 +145,16 @@ pub(super) async fn take_screenshot_api(
 ) -> Json<ApiResponse<serde_json::Value>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::TakeScreenshot(tx));
-    let _ = rx.await;
+    let path_str = match rx.await {
+        Ok(Ok(p)) => p,
+        _ => return Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Failed to initiate screenshot".into()),
+        }),
+    };
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let path = screenshot_path();
+    let path = std::path::PathBuf::from(&path_str);
     if !path.exists() {
         return Json(ApiResponse {
             ok: false,
@@ -156,7 +163,7 @@ pub(super) async fn take_screenshot_api(
         });
     }
 
-    let path_str = path.to_string_lossy().to_string();
+    let screenshot_b64 = read_screenshot_base64(&path);
 
     if params.get("analyze").map(|v| v == "true").unwrap_or(false) {
         // Fetch entities before calling sync analysis (to avoid holding image types across await)
@@ -170,15 +177,37 @@ pub(super) async fn take_screenshot_api(
 
         match analyze_screenshot(&path, &entities, cam_x, cam_y) {
             Ok(analysis) => {
-                Json(ApiResponse::success(serde_json::to_value(analysis).unwrap_or_default()))
+                let mut val = serde_json::to_value(analysis).unwrap_or_default();
+                if let Some((b64, w, h)) = screenshot_b64 {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("base64".into(), serde_json::json!(b64));
+                        obj.insert("width".into(), serde_json::json!(w));
+                        obj.insert("height".into(), serde_json::json!(h));
+                    }
+                }
+                Json(ApiResponse::success(val))
             }
-            Err(e) => Json(ApiResponse::success(serde_json::json!({
-                "path": path_str,
-                "analysis_error": e,
-            }))),
+            Err(e) => {
+                let mut resp = serde_json::json!({
+                    "path": path_str,
+                    "analysis_error": e,
+                });
+                if let Some((b64, w, h)) = screenshot_b64 {
+                    resp["base64"] = serde_json::json!(b64);
+                    resp["width"] = serde_json::json!(w);
+                    resp["height"] = serde_json::json!(h);
+                }
+                Json(ApiResponse::success(resp))
+            }
         }
     } else {
-        Json(ApiResponse::success(serde_json::json!({ "path": path_str })))
+        let mut resp = serde_json::json!({ "path": path_str });
+        if let Some((b64, w, h)) = screenshot_b64 {
+            resp["base64"] = serde_json::json!(b64);
+            resp["width"] = serde_json::json!(w);
+            resp["height"] = serde_json::json!(h);
+        }
+        Json(ApiResponse::success(resp))
     }
 }
 
@@ -284,15 +313,21 @@ fn analyze_screenshot(
 }
 
 pub(super) async fn screenshot_baseline(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<ApiResponse<String>> {
-    let src = screenshot_path();
-    if !src.exists() {
-        return Json(ApiResponse::err(
-            "No screenshot exists yet. Call GET /screenshot first.",
-        ));
-    }
-    let baseline = std::path::PathBuf::from("screenshot_baseline.png");
+    let dir = {
+        let snap = state.snapshot.read().unwrap();
+        screenshot_dir(snap.physics.screenshot_path.as_deref())
+    };
+    let src = match latest_screenshot_in_dir(&dir) {
+        Some(p) => p,
+        None => {
+            return Json(ApiResponse::err(
+                "No screenshot exists yet. Call GET /screenshot first.",
+            ));
+        }
+    };
+    let baseline = dir.join("screenshot_baseline.png");
     match std::fs::copy(&src, &baseline) {
         Ok(_) => Json(ApiResponse::success(
             baseline.to_string_lossy().to_string(),
@@ -308,10 +343,19 @@ pub(super) async fn screenshot_diff(
     // Take a new screenshot first
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::TakeScreenshot(tx));
-    let _ = rx.await;
+    let path_str = match rx.await {
+        Ok(Ok(p)) => p,
+        _ => {
+            return Json(ApiResponse {
+                ok: false,
+                data: None,
+                error: Some("Failed to initiate screenshot".into()),
+            })
+        }
+    };
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let current_path = screenshot_path();
+    let current_path = std::path::PathBuf::from(&path_str);
     if !current_path.exists() {
         return Json(ApiResponse {
             ok: false,
@@ -320,10 +364,14 @@ pub(super) async fn screenshot_diff(
         });
     }
 
+    let dir = {
+        let snap = state.snapshot.read().unwrap();
+        screenshot_dir(snap.physics.screenshot_path.as_deref())
+    };
     let baseline_path = req
         .baseline_path
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("screenshot_baseline.png"));
+        .unwrap_or_else(|| dir.join("screenshot_baseline.png"));
 
     if !baseline_path.exists() {
         return Json(ApiResponse {

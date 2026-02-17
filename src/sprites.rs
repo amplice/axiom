@@ -127,6 +127,12 @@ pub struct SpriteSheetDef {
     pub animations: HashMap<String, SpriteSheetAnimationDef>,
     #[serde(default)]
     pub direction_map: Option<Vec<u8>>,
+    #[serde(default = "default_anchor_y")]
+    pub anchor_y: f32,
+}
+
+fn default_anchor_y() -> f32 {
+    -0.15
 }
 
 fn default_one_u32() -> u32 {
@@ -167,6 +173,8 @@ pub struct SpriteSheetRenderCache {
     loaded_sheets: std::collections::HashSet<String>,
     /// Last registry version we synced from
     last_synced_version: u64,
+    /// Last asset_path we synced with; if it changes we need to reload everything.
+    last_asset_path: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -277,7 +285,7 @@ fn ensure_sprite_for_sheet_entities(
     registry: Res<SpriteSheetRegistry>,
     query: Query<
         (Entity, &crate::components::AnimationController),
-        Without<Sprite>,
+        (Without<Sprite>, Without<crate::components::Invisible>),
     >,
 ) {
     for (entity, anim) in query.iter() {
@@ -290,18 +298,41 @@ fn ensure_sprite_for_sheet_entities(
     }
 }
 
+/// Resolve a sprite path against the game's configured asset_path.
+/// If asset_path is set and the sprite path is relative, joins them to create
+/// an absolute path that Bevy's AssetServer can load regardless of the startup
+/// asset root.  If asset_path is None, returns the path unchanged (relative to
+/// Bevy's default asset root).
+fn resolve_sprite_asset_path(relative: &str, asset_path: Option<&str>) -> String {
+    if let Some(base) = asset_path.filter(|s| !s.is_empty()) {
+        let p = std::path::Path::new(relative);
+        if p.is_absolute() {
+            return relative.to_string();
+        }
+        let resolved = std::path::Path::new(base).join(relative);
+        resolved.to_string_lossy().to_string()
+    } else {
+        relative.to_string()
+    }
+}
+
 /// Sync SpriteSheetRegistry into the render cache: load textures + create atlas layouts.
 fn sync_sprite_sheet_cache(
     registry: Res<SpriteSheetRegistry>,
+    config: Res<crate::components::GameConfig>,
     asset_server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut cache: ResMut<SpriteSheetRenderCache>,
 ) {
-    if registry.version != cache.last_synced_version {
+    // Invalidate cache if the registry version changed or the asset_path changed.
+    let asset_path_changed = cache.last_asset_path != config.asset_path;
+    if registry.version != cache.last_synced_version || asset_path_changed {
         cache.loaded_sheets.clear();
         cache.entries.clear();
         cache.last_synced_version = registry.version;
+        cache.last_asset_path = config.asset_path.clone();
     }
+    let base = config.asset_path.as_deref();
     for (name, sheet) in &registry.sheets {
         if cache.loaded_sheets.contains(name) {
             continue;
@@ -310,7 +341,8 @@ fn sync_sprite_sheet_cache(
         let frame_size = UVec2::new(sheet.frame_width, sheet.frame_height);
 
         // Load the sheet-level fallback texture + layout
-        let texture: Handle<Image> = asset_server.load(&sheet.path);
+        let resolved = resolve_sprite_asset_path(&sheet.path, base);
+        let texture: Handle<Image> = asset_server.load(&resolved);
         let layout = TextureAtlasLayout::from_grid(
             frame_size,
             sheet.columns,
@@ -331,7 +363,8 @@ fn sync_sprite_sheet_cache(
         for (anim_name, anim_def) in &sheet.animations {
             if let Some(ref anim_path) = anim_def.path {
                 if anim_path != &sheet.path {
-                    let anim_texture: Handle<Image> = asset_server.load(anim_path);
+                    let resolved_anim = resolve_sprite_asset_path(anim_path, base);
+                    let anim_texture: Handle<Image> = asset_server.load(&resolved_anim);
                     let anim_layout = TextureAtlasLayout::from_grid(
                         frame_size,
                         sheet.columns,
@@ -405,7 +438,7 @@ fn apply_sprite_sheet_rendering(
         // Display at full frame size — character body (~30% of cell) scales with world
         let display_size = sheet.frame_width.max(sheet.frame_height) as f32;
         sprite.custom_size = Some(Vec2::new(display_size, display_size));
-        sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, -0.15));
+        sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, sheet.anchor_y));
         // Don't flip for 8-directional sprites
         if sheet.rows > 1 {
             sprite.flip_x = false;

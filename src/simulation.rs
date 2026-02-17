@@ -963,6 +963,7 @@ pub fn finalize_real_sim(
                 projectile_speed: None,
                 hitbox_active: None,
                 hitbox_damage: None,
+                visible: None,
             });
         }
 

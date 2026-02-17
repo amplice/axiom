@@ -76,12 +76,134 @@ pub(super) fn export_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("export"))
 }
 
-pub(super) fn screenshot_path() -> std::path::PathBuf {
+/// Resolve the screenshot directory from config, env var, or current dir.
+pub fn screenshot_dir(config_path: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = config_path.filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(p);
+    }
     std::env::var("AXIOM_SCREENSHOT_PATH")
         .ok()
+        .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::PathBuf::from("screenshot.png"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Find the next auto-numbered screenshot path: screenshot_001.png, screenshot_002.png, etc.
+pub fn next_screenshot_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let _ = std::fs::create_dir_all(dir);
+    let mut max_num = 0u32;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(num_str) = name_str
+                .strip_prefix("screenshot_")
+                .and_then(|s| s.strip_suffix(".png"))
+            {
+                if let Ok(n) = num_str.parse::<u32>() {
+                    max_num = max_num.max(n);
+                }
+            }
+        }
+    }
+    dir.join(format!("screenshot_{:03}.png", max_num + 1))
+}
+
+/// Find the most recently modified screenshot_*.png in a directory.
+pub(super) fn latest_screenshot_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("screenshot_") && name.ends_with(".png") {
+                if let Ok(meta) = path.metadata() {
+                    let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    if best.as_ref().map_or(true, |(_, t)| modified > *t) {
+                        best = Some((path, modified));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Resolve the assets directory from config, env var, or default "assets".
+pub(super) fn resolve_assets_dir(config_path: Option<&str>) -> String {
+    if let Some(p) = config_path.filter(|s| !s.is_empty()) {
+        return p.to_string();
+    }
+    std::env::var("AXIOM_ASSETS_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "assets".to_string())
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub(super) fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(BASE64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub(super) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let table: [u8; 256] = {
+        let mut t = [255u8; 256];
+        for (i, c) in BASE64_ALPHABET.iter().enumerate() {
+            t[*c as usize] = i as u8;
+        }
+        t[b'=' as usize] = 0;
+        t
+    };
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let a = table[bytes[i] as usize];
+        let b = table[bytes[i + 1] as usize];
+        let c = table[bytes[i + 2] as usize];
+        let d = table[bytes[i + 3] as usize];
+        if a == 255 || b == 255 {
+            return Err("Invalid base64 character".to_string());
+        }
+        out.push((a << 2) | (b >> 4));
+        if bytes[i + 2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if bytes[i + 3] != b'=' {
+            out.push((c << 6) | d);
+        }
+        i += 4;
+    }
+    Ok(out)
+}
+
+pub(super) fn read_screenshot_base64(path: &std::path::Path) -> Option<(String, u32, u32)> {
+    let file_bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&file_bytes).ok()?;
+    let (w, h) = (img.width(), img.height());
+    Some((base64_encode(&file_bytes), w, h))
 }
 
 pub(super) fn unix_ms_now() -> u64 {
@@ -412,6 +534,23 @@ pub(super) fn apply_config_overrides(
             "tile_mode" => {
                 config.tile_mode = serde_json::from_value(value.clone())
                     .map_err(|e| format!("Invalid tile_mode: {e}"))?;
+            }
+            "debug_mode" => {
+                config.debug_mode = value
+                    .as_bool()
+                    .ok_or("debug_mode must be a boolean")?;
+            }
+            "screenshot_path" => {
+                config.screenshot_path = value
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+            }
+            "asset_path" => {
+                config.asset_path = value
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
             }
             other => return Err(format!("Unsupported config override key: {other}")),
         }

@@ -16,8 +16,8 @@ use crate::api::types::{
 };
 use crate::components::{
     AiBehavior, AiState, Alive, AnimationController, Collider, GameConfig, GamePosition, Grounded,
-    Health, Hitbox, NetworkId, NextNetworkId, PathFollower, PendingDeath, Player, RenderLayer, Tags,
-    TopDownMover, Velocity,
+    Health, Hitbox, Invisible, NetworkId, NextNetworkId, OnDeathFired, PathFollower, PendingDeath,
+    Player, RenderLayer, Tags, TopDownMover, Velocity,
 };
 use crate::events::{GameEvent, GameEventBus};
 use crate::input::{MouseInput, VirtualInput};
@@ -318,7 +318,6 @@ impl Plugin for ScriptingPlugin {
                     refresh_script_tilemap_cache,
                     refresh_script_entity_cache,
                     run_entity_scripts,
-                    refresh_script_entity_cache,
                     run_global_scripts,
                     flush_script_events_to_game_events,
                     cleanup_pending_death,
@@ -390,6 +389,7 @@ struct LuaEntitySnapshot {
     vy: f32,
     grounded: bool,
     alive: bool,
+    visible: bool,
     is_player: bool,
     aabb: Option<(Vec2, Vec2)>,
     tags: HashSet<String>,
@@ -422,6 +422,7 @@ type ScriptEntityCacheQueryItem<'a> = (
     Option<&'a Grounded>,
     Option<&'a Alive>,
     Option<&'a Health>,
+    Option<&'a Invisible>,
 );
 
 type ScriptEntityRuntimeQueryItem<'a> = (
@@ -444,6 +445,8 @@ type ScriptEntityRuntimeQueryItem<'a> = (
         Option<&'a mut crate::components::CollisionLayer>,
         Option<&'a crate::state_machine::EntityStateMachine>,
         Option<&'a crate::inventory::Inventory>,
+        Option<&'a OnDeathFired>,
+        Option<&'a Invisible>,
     ),
 );
 
@@ -463,6 +466,7 @@ struct LuaEntitySnapshotParts<'a> {
     grounded: Option<&'a Grounded>,
     alive: Option<&'a Alive>,
     health: Option<&'a Health>,
+    invisible: bool,
 }
 
 struct WorldBuildArgs<'a> {
@@ -478,6 +482,93 @@ struct WorldBuildArgs<'a> {
     input: &'a Arc<LuaInputSnapshot>,
     world_events: &'a Arc<Vec<GameEvent>>,
     game_state: &'a str,
+    flags: WorldApiFlags,
+}
+
+#[derive(Clone, Copy)]
+struct WorldApiFlags {
+    input: bool,
+    entities: bool,
+    pathfinding: bool,
+    tilemap: bool,
+    spawn: bool,
+    camera: bool,
+    ui: bool,
+    audio: bool,
+    screen_effects: bool,
+    game_flow: bool,
+    emit_log: bool,
+    misc: bool,
+}
+
+impl WorldApiFlags {
+    fn all() -> Self {
+        Self {
+            input: true,
+            entities: true,
+            pathfinding: true,
+            tilemap: true,
+            spawn: true,
+            camera: true,
+            ui: true,
+            audio: true,
+            screen_effects: true,
+            game_flow: true,
+            emit_log: true,
+            misc: true,
+        }
+    }
+}
+
+fn analyze_world_api_usage(source: &str) -> WorldApiFlags {
+    WorldApiFlags {
+        input: source.contains("input."),
+        entities: source.contains("find_all")
+            || source.contains("find_in_radius")
+            || source.contains("find_nearest")
+            || source.contains("player()")
+            || source.contains("get_entity(")
+            || source.contains("despawn("),
+        pathfinding: source.contains("find_path")
+            || source.contains("line_of_sight")
+            || source.contains("raycast_entities"),
+        tilemap: source.contains("is_solid")
+            || source.contains("get_tile")
+            || source.contains("set_tile")
+            || source.contains("raycast(")
+            || source.contains("is_platform")
+            || source.contains("is_climbable")
+            || source.contains("tile_friction"),
+        spawn: source.contains("spawn(")
+            || source.contains("spawn_projectile")
+            || source.contains("spawn_particles"),
+        camera: source.contains("camera."),
+        ui: source.contains(".ui.")
+            || source.contains("show_screen")
+            || source.contains("hide_screen")
+            || source.contains("dialogue"),
+        audio: source.contains("play_sfx")
+            || source.contains("play_music")
+            || source.contains("stop_music")
+            || source.contains("set_volume"),
+        screen_effects: source.contains("screen_flash")
+            || source.contains("screen_fade")
+            || source.contains("set_ambient"),
+        game_flow: source.contains("transition(")
+            || source.contains(".pause(")
+            || source.contains(".resume("),
+        emit_log: source.contains("emit(")
+            || source.contains(".log(")
+            || source.contains(".on("),
+        misc: source.contains("tween")
+            || source.contains("spawn_text")
+            || source.contains("set_weather")
+            || source.contains("clear_weather")
+            || source.contains("set_parallax")
+            || source.contains("cutscene")
+            || source.contains("set_time_of_day")
+            || source.contains("rebind"),
+    }
 }
 
 #[derive(SystemParam)]
@@ -577,6 +668,10 @@ enum ScriptWorldCommand {
     SetAlive {
         target_id: u64,
         alive: bool,
+    },
+    SetVisible {
+        target_id: u64,
+        visible: bool,
     },
     TweenEntity {
         target_id: u64,
@@ -749,14 +844,14 @@ fn refresh_script_tilemap_cache(tilemap: Res<Tilemap>, mut cache: ResMut<ScriptT
 }
 
 fn refresh_script_entity_cache(
-    query: Query<ScriptEntityCacheQueryItem<'_>>,
+    query: Query<ScriptEntityCacheQueryItem<'_>, Without<PendingDeath>>,
     mut cache: ResMut<ScriptEntitySnapshotCache>,
 ) {
     let mut network_lookup = HashMap::<u64, Entity>::new();
     let entities = query
         .iter()
         .filter_map(
-            |(entity, pos, vel, collider, network_id, tags, player, grounded, alive, health)| {
+            |(entity, pos, vel, collider, network_id, tags, player, grounded, alive, health, invisible)| {
                 let snapshot = make_lua_entity_snapshot(LuaEntitySnapshotParts {
                     pos,
                     vel,
@@ -767,6 +862,7 @@ fn refresh_script_entity_cache(
                     grounded,
                     alive,
                     health,
+                    invisible: invisible.is_some(),
                 })?;
                 network_lookup.insert(snapshot.id, entity);
                 Some(snapshot)
@@ -823,6 +919,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
     let raycast_entities = entity_cache.entities.clone();
     let mut pending_world_commands = Vec::<ScriptWorldCommand>::new();
     let mut pending_log_entries = Vec::<ScriptLogEntry>::new();
+    let mut entity_count = 0u32;
 
     for (
         network_id,
@@ -839,9 +936,10 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         mut animation_controller,
         mut top_down_mover,
         pending_death,
-        (mut render_layer, mut collision_layer, state_machine, inventory),
+        (mut render_layer, mut collision_layer, state_machine, inventory, on_death_fired, invisible),
     ) in query.iter_mut()
     {
+        let has_invisible = invisible.is_some();
         lua.expire_registry_values();
         let cursor_key = (script.script_name.clone(), network_id.0);
         used_entity_cursor_keys.insert(cursor_key.clone());
@@ -851,6 +949,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         let (
             update,
             uses_world_api,
+            world_api_flags,
             uses_tag_helpers,
             _uses_damage_helpers,
             _uses_follow_path_helpers,
@@ -862,6 +961,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                 continue;
             };
             let uses_world_api = source.contains("world.");
+            let world_api_flags = analyze_world_api_usage(source);
             let uses_tag_helpers = source.contains("has_tag")
                 || source.contains("add_tag")
                 || source.contains("remove_tag")
@@ -878,6 +978,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                 Ok(f) => (
                     f,
                     uses_world_api,
+                    world_api_flags,
                     uses_tag_helpers,
                     uses_damage_helpers,
                     uses_follow_path_helpers,
@@ -953,6 +1054,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         }
         let _ = entity_tbl.set("grounded", grounded.is_some_and(|g| g.0));
         let _ = entity_tbl.set("alive", alive.as_ref().is_none_or(|a| a.0));
+        let _ = entity_tbl.set("visible", !has_invisible);
         if let Some(h) = health.as_ref() {
             let _ = entity_tbl.set("health", h.current);
             let _ = entity_tbl.set("max_health", h.max);
@@ -1086,6 +1188,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                     input: &input_snapshot,
                     world_events: &world_events,
                     game_state: &runtime_state.state,
+                    flags: world_api_flags,
                 },
             )
         } else {
@@ -1175,6 +1278,14 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         if let Some(a) = alive.as_deref_mut() {
             if let Some(is_alive) = alive_override {
                 a.0 = is_alive;
+            }
+        }
+        if let Ok(vis) = entity_tbl.get::<bool>("visible") {
+            let ent_id = network_id.0;
+            if vis && has_invisible {
+                pending_world_commands.push(ScriptWorldCommand::SetVisible { target_id: ent_id, visible: true });
+            } else if !vis && !has_invisible {
+                pending_world_commands.push(ScriptWorldCommand::SetVisible { target_id: ent_id, visible: false });
             }
         }
         if let Some(hb) = hitbox.as_deref_mut() {
@@ -1375,8 +1486,8 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                 }
             }
         }
-        // on_death lifecycle hook: if entity has PendingDeath, call on_death() if defined
-        if pending_death.is_some() {
+        // on_death lifecycle hook: fire once when PendingDeath first appears
+        if pending_death.is_some() && on_death_fired.is_none() {
             if let Some(source) = engine.scripts.get(&script.script_name) {
                 if source.contains("on_death") {
                     let on_death_result: Result<Function, _> = lua.globals().get("on_death");
@@ -1387,6 +1498,22 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                             limits.instruction_interval,
                             || on_death_fn.call::<()>((entity_tbl.clone(), world_tbl.clone())),
                         );
+                    }
+                }
+            }
+            // Mark so on_death won't fire again for this entity
+            if let Some(&ent) = network_lookup.get(&network_id.0) {
+                commands.entity(ent).insert(OnDeathFired);
+            }
+            // Write back animation changes from on_death (e.g. entity.animation = "die")
+            if let Some(anim) = animation_controller.as_deref_mut() {
+                if let Ok(next_state) = entity_tbl.get::<String>("animation") {
+                    let state = next_state.trim();
+                    if !state.is_empty() && state != anim.state {
+                        anim.state = state.to_string();
+                        anim.frame = 0;
+                        anim.timer = 0.0;
+                        anim.playing = true;
                     }
                 }
             }
@@ -1429,13 +1556,15 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         }
         engine.entity_event_cursors.insert(cursor_key, frame.frame);
 
-        // Drop tables to release closure registry refs. Multiple GC passes
-        // are needed because closures captured Table handles that only get
-        // queued for expiry when the closure itself is collected.
+        // Drop tables to release closure registry refs, then mark them for
+        // expiry. Actual collection happens after the loop (line ~1484).
         drop(world_tbl);
         drop(entity_tbl);
-        for _ in 0..3 {
-            lua.expire_registry_values();
+        lua.expire_registry_values();
+        // Safety valve: do one GC every 50 entities to avoid registry overflow.
+        // Lazy world table creates fewer registry entries per entity (~8 vs ~38).
+        entity_count += 1;
+        if entity_count % 50 == 0 {
             let _ = lua.gc_collect();
         }
     }
@@ -1534,13 +1663,14 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         if engine.disabled_global_scripts.contains(&script_name) {
             continue;
         }
-        let update = {
+        let (update, world_api_flags) = {
             let Some(source) = engine.scripts.get(&script_name) else {
                 continue;
             };
+            let flags = analyze_world_api_usage(source);
             used_scripts.insert(script_name.clone());
             match get_or_compile_update(lua, &mut cache.compiled, &script_name, source) {
-                Ok(f) => f,
+                Ok(f) => (f, flags),
                 Err(err_msg) => {
                     let streak = engine
                         .global_error_streaks
@@ -1591,6 +1721,7 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
                 input: &input_snapshot,
                 world_events: &world_events,
                 game_state: &runtime_state.state,
+                flags: world_api_flags,
             },
         );
         let (world_tbl, pending_events, pending_commands) = match world_tbl {
@@ -1661,10 +1792,9 @@ fn run_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
             .global_event_cursors
             .insert(script_name.clone(), frame.frame);
 
-        // Drop world_tbl to release closure registry refs, then GC
+        // Drop world_tbl to release closure registry refs
         drop(world_tbl);
         lua.expire_registry_values();
-        let _ = lua.gc_collect();
     }
 
     engine
@@ -1706,6 +1836,7 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
         grounded,
         alive,
         health,
+        invisible,
     } = parts;
     let network_id = network_id?;
     let tags_set = tags.map(|t| t.0.clone()).unwrap_or_default();
@@ -1723,6 +1854,7 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
         vy: vel.map_or(0.0, |v| v.y),
         grounded: grounded.is_some_and(|g| g.0),
         alive: alive.is_none_or(|a| a.0),
+        visible: !invisible,
         is_player: player.is_some() || tags_set.contains("player"),
         aabb,
         tags: tags_set,
@@ -1938,6 +2070,7 @@ fn lua_spawn_request(
         script,
         tags,
         is_player,
+        invisible: false,
     })
 }
 
@@ -2113,6 +2246,17 @@ fn apply_script_world_commands(
                     commands.queue(move |world: &mut World| {
                         if let Some(mut a) = world.get_mut::<Alive>(entity) {
                             a.0 = alive;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetVisible { target_id, visible } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if visible {
+                            world.entity_mut(entity).remove::<Invisible>();
+                        } else {
+                            world.entity_mut(entity).insert(Invisible);
                         }
                     });
                 }
@@ -2440,7 +2584,7 @@ fn install_entity_snapshot_metatable(lua: &Lua) -> mlua::Result<()> {
         -- When __index is a table, dot calls pass the first arg as self which breaks dispatch.
         __axiom_snap_mt = {
             __newindex = function(_, key, _)
-                error("Cannot set '" .. tostring(key) .. "' on entity snapshot. Use methods like heal()/damage()/set_position()/set_velocity()/set_alive().")
+                error("Cannot set '" .. tostring(key) .. "' on entity snapshot. Use methods like heal()/damage()/set_position()/set_velocity()/set_alive()/set_visible().")
             end,
             __index = function(tbl, key)
                 local v = rawget(tbl, key)
@@ -2459,7 +2603,8 @@ fn install_entity_snapshot_metatable(lua: &Lua) -> mlua::Result<()> {
                 local dispatch = rawget(tbl, "__dispatch")
                 if not dispatch then return nil end
                 if key == "damage" or key == "heal" or key == "knockback"
-                   or key == "set_position" or key == "set_velocity" or key == "set_alive" then
+                   or key == "set_position" or key == "set_velocity" or key == "set_alive"
+                   or key == "set_visible" then
                     return function(first, ...)
                         if first == tbl then
                             return dispatch(key, tbl, ...)
@@ -2622,6 +2767,7 @@ fn lua_entity_table(
     tbl.raw_set("vy", entity.vy)?;
     tbl.raw_set("grounded", entity.grounded)?;
     tbl.raw_set("alive", entity.alive)?;
+    tbl.raw_set("visible", entity.visible)?;
     if let Some(h) = entity.health {
         tbl.raw_set("health", h)?;
     }
@@ -2730,6 +2876,18 @@ fn lua_entity_table(
                 });
                 Ok(Value::Nil)
             }
+            "set_visible" => {
+                let visible = match args_vec.get(2) {
+                    Some(Value::Boolean(b)) => *b,
+                    _ => true,
+                };
+                dispatch_tbl.raw_set("visible", visible)?;
+                cmds.borrow_mut().push(ScriptWorldCommand::SetVisible {
+                    target_id: entity_id,
+                    visible,
+                });
+                Ok(Value::Nil)
+            }
             _ => Ok(Value::Nil),
         }
     })?;
@@ -2761,6 +2919,7 @@ pub fn dry_run_script(source: &str) -> Result<ScriptTestResult, String> {
         .set("grounded", true)
         .map_err(|e| e.to_string())?;
     entity_tbl.set("alive", true).map_err(|e| e.to_string())?;
+    entity_tbl.set("visible", true).map_err(|e| e.to_string())?;
     entity_tbl
         .set("health", 3.0f32)
         .map_err(|e| e.to_string())?;
@@ -2940,6 +3099,7 @@ pub fn dry_run_script(source: &str) -> Result<ScriptTestResult, String> {
             input: &input,
             world_events: &world_events,
             game_state: "Playing",
+            flags: WorldApiFlags::all(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -2999,6 +3159,7 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
         input,
         world_events,
         game_state,
+        flags,
     } = args;
     let frame = *frame;
     let seconds = *seconds;
@@ -3015,6 +3176,8 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
     let world_tbl = lua.create_table()?;
     let pending_events = Rc::new(RefCell::new(Vec::<ScriptEvent>::new()));
     let pending_commands = Rc::new(RefCell::new(Vec::<ScriptWorldCommand>::new()));
+
+    // === Always-on fields (used by virtually every script) ===
     world_tbl.set("frame", frame)?;
     world_tbl.set("time", seconds)?;
     world_tbl.set("dt", dt)?;
@@ -3034,1026 +3197,1049 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
         Ok(())
     })?;
     world_tbl.set("set_var", set_var_fn)?;
-    let input_tbl = lua.create_table()?;
-    let active_actions = input.active.clone();
-    let input_pressed = lua
-        .create_function(move |_lua, action: String| Ok(active_actions.contains(action.trim())))?;
-    input_tbl.set("pressed", input_pressed)?;
-    let just_pressed_actions = input.just_pressed.clone();
-    let input_just_pressed = lua.create_function(move |_lua, action: String| {
-        Ok(just_pressed_actions.contains(action.trim()))
-    })?;
-    input_tbl.set("just_pressed", input_just_pressed)?;
-    // Mouse input
-    input_tbl.set("mouse_x", input.mouse_x)?;
-    input_tbl.set("mouse_y", input.mouse_y)?;
-    let mouse_left = input.mouse_left;
-    let mouse_right = input.mouse_right;
-    let mouse_middle = input.mouse_middle;
-    let mouse_left_jp = input.mouse_left_just_pressed;
-    let mouse_right_jp = input.mouse_right_just_pressed;
-    let mouse_middle_jp = input.mouse_middle_just_pressed;
-    let mouse_pressed_fn = lua.create_function(move |_lua, button: String| {
-        Ok(match button.trim().to_lowercase().as_str() {
-            "left" => mouse_left,
-            "right" => mouse_right,
-            "middle" => mouse_middle,
-            _ => false,
-        })
-    })?;
-    input_tbl.set("mouse_pressed", mouse_pressed_fn)?;
-    let mouse_just_pressed_fn = lua.create_function(move |_lua, button: String| {
-        Ok(match button.trim().to_lowercase().as_str() {
-            "left" => mouse_left_jp,
-            "right" => mouse_right_jp,
-            "middle" => mouse_middle_jp,
-            _ => false,
-        })
-    })?;
-    input_tbl.set("mouse_just_pressed", mouse_just_pressed_fn)?;
-    world_tbl.set("input", input_tbl)?;
-    let entities_for_all = entities.clone();
-    let cmds_for_all = pending_commands.clone();
-    let find_all_fn = lua.create_function(move |lua_ctx, tag: Option<String>| {
-        let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
-        let out = lua_ctx.create_table()?;
-        let mut index = 1usize;
-        for entity in entities_for_all
-            .iter()
-            .filter(|e| entity_matches_tag(e, tag))
-        {
-            out.set(index, lua_entity_table(lua_ctx, entity, &cmds_for_all)?)?;
-            index += 1;
-        }
-        Ok(out)
-    })?;
-    world_tbl.set("find_all", find_all_fn)?;
-    let entities_for_radius = entities.clone();
-    let cmds_for_radius = pending_commands.clone();
-    let find_in_radius_fn = lua.create_function(
-        move |lua_ctx, (x, y, radius, tag): (f32, f32, f32, Option<String>)| {
-            let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
-            let max_d2 = radius.max(0.0).powi(2);
-            let out = lua_ctx.create_table()?;
-            let mut index = 1usize;
-            for entity in entities_for_radius
-                .iter()
-                .filter(|e| entity_matches_tag(e, tag))
-            {
-                let dx = entity.x - x;
-                let dy = entity.y - y;
-                if dx * dx + dy * dy <= max_d2 {
-                    out.set(index, lua_entity_table(lua_ctx, entity, &cmds_for_radius)?)?;
-                    index += 1;
-                }
-            }
-            Ok(out)
-        },
-    )?;
-    world_tbl.set("find_in_radius", find_in_radius_fn)?;
-    let entities_for_nearest = entities.clone();
-    let cmds_for_nearest = pending_commands.clone();
-    let find_nearest_fn =
-        lua.create_function(move |lua_ctx, (x, y, tag): (f32, f32, Option<String>)| {
-            let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
-            let nearest = entities_for_nearest
-                .iter()
-                .filter(|e| entity_matches_tag(e, tag))
-                .min_by(|a, b| {
-                    let adx = a.x - x;
-                    let ady = a.y - y;
-                    let bdx = b.x - x;
-                    let bdy = b.y - y;
-                    let da = adx * adx + ady * ady;
-                    let db = bdx * bdx + bdy * bdy;
-                    da.total_cmp(&db)
-                });
-            match nearest {
-                Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_nearest)?)),
-                None => Ok(Value::Nil),
-            }
-        })?;
-    world_tbl.set("find_nearest", find_nearest_fn)?;
-    let entities_for_get = entities.clone();
-    let cmds_for_get = pending_commands.clone();
-    let get_entity_fn = lua.create_function(move |lua_ctx, id: u64| {
-        match entities_for_get.iter().find(|e| e.id == id) {
-            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_get)?)),
-            None => Ok(Value::Nil),
-        }
-    })?;
-    world_tbl.set("get_entity", get_entity_fn)?;
-    let entities_for_player = entities.clone();
-    let cmds_for_player = pending_commands.clone();
-    let player_fn = lua.create_function(move |lua_ctx, _: Option<mlua::Table>| {
-        match entities_for_player.iter().find(|e| e.is_player) {
-            Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx, entity, &cmds_for_player)?)),
-            None => Ok(Value::Nil),
-        }
-    })?;
-    world_tbl.set("player", player_fn)?;
-    let tm = tilemap.clone();
-    let is_solid_fn = lua.create_function(move |_lua, (x, y): (i32, i32)| Ok(tm.is_solid(x, y)))?;
-    world_tbl.set("is_solid", is_solid_fn)?;
-    let tm2 = tilemap.clone();
-    let get_tile_fn =
-        lua.create_function(move |_lua, (x, y): (i32, i32)| Ok(tm2.get(x, y) as u8))?;
-    world_tbl.set("get_tile", get_tile_fn)?;
-    let set_tile_commands_ref = pending_commands.clone();
-    let set_tile_script_name = script_name.to_string();
-    let set_tile_fn = lua.create_function_mut(move |_lua, (x, y, tile_id): (i32, i32, u8)| {
-        set_tile_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::SetTile {
-                x,
-                y,
-                tile_id,
-                script_name: set_tile_script_name.clone(),
-                source_entity,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("set_tile", set_tile_fn)?;
-    let tm_platform = tilemap.clone();
-    let is_platform_fn = lua
-        .create_function(move |_lua, (x, y): (i32, i32)| Ok(tm_platform.get(x, y).is_platform()))?;
-    world_tbl.set("is_platform", is_platform_fn)?;
-    let tm_climb = tilemap.clone();
-    let tile_types_climb = config.tile_types.clone();
-    let is_climbable_fn = lua.create_function(move |_lua, (x, y): (i32, i32)| {
-        Ok(tile_types_climb.is_climbable(tm_climb.get_tile(x, y)))
-    })?;
-    world_tbl.set("is_climbable", is_climbable_fn)?;
-    let tm_friction = tilemap.clone();
-    let tile_types_friction = config.tile_types.clone();
-    let tile_friction_fn = lua.create_function(move |_lua, (x, y): (i32, i32)| {
-        Ok(tile_types_friction.friction(tm_friction.get_tile(x, y)))
-    })?;
-    world_tbl.set("tile_friction", tile_friction_fn)?;
-    let tile_size = config.tile_size;
-    let tm3 = tilemap.clone();
-    let raycast_fn = lua.create_function(
-        move |lua_ctx, (ox, oy, dx, dy, max_dist): (f32, f32, f32, f32, f32)| {
-            let len = (dx * dx + dy * dy).sqrt();
-            if len <= 0.0001 {
-                return Ok(Value::Nil);
-            }
-            let ndx = dx / len;
-            let ndy = dy / len;
-            let mut d = 0.0f32;
-            let mut prev_tx = (ox / tile_size).floor() as i32;
-            let mut prev_ty = (oy / tile_size).floor() as i32;
-            while d <= max_dist.max(0.0) {
-                let x = ox + ndx * d;
-                let y = oy + ndy * d;
-                let tx = (x / tile_size).floor() as i32;
-                let ty = (y / tile_size).floor() as i32;
-                if tm3.is_solid(tx, ty) {
-                    let hit = lua_ctx.create_table()?;
-                    hit.set("x", x)?;
-                    hit.set("y", y)?;
-                    hit.set("tile_x", tx)?;
-                    hit.set("tile_y", ty)?;
-                    hit.set("distance", d)?;
-                    hit.set("normal_x", (prev_tx - tx) as f32)?;
-                    hit.set("normal_y", (prev_ty - ty) as f32)?;
-                    return Ok(Value::Table(hit));
-                }
-                prev_tx = tx;
-                prev_ty = ty;
-                d += 0.5;
-            }
-            Ok(Value::Nil)
-        },
-    )?;
-    world_tbl.set("raycast", raycast_fn)?;
-    let tm4 = tilemap.clone();
-    let config_for_path = config.clone();
-    let find_path_fn = lua.create_function(
-        move |lua_ctx, (sx, sy, tx, ty, path_type): (f32, f32, f32, f32, Option<String>)| {
-            let path = if matches!(path_type.as_deref(), Some("platformer")) {
-                crate::pathfinding::find_platformer_path_points(
-                    &tm4,
-                    &config_for_path,
-                    Vec2::new(sx, sy),
-                    Vec2::new(tx, ty),
-                )
-                .unwrap_or_default()
-            } else {
-                ai::find_top_down_path_points(&tm4, tile_size, Vec2::new(sx, sy), Vec2::new(tx, ty))
-                    .unwrap_or_default()
-            };
-            let out = lua_ctx.create_table()?;
-            for (i, p) in path.iter().enumerate() {
-                let point = lua_ctx.create_table()?;
-                point.set("x", p.x)?;
-                point.set("y", p.y)?;
-                out.set(i + 1, point)?;
-            }
-            Ok(out)
-        },
-    )?;
-    world_tbl.set("find_path", find_path_fn)?;
-    let tm5 = tilemap.clone();
-    let line_of_sight_fn =
-        lua.create_function(move |_lua, (x1, y1, x2, y2): (f32, f32, f32, f32)| {
-            Ok(ai::has_line_of_sight_points(
-                &tm5,
-                tile_size,
-                Vec2::new(x1, y1),
-                Vec2::new(x2, y2),
-            ))
-        })?;
-    world_tbl.set("line_of_sight", line_of_sight_fn)?;
-    let raycast_entities_list = entities.clone();
-    let raycast_entities_fn = lua.create_function(
-        move |lua_ctx,
-              (ox, oy, dx, dy, max_dist, tag): (f32, f32, f32, f32, f32, Option<String>)| {
-            let tag_filter = tag
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|s| s.to_string());
-            let targets = raycast_entities_list.iter().filter_map(|e| {
-                if let Some(tag_name) = tag_filter.as_deref() {
-                    if !e.tags.contains(tag_name) {
-                        return None;
-                    }
-                }
-                let (min, max) = e.aabb?;
-                Some(RaycastAabb { id: e.id, min, max })
-            });
-            let hits = raycast_aabbs(Vec2::new(ox, oy), Vec2::new(dx, dy), max_dist, targets);
-            let out = lua_ctx.create_table()?;
-            for (i, hit) in hits.into_iter().enumerate() {
-                let item = lua_ctx.create_table()?;
-                item.set("id", hit.id)?;
-                item.set("x", hit.x)?;
-                item.set("y", hit.y)?;
-                item.set("distance", hit.distance)?;
-                out.set(i + 1, item)?;
-            }
-            Ok(out)
-        },
-    )?;
-    world_tbl.set("raycast_entities", raycast_entities_fn)?;
 
-    let spawn_commands_ref = pending_commands.clone();
-    let spawn_config = config.clone();
-    let spawn_script_name = script_name.to_string();
-    let spawn_fn = lua.create_function_mut(move |lua_ctx, spec: mlua::Table| {
-        let request = lua_spawn_request(lua_ctx, spec, &spawn_config)?;
-        spawn_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::Spawn {
-                request,
-                script_name: spawn_script_name.clone(),
-                source_entity,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("spawn", spawn_fn)?;
-
-    let spawn_projectile_commands_ref = pending_commands.clone();
-    let spawn_projectile_script_name = script_name.to_string();
-    let spawn_projectile_fn = lua.create_function_mut(move |_lua, spec: mlua::Table| {
-        let x = spec.get::<Option<f32>>("x")?.unwrap_or(0.0);
-        let y = spec.get::<Option<f32>>("y")?.unwrap_or(0.0);
-        let speed = spec.get::<Option<f32>>("speed")?.unwrap_or(260.0).max(0.0);
-        let damage = spec.get::<Option<f32>>("damage")?.unwrap_or(1.0).max(0.0);
-        let lifetime = spec
-            .get::<Option<u32>>("lifetime")
-            .or_else(|_| spec.get::<Option<u32>>("lifetime_frames"))?
-            .unwrap_or(60);
-        let owner = spec
-            .get::<Option<u64>>("owner")
-            .or_else(|_| spec.get::<Option<u64>>("owner_id"))?
-            .or(source_entity)
-            .unwrap_or(0);
-        let damage_tag = spec
-            .get::<Option<String>>("damage_tag")?
-            .unwrap_or_else(|| "player".to_string());
-        let width = spec.get::<Option<f32>>("width")?.unwrap_or(4.0).max(0.1);
-        let height = spec.get::<Option<f32>>("height")?.unwrap_or(4.0).max(0.1);
-        let (mut dir_x, mut dir_y) = (1.0f32, 0.0f32);
-        if let Ok(direction) = spec.get::<mlua::Table>("direction") {
-            if let Ok(x) = direction.get::<f32>("x") {
-                dir_x = x;
-            } else if let Ok(x) = direction.get::<f32>(1) {
-                dir_x = x;
-            }
-            if let Ok(y) = direction.get::<f32>("y") {
-                dir_y = y;
-            } else if let Ok(y) = direction.get::<f32>(2) {
-                dir_y = y;
-            }
-        }
-        let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
-        if len > 0.0001 {
-            dir_x /= len;
-            dir_y /= len;
-        } else {
-            dir_x = 1.0;
-            dir_y = 0.0;
-        }
-
-        let mut tags = vec!["projectile".to_string()];
-        if let Ok(tag_tbl) = spec.get::<mlua::Table>("tags") {
-            for tag in tag_tbl.sequence_values::<String>() {
-                let tag = tag?;
-                let trimmed = tag.trim();
-                if !trimmed.is_empty() && !tags.iter().any(|t| t == trimmed) {
-                    tags.push(trimmed.to_string());
-                }
-            }
-        }
-
-        let request = EntitySpawnRequest {
-            x,
-            y,
-            components: vec![
-                ComponentDef::Collider { width, height },
-                ComponentDef::Projectile {
-                    speed,
-                    direction: Vec2Def { x: dir_x, y: dir_y },
-                    lifetime_frames: lifetime,
-                    damage,
-                    owner_id: owner,
-                    damage_tag,
-                },
-            ],
-            script: spec.get::<Option<String>>("script")?,
-            tags,
-            is_player: false,
-        };
-        spawn_projectile_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::Spawn {
-                request,
-                script_name: spawn_projectile_script_name.clone(),
-                source_entity,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("spawn_projectile", spawn_projectile_fn)?;
-
-    let spawn_particles_ref = pending_events.clone();
-    let spawn_particles_commands_ref = pending_commands.clone();
-    let spawn_particles_script_name = script_name.to_string();
-    let spawn_particles_fn =
-        lua.create_function_mut(move |lua_ctx, (preset, x, y, angle): (String, f32, f32, Option<f32>)| {
-            let preset = preset.trim().to_string();
-            if preset.is_empty() {
-                return Ok(());
-            }
-            spawn_particles_commands_ref
-                .borrow_mut()
-                .push(ScriptWorldCommand::SpawnParticles {
-                    preset: preset.clone(),
-                    x,
-                    y,
-                    angle,
-                    script_name: spawn_particles_script_name.clone(),
-                    source_entity,
-                });
-            let data = lua_ctx.to_value(&serde_json::json!({
-                "preset": preset,
-                "x": x,
-                "y": y,
-            }))?;
-            spawn_particles_ref.borrow_mut().push(ScriptEvent {
-                name: "spawn_particles".to_string(),
-                data: lua_ctx.from_value(data)?,
-                frame,
-                source_entity,
-            });
-            Ok(())
-        })?;
-    world_tbl.set("spawn_particles", spawn_particles_fn)?;
-
-    let despawn_commands_ref = pending_commands.clone();
-    let despawn_script_name = script_name.to_string();
-    let despawn_fn = lua.create_function_mut(move |_lua, entity_id: u64| {
-        despawn_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::Despawn {
-                target_id: entity_id,
-                script_name: despawn_script_name.clone(),
-                source_entity,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("despawn", despawn_fn)?;
-
-    // world.tween(entity_id, {property="x", to=100, duration=0.5, easing="ease_out"})
-    let tween_commands_ref = pending_commands.clone();
-    let tween_fn = lua.create_function_mut(move |_lua, (entity_id, opts): (u64, mlua::Table)| {
-        let property: String = opts.get("property")?;
-        let to: f32 = opts.get("to")?;
-        let from: Option<f32> = opts.get("from").ok();
-        let duration: f32 = opts.get("duration").unwrap_or(0.5);
-        let easing: Option<String> = opts.get("easing").ok();
-        let tween_id: Option<String> = opts.get("tween_id").ok();
-        tween_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::TweenEntity {
-                target_id: entity_id,
-                property,
-                to,
-                from,
-                duration,
-                easing,
-                tween_id,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("tween", tween_fn)?;
-
-    // world.tween_sequence(entity_id, {{property="x", to=100, duration=0.5}, {property="y", to=200, duration=0.3}}, "seq_id")
-    let tween_seq_commands_ref = pending_commands.clone();
-    let tween_seq_fn = lua.create_function_mut(move |_lua, (entity_id, steps_tbl, seq_id): (u64, mlua::Table, Option<String>)| {
-        let mut steps = Vec::new();
-        for pair in steps_tbl.sequence_values::<mlua::Table>() {
-            let step_tbl = pair?;
-            let property: String = step_tbl.get("property")?;
-            let to: f32 = step_tbl.get("to")?;
-            let from: Option<f32> = step_tbl.get("from").ok();
-            let duration: f32 = step_tbl.get("duration").unwrap_or(0.5);
-            let easing: Option<String> = step_tbl.get("easing").ok();
-            steps.push(crate::tween::TweenStep { property, to, from, duration, easing });
-        }
-        tween_seq_commands_ref
-            .borrow_mut()
-            .push(ScriptWorldCommand::TweenSequence {
-                target_id: entity_id,
-                steps,
-                sequence_id: seq_id,
-            });
-        Ok(())
-    })?;
-    world_tbl.set("tween_sequence", tween_seq_fn)?;
-
-    // world.screen_flash(duration, color?)
-    let flash_commands_ref = pending_commands.clone();
-    let screen_flash_fn =
-        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
-            let color_arr = if let Some(tbl) = color {
-                let r: f32 = tbl.get(1).unwrap_or(1.0);
-                let g: f32 = tbl.get(2).unwrap_or(1.0);
-                let b: f32 = tbl.get(3).unwrap_or(1.0);
-                Some([r, g, b])
-            } else {
-                None
-            };
-            flash_commands_ref
-                .borrow_mut()
-                .push(ScriptWorldCommand::ScreenEffect {
-                    effect: "flash".to_string(),
-                    duration,
-                    color: color_arr,
-                });
-            Ok(())
-        })?;
-    world_tbl.set("screen_flash", screen_flash_fn)?;
-
-    // world.screen_fade_out(duration, color?)
-    let fade_out_commands_ref = pending_commands.clone();
-    let screen_fade_out_fn =
-        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
-            let color_arr = if let Some(tbl) = color {
-                let r: f32 = tbl.get(1).unwrap_or(0.0);
-                let g: f32 = tbl.get(2).unwrap_or(0.0);
-                let b: f32 = tbl.get(3).unwrap_or(0.0);
-                Some([r, g, b])
-            } else {
-                None
-            };
-            fade_out_commands_ref
-                .borrow_mut()
-                .push(ScriptWorldCommand::ScreenEffect {
-                    effect: "fade_out".to_string(),
-                    duration,
-                    color: color_arr,
-                });
-            Ok(())
-        })?;
-    world_tbl.set("screen_fade_out", screen_fade_out_fn)?;
-
-    // world.screen_fade_in(duration, color?)
-    let fade_in_commands_ref = pending_commands.clone();
-    let screen_fade_in_fn =
-        lua.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
-            let color_arr = if let Some(tbl) = color {
-                let r: f32 = tbl.get(1).unwrap_or(0.0);
-                let g: f32 = tbl.get(2).unwrap_or(0.0);
-                let b: f32 = tbl.get(3).unwrap_or(0.0);
-                Some([r, g, b])
-            } else {
-                None
-            };
-            fade_in_commands_ref
-                .borrow_mut()
-                .push(ScriptWorldCommand::ScreenEffect {
-                    effect: "fade_in".to_string(),
-                    duration,
-                    color: color_arr,
-                });
-            Ok(())
-        })?;
-    world_tbl.set("screen_fade_in", screen_fade_in_fn)?;
-
-    // world.set_ambient(intensity, color?)
-    let ambient_commands_ref = pending_commands.clone();
-    let set_ambient_fn =
-        lua.create_function_mut(move |_lua, (intensity, color): (f32, Option<mlua::Table>)| {
-            let color_arr = if let Some(tbl) = color {
-                let r: f32 = tbl.get(1).unwrap_or(1.0);
-                let g: f32 = tbl.get(2).unwrap_or(1.0);
-                let b: f32 = tbl.get(3).unwrap_or(1.0);
-                Some([r, g, b])
-            } else {
-                None
-            };
-            ambient_commands_ref
-                .borrow_mut()
-                .push(ScriptWorldCommand::SetAmbient {
-                    intensity,
-                    color: color_arr,
-                });
-            Ok(())
-        })?;
-    world_tbl.set("set_ambient", set_ambient_fn)?;
-
+    // game.state is always available
     let game_tbl = lua.create_table()?;
     game_tbl.set("state", game_state)?;
-    let game_transition_events_ref = pending_events.clone();
-    let game_transition_fn =
-        lua.create_function_mut(move |lua_ctx, (to, opts): (String, Option<mlua::Table>)| {
-            let mut payload = serde_json::json!({ "to": to });
-            if let Some(opts) = opts {
-                if let Ok(effect) = opts.get::<String>("effect") {
-                    payload["effect"] = serde_json::json!(effect);
-                }
-                if let Ok(duration) = opts.get::<f32>("duration") {
-                    payload["duration"] = serde_json::json!(duration);
-                }
-            }
-            game_transition_events_ref.borrow_mut().push(ScriptEvent {
-                name: "game_transition".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
-            Ok(())
-        })?;
-    game_tbl.set("transition", game_transition_fn)?;
-
-    let game_pause_events_ref = pending_events.clone();
-    let game_pause_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
-        game_pause_events_ref.borrow_mut().push(ScriptEvent {
-            name: "game_pause".to_string(),
-            data: serde_json::json!({}),
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    game_tbl.set("pause", game_pause_fn)?;
-
-    let game_resume_events_ref = pending_events.clone();
-    let game_resume_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
-        game_resume_events_ref.borrow_mut().push(ScriptEvent {
-            name: "game_resume".to_string(),
-            data: serde_json::json!({}),
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    game_tbl.set("resume", game_resume_fn)?;
     world_tbl.set("game", game_tbl)?;
 
-    let pending_events_ref = pending_events.clone();
-    let emit_fn = lua.create_function_mut(move |lua_ctx, (name, data): (String, Value)| {
-        let json = match data {
-            Value::Nil => serde_json::Value::Null,
-            v => lua_ctx
-                .from_value::<serde_json::Value>(v)
-                .unwrap_or(serde_json::Value::Null),
-        };
-        pending_events_ref.borrow_mut().push(ScriptEvent {
-            name,
-            data: json,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    world_tbl.set("emit", emit_fn)?;
+    // === Lazy group builders ===
+    // Each builder is a Lua function that, when called with the world table,
+    // installs all closures for that group. The __index metamethod triggers
+    // builders on first access.
+    let builders = lua.create_table()?;
+    let key_map = lua.create_table()?;
 
-    // Script logging: world.log(msg) or world.log(level, msg)
-    let log_entries = lua.create_table()?;
-    let log_idx = Rc::new(RefCell::new(0usize));
-    let log_entries_ref = log_entries.clone();
-    let log_script_name = script_name.to_string();
-    let log_fn = lua.create_function_mut(move |lua_ctx, args: mlua::MultiValue| {
-        let args_vec: Vec<Value> = args.into_iter().collect();
-        let (level, message) = if args_vec.len() >= 2 {
-            // Skip leading table arg from colon syntax
-            let mut str_args = Vec::new();
-            for val in &args_vec {
-                if let Value::String(s) = val {
-                    str_args.push(s.to_string_lossy().to_string());
-                }
-            }
-            if str_args.len() >= 2 {
-                (str_args[0].clone(), str_args[1].clone())
-            } else if str_args.len() == 1 {
-                ("info".to_string(), str_args[0].clone())
-            } else {
-                ("info".to_string(), format!("{:?}", args_vec))
-            }
-        } else if let Some(Value::String(s)) = args_vec.first() {
-            ("info".to_string(), s.to_string_lossy().to_string())
-        } else if let Some(val) = args_vec.first() {
-            ("info".to_string(), format!("{:?}", val))
-        } else {
-            return Ok(());
-        };
-        let entry = lua_ctx.create_table()?;
-        entry.set("level", level)?;
-        entry.set("message", message)?;
-        entry.set("script_name", log_script_name.as_str())?;
-        entry.set("frame", frame)?;
-        entry.set("entity_id", source_entity)?;
-        let mut idx = log_idx.borrow_mut();
-        *idx += 1;
-        log_entries_ref.set(*idx, entry)?;
-        Ok(())
-    })?;
-    world_tbl.set("log", log_fn)?;
-    world_tbl.set("__axiom_pending_logs", log_entries)?;
-
-    let on_events = world_events.clone();
-    let on_fn =
-        lua.create_function_mut(move |lua_ctx, (name, handler): (String, mlua::Function)| {
-            let target = name.trim();
-            if target.is_empty() {
-                return Ok(0usize);
-            }
-            let mut called = 0usize;
-            for ev in on_events.iter().filter(|ev| ev.name == target) {
-                let payload = lua_ctx.to_value(&ev.data).unwrap_or(Value::Nil);
-                handler.call::<()>(payload)?;
-                called += 1;
-            }
-            Ok(called)
+    if flags.input {
+        let input_ref = input.clone();
+        let rebind_pending = pending_commands.clone();
+        let input_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let input_tbl = lua_ctx.create_table()?;
+            let active_actions = input_ref.active.clone();
+            let input_pressed = lua_ctx
+                .create_function(move |_lua, action: String| Ok(active_actions.contains(action.trim())))?;
+            input_tbl.set("pressed", input_pressed)?;
+            let just_pressed_actions = input_ref.just_pressed.clone();
+            let input_just_pressed = lua_ctx.create_function(move |_lua, action: String| {
+                Ok(just_pressed_actions.contains(action.trim()))
+            })?;
+            input_tbl.set("just_pressed", input_just_pressed)?;
+            input_tbl.set("mouse_x", input_ref.mouse_x)?;
+            input_tbl.set("mouse_y", input_ref.mouse_y)?;
+            let mouse_left = input_ref.mouse_left;
+            let mouse_right = input_ref.mouse_right;
+            let mouse_middle = input_ref.mouse_middle;
+            let mouse_left_jp = input_ref.mouse_left_just_pressed;
+            let mouse_right_jp = input_ref.mouse_right_just_pressed;
+            let mouse_middle_jp = input_ref.mouse_middle_just_pressed;
+            let mouse_pressed_fn = lua_ctx.create_function(move |_lua, button: String| {
+                Ok(match button.trim().to_lowercase().as_str() {
+                    "left" => mouse_left,
+                    "right" => mouse_right,
+                    "middle" => mouse_middle,
+                    _ => false,
+                })
+            })?;
+            input_tbl.set("mouse_pressed", mouse_pressed_fn)?;
+            let mouse_just_pressed_fn = lua_ctx.create_function(move |_lua, button: String| {
+                Ok(match button.trim().to_lowercase().as_str() {
+                    "left" => mouse_left_jp,
+                    "right" => mouse_right_jp,
+                    "middle" => mouse_middle_jp,
+                    _ => false,
+                })
+            })?;
+            input_tbl.set("mouse_just_pressed", mouse_just_pressed_fn)?;
+            let rebind_cmds = rebind_pending.clone();
+            let rebind_fn = lua_ctx.create_function_mut(move |_lua, (key, action): (String, String)| {
+                rebind_cmds
+                    .borrow_mut()
+                    .push(ScriptWorldCommand::RebindInput { key, action });
+                Ok(())
+            })?;
+            input_tbl.set("rebind", rebind_fn)?;
+            tbl.raw_set("input", input_tbl)?;
+            Ok(())
         })?;
-    world_tbl.set("on", on_fn)?;
+        builders.set("input", input_builder)?;
+        key_map.set("input", "input")?;
+    }
 
-    let sfx_events_ref = pending_events.clone();
-    let play_sfx_fn = lua.create_function_mut(
-        move |lua_ctx, (name, opts): (String, Option<mlua::Table>)| {
-            let mut payload = serde_json::json!({ "name": name });
-            if let Some(opts) = opts {
-                if let Ok(volume) = opts.get::<f32>("volume") {
-                    payload["volume"] = serde_json::json!(volume);
+    if flags.entities {
+        let ent = entities.clone();
+        let cmds = pending_commands.clone();
+        let sn = script_name.to_string();
+        let entities_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let entities_for_all = ent.clone();
+            let cmds_for_all = cmds.clone();
+            let find_all_fn = lua_ctx.create_function(move |lua_ctx2, tag: Option<String>| {
+                let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
+                let out = lua_ctx2.create_table()?;
+                let mut index = 1usize;
+                for entity in entities_for_all.iter().filter(|e| entity_matches_tag(e, tag)) {
+                    out.set(index, lua_entity_table(lua_ctx2, entity, &cmds_for_all)?)?;
+                    index += 1;
                 }
-                if let Ok(pitch) = opts.get::<f32>("pitch") {
-                    payload["pitch"] = serde_json::json!(pitch);
+                Ok(out)
+            })?;
+            tbl.raw_set("find_all", find_all_fn)?;
+
+            let entities_for_radius = ent.clone();
+            let cmds_for_radius = cmds.clone();
+            let find_in_radius_fn = lua_ctx.create_function(
+                move |lua_ctx2, (x, y, radius, tag): (f32, f32, f32, Option<String>)| {
+                    let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
+                    let max_d2 = radius.max(0.0).powi(2);
+                    let out = lua_ctx2.create_table()?;
+                    let mut index = 1usize;
+                    for entity in entities_for_radius.iter().filter(|e| entity_matches_tag(e, tag)) {
+                        let dx = entity.x - x;
+                        let dy = entity.y - y;
+                        if dx * dx + dy * dy <= max_d2 {
+                            out.set(index, lua_entity_table(lua_ctx2, entity, &cmds_for_radius)?)?;
+                            index += 1;
+                        }
+                    }
+                    Ok(out)
+                },
+            )?;
+            tbl.raw_set("find_in_radius", find_in_radius_fn)?;
+
+            let entities_for_nearest = ent.clone();
+            let cmds_for_nearest = cmds.clone();
+            let find_nearest_fn =
+                lua_ctx.create_function(move |lua_ctx2, (x, y, tag): (f32, f32, Option<String>)| {
+                    let tag = tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
+                    let nearest = entities_for_nearest
+                        .iter()
+                        .filter(|e| entity_matches_tag(e, tag))
+                        .min_by(|a, b| {
+                            let adx = a.x - x;
+                            let ady = a.y - y;
+                            let bdx = b.x - x;
+                            let bdy = b.y - y;
+                            let da = adx * adx + ady * ady;
+                            let db = bdx * bdx + bdy * bdy;
+                            da.total_cmp(&db)
+                        });
+                    match nearest {
+                        Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx2, entity, &cmds_for_nearest)?)),
+                        None => Ok(Value::Nil),
+                    }
+                })?;
+            tbl.raw_set("find_nearest", find_nearest_fn)?;
+
+            let entities_for_get = ent.clone();
+            let cmds_for_get = cmds.clone();
+            let get_entity_fn = lua_ctx.create_function(move |lua_ctx2, id: u64| {
+                match entities_for_get.iter().find(|e| e.id == id) {
+                    Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx2, entity, &cmds_for_get)?)),
+                    None => Ok(Value::Nil),
                 }
-            }
-            sfx_events_ref.borrow_mut().push(ScriptEvent {
-                name: "audio_play_sfx".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
+            })?;
+            tbl.raw_set("get_entity", get_entity_fn)?;
+
+            let entities_for_player = ent.clone();
+            let cmds_for_player = cmds.clone();
+            let player_fn = lua_ctx.create_function(move |lua_ctx2, _: Option<mlua::Table>| {
+                match entities_for_player.iter().find(|e| e.is_player) {
+                    Some(entity) => Ok(Value::Table(lua_entity_table(lua_ctx2, entity, &cmds_for_player)?)),
+                    None => Ok(Value::Nil),
+                }
+            })?;
+            tbl.raw_set("player", player_fn)?;
+
+            let despawn_commands_ref = cmds.clone();
+            let despawn_script_name = sn.clone();
+            let despawn_fn = lua_ctx.create_function_mut(move |_lua, entity_id: u64| {
+                despawn_commands_ref
+                    .borrow_mut()
+                    .push(ScriptWorldCommand::Despawn {
+                        target_id: entity_id,
+                        script_name: despawn_script_name.clone(),
+                        source_entity,
+                    });
+                Ok(())
+            })?;
+            tbl.raw_set("despawn", despawn_fn)?;
+
             Ok(())
-        },
-    )?;
-    world_tbl.set("play_sfx", play_sfx_fn)?;
-
-    let music_events_ref = pending_events.clone();
-    let play_music_fn = lua.create_function_mut(
-        move |lua_ctx, (name, opts): (String, Option<mlua::Table>)| {
-            let mut payload = serde_json::json!({ "name": name });
-            if let Some(opts) = opts {
-                if let Ok(fade_in) = opts.get::<f32>("fade_in") {
-                    payload["fade_in"] = serde_json::json!(fade_in);
-                }
-            }
-            music_events_ref.borrow_mut().push(ScriptEvent {
-                name: "audio_play_music".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
-            Ok(())
-        },
-    )?;
-    world_tbl.set("play_music", play_music_fn)?;
-
-    let stop_music_events_ref = pending_events.clone();
-    let stop_music_fn = lua.create_function_mut(move |lua_ctx, opts: Option<mlua::Table>| {
-        let mut payload = serde_json::json!({});
-        if let Some(opts) = opts {
-            if let Ok(fade_out) = opts.get::<f32>("fade_out") {
-                payload["fade_out"] = serde_json::json!(fade_out);
-            }
+        })?;
+        builders.set("entities", entities_builder)?;
+        for k in &["find_all", "find_in_radius", "find_nearest", "get_entity", "player", "despawn"] {
+            key_map.set(*k, "entities")?;
         }
-        stop_music_events_ref.borrow_mut().push(ScriptEvent {
-            name: "audio_stop_music".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    world_tbl.set("stop_music", stop_music_fn)?;
+    }
 
-    let volume_events_ref = pending_events.clone();
-    let set_volume_fn =
-        lua.create_function_mut(move |lua_ctx, (channel, value): (String, f32)| {
-            let payload = serde_json::json!({
-                "channel": channel,
-                "value": value,
-            });
-            volume_events_ref.borrow_mut().push(ScriptEvent {
-                name: "audio_set_volume".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
+    let tile_size = config.tile_size;
+    if flags.tilemap {
+        let tm = tilemap.clone();
+        let cfg_tt = config.tile_types.clone();
+        let cmds = pending_commands.clone();
+        let sn = script_name.to_string();
+        let tilemap_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let tm1 = tm.clone();
+            let is_solid_fn = lua_ctx.create_function(move |_lua, (x, y): (i32, i32)| Ok(tm1.is_solid(x, y)))?;
+            tbl.raw_set("is_solid", is_solid_fn)?;
+            let tm2 = tm.clone();
+            let get_tile_fn =
+                lua_ctx.create_function(move |_lua, (x, y): (i32, i32)| Ok(tm2.get(x, y) as u8))?;
+            tbl.raw_set("get_tile", get_tile_fn)?;
+            let set_tile_commands_ref = cmds.clone();
+            let set_tile_script_name = sn.clone();
+            let set_tile_fn = lua_ctx.create_function_mut(move |_lua, (x, y, tile_id): (i32, i32, u8)| {
+                set_tile_commands_ref
+                    .borrow_mut()
+                    .push(ScriptWorldCommand::SetTile {
+                        x, y, tile_id,
+                        script_name: set_tile_script_name.clone(),
+                        source_entity,
+                    });
+                Ok(())
+            })?;
+            tbl.raw_set("set_tile", set_tile_fn)?;
+            let tm_p = tm.clone();
+            let is_platform_fn = lua_ctx
+                .create_function(move |_lua, (x, y): (i32, i32)| Ok(tm_p.get(x, y).is_platform()))?;
+            tbl.raw_set("is_platform", is_platform_fn)?;
+            let tm_c = tm.clone();
+            let tt_c = cfg_tt.clone();
+            let is_climbable_fn = lua_ctx.create_function(move |_lua, (x, y): (i32, i32)| {
+                Ok(tt_c.is_climbable(tm_c.get_tile(x, y)))
+            })?;
+            tbl.raw_set("is_climbable", is_climbable_fn)?;
+            let tm_f = tm.clone();
+            let tt_f = cfg_tt.clone();
+            let tile_friction_fn = lua_ctx.create_function(move |_lua, (x, y): (i32, i32)| {
+                Ok(tt_f.friction(tm_f.get_tile(x, y)))
+            })?;
+            tbl.raw_set("tile_friction", tile_friction_fn)?;
+            let tm3 = tm.clone();
+            let ts = tile_size;
+            let raycast_fn = lua_ctx.create_function(
+                move |lua_ctx2, (ox, oy, dx, dy, max_dist): (f32, f32, f32, f32, f32)| {
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len <= 0.0001 { return Ok(Value::Nil); }
+                    let ndx = dx / len;
+                    let ndy = dy / len;
+                    let mut d = 0.0f32;
+                    let mut prev_tx = (ox / ts).floor() as i32;
+                    let mut prev_ty = (oy / ts).floor() as i32;
+                    while d <= max_dist.max(0.0) {
+                        let x = ox + ndx * d;
+                        let y = oy + ndy * d;
+                        let tx = (x / ts).floor() as i32;
+                        let ty = (y / ts).floor() as i32;
+                        if tm3.is_solid(tx, ty) {
+                            let hit = lua_ctx2.create_table()?;
+                            hit.set("x", x)?;
+                            hit.set("y", y)?;
+                            hit.set("tile_x", tx)?;
+                            hit.set("tile_y", ty)?;
+                            hit.set("distance", d)?;
+                            hit.set("normal_x", (prev_tx - tx) as f32)?;
+                            hit.set("normal_y", (prev_ty - ty) as f32)?;
+                            return Ok(Value::Table(hit));
+                        }
+                        prev_tx = tx;
+                        prev_ty = ty;
+                        d += 0.5;
+                    }
+                    Ok(Value::Nil)
+                },
+            )?;
+            tbl.raw_set("raycast", raycast_fn)?;
             Ok(())
         })?;
-    world_tbl.set("set_volume", set_volume_fn)?;
+        builders.set("tilemap", tilemap_builder)?;
+        for k in &["is_solid", "get_tile", "set_tile", "is_platform", "is_climbable", "tile_friction", "raycast"] {
+            key_map.set(*k, "tilemap")?;
+        }
+    }
 
-    let ui_tbl = lua.create_table()?;
-    let ui_show_ref = pending_events.clone();
-    let ui_show_fn = lua.create_function_mut(move |lua_ctx, name: String| {
-        let payload = serde_json::json!({ "name": name });
-        ui_show_ref.borrow_mut().push(ScriptEvent {
-            name: "ui_show_screen".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    ui_tbl.set("show_screen", ui_show_fn)?;
-
-    let ui_hide_ref = pending_events.clone();
-    let ui_hide_fn = lua.create_function_mut(move |lua_ctx, name: String| {
-        let payload = serde_json::json!({ "name": name });
-        ui_hide_ref.borrow_mut().push(ScriptEvent {
-            name: "ui_hide_screen".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    ui_tbl.set("hide_screen", ui_hide_fn)?;
-
-    let ui_text_ref = pending_events.clone();
-    let ui_set_text_fn =
-        lua.create_function_mut(move |lua_ctx, (id, text): (String, String)| {
-            let payload = serde_json::json!({ "id": id, "text": text });
-            ui_text_ref.borrow_mut().push(ScriptEvent {
-                name: "ui_set_text".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
+    if flags.pathfinding {
+        let tm = tilemap.clone();
+        let cfg = config.clone();
+        let ent = entities.clone();
+        let pathfinding_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let tm4 = tm.clone();
+            let config_for_path = cfg.clone();
+            let ts = tile_size;
+            let find_path_fn = lua_ctx.create_function(
+                move |lua_ctx2, (sx, sy, tx, ty, path_type): (f32, f32, f32, f32, Option<String>)| {
+                    let path = if matches!(path_type.as_deref(), Some("platformer")) {
+                        crate::pathfinding::find_platformer_path_points(
+                            &tm4, &config_for_path, Vec2::new(sx, sy), Vec2::new(tx, ty),
+                        ).unwrap_or_default()
+                    } else {
+                        ai::find_top_down_path_points(&tm4, ts, Vec2::new(sx, sy), Vec2::new(tx, ty))
+                            .unwrap_or_default()
+                    };
+                    let out = lua_ctx2.create_table()?;
+                    for (i, p) in path.iter().enumerate() {
+                        let point = lua_ctx2.create_table()?;
+                        point.set("x", p.x)?;
+                        point.set("y", p.y)?;
+                        out.set(i + 1, point)?;
+                    }
+                    Ok(out)
+                },
+            )?;
+            tbl.raw_set("find_path", find_path_fn)?;
+            let tm5 = tm.clone();
+            let line_of_sight_fn =
+                lua_ctx.create_function(move |_lua, (x1, y1, x2, y2): (f32, f32, f32, f32)| {
+                    Ok(ai::has_line_of_sight_points(&tm5, ts, Vec2::new(x1, y1), Vec2::new(x2, y2)))
+                })?;
+            tbl.raw_set("line_of_sight", line_of_sight_fn)?;
+            let raycast_entities_list = ent.clone();
+            let raycast_entities_fn = lua_ctx.create_function(
+                move |lua_ctx2, (ox, oy, dx, dy, max_dist, tag): (f32, f32, f32, f32, f32, Option<String>)| {
+                    let tag_filter = tag.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(|s| s.to_string());
+                    let targets = raycast_entities_list.iter().filter_map(|e| {
+                        if let Some(tag_name) = tag_filter.as_deref() {
+                            if !e.tags.contains(tag_name) { return None; }
+                        }
+                        let (min, max) = e.aabb?;
+                        Some(RaycastAabb { id: e.id, min, max })
+                    });
+                    let hits = raycast_aabbs(Vec2::new(ox, oy), Vec2::new(dx, dy), max_dist, targets);
+                    let out = lua_ctx2.create_table()?;
+                    for (i, hit) in hits.into_iter().enumerate() {
+                        let item = lua_ctx2.create_table()?;
+                        item.set("id", hit.id)?;
+                        item.set("x", hit.x)?;
+                        item.set("y", hit.y)?;
+                        item.set("distance", hit.distance)?;
+                        out.set(i + 1, item)?;
+                    }
+                    Ok(out)
+                },
+            )?;
+            tbl.raw_set("raycast_entities", raycast_entities_fn)?;
             Ok(())
         })?;
-    ui_tbl.set("set_text", ui_set_text_fn)?;
+        builders.set("pathfinding", pathfinding_builder)?;
+        for k in &["find_path", "line_of_sight", "raycast_entities"] {
+            key_map.set(*k, "pathfinding")?;
+        }
+    }
 
-    let ui_progress_ref = pending_events.clone();
-    let ui_set_progress_fn =
-        lua.create_function_mut(move |lua_ctx, (id, value, max): (String, f32, f32)| {
-            let payload = serde_json::json!({ "id": id, "value": value, "max": max });
-            ui_progress_ref.borrow_mut().push(ScriptEvent {
-                name: "ui_set_progress".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
-            Ok(())
-        })?;
-    ui_tbl.set("set_progress", ui_set_progress_fn)?;
-    world_tbl.set("ui", ui_tbl)?;
+    if flags.spawn {
+        let cfg = config.clone();
+        let cmds = pending_commands.clone();
+        let evts = pending_events.clone();
+        let sn = script_name.to_string();
+        let spawn_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let spawn_commands_ref = cmds.clone();
+            let spawn_config = cfg.clone();
+            let spawn_script_name = sn.clone();
+            let spawn_fn = lua_ctx.create_function_mut(move |lua_ctx2, spec: mlua::Table| {
+                let request = lua_spawn_request(lua_ctx2, spec, &spawn_config)?;
+                spawn_commands_ref
+                    .borrow_mut()
+                    .push(ScriptWorldCommand::Spawn {
+                        request,
+                        script_name: spawn_script_name.clone(),
+                        source_entity,
+                    });
+                Ok(())
+            })?;
+            tbl.raw_set("spawn", spawn_fn)?;
 
-    let dialogue_tbl = lua.create_table()?;
-    let dialogue_start_ref = pending_events.clone();
-    let dialogue_start_fn = lua.create_function_mut(move |lua_ctx, conversation: String| {
-        let payload = serde_json::json!({ "conversation": conversation });
-        dialogue_start_ref.borrow_mut().push(ScriptEvent {
-            name: "dialogue_start".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    dialogue_tbl.set("start", dialogue_start_fn)?;
-    let dialogue_choose_ref = pending_events.clone();
-    let dialogue_choose_fn = lua.create_function_mut(move |lua_ctx, choice: u32| {
-        let payload = serde_json::json!({ "choice": choice });
-        dialogue_choose_ref.borrow_mut().push(ScriptEvent {
-            name: "dialogue_choose".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    dialogue_tbl.set("choose", dialogue_choose_fn)?;
-    world_tbl.set("dialogue", dialogue_tbl)?;
-
-    let camera_tbl = lua.create_table()?;
-    let camera_shake_ref = pending_events.clone();
-    let camera_shake_fn =
-        lua.create_function_mut(move |lua_ctx, (intensity, duration): (f32, Option<f32>)| {
-            let payload = serde_json::json!({
-                "intensity": intensity.max(0.0),
-                "duration": duration.unwrap_or(0.25).max(0.0),
-            });
-            camera_shake_ref.borrow_mut().push(ScriptEvent {
-                name: "camera_shake".to_string(),
-                data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-                frame,
-                source_entity,
-            });
-            Ok(())
-        })?;
-    camera_tbl.set("shake", camera_shake_fn)?;
-
-    let camera_zoom_ref = pending_events.clone();
-    let camera_zoom_fn = lua.create_function_mut(move |lua_ctx, zoom: f32| {
-        let payload = serde_json::json!({
-            "zoom": zoom.max(0.05),
-        });
-        camera_zoom_ref.borrow_mut().push(ScriptEvent {
-            name: "camera_zoom".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    camera_tbl.set("zoom", camera_zoom_fn)?;
-
-    let camera_look_ref = pending_events.clone();
-    let camera_look_fn = lua.create_function_mut(move |lua_ctx, (x, y): (f32, f32)| {
-        let payload = serde_json::json!({
-            "x": x,
-            "y": y,
-        });
-        camera_look_ref.borrow_mut().push(ScriptEvent {
-            name: "camera_look_at".to_string(),
-            data: lua_ctx.from_value(lua_ctx.to_value(&payload)?)?,
-            frame,
-            source_entity,
-        });
-        Ok(())
-    })?;
-    camera_tbl.set("look_at", camera_look_fn)?;
-    world_tbl.set("camera", camera_tbl)?;
-
-    // world.spawn_text(x, y, text, opts?)
-    let spawn_text_cmds = pending_commands.clone();
-    let spawn_text_fn = lua.create_function_mut(
-        move |_lua, (x, y, text, opts): (f32, f32, String, Option<mlua::Table>)| {
-            let mut font_size = 16.0f32;
-            let mut color = [1.0f32, 1.0, 1.0, 1.0];
-            let mut duration = None;
-            let mut fade = false;
-            let mut rise_speed = 0.0f32;
-            let mut owner_id = None;
-            if let Some(opts) = opts {
-                if let Ok(fs) = opts.get::<f32>("font_size") { font_size = fs; }
-                if let Ok(c) = opts.get::<mlua::Table>("color") {
-                    color[0] = c.get(1).unwrap_or(1.0);
-                    color[1] = c.get(2).unwrap_or(1.0);
-                    color[2] = c.get(3).unwrap_or(1.0);
-                    color[3] = c.get(4).unwrap_or(1.0);
+            let spawn_projectile_commands_ref = cmds.clone();
+            let spawn_projectile_script_name = sn.clone();
+            let spawn_projectile_fn = lua_ctx.create_function_mut(move |_lua, spec: mlua::Table| {
+                let x = spec.get::<Option<f32>>("x")?.unwrap_or(0.0);
+                let y = spec.get::<Option<f32>>("y")?.unwrap_or(0.0);
+                let speed = spec.get::<Option<f32>>("speed")?.unwrap_or(260.0).max(0.0);
+                let damage = spec.get::<Option<f32>>("damage")?.unwrap_or(1.0).max(0.0);
+                let lifetime = spec
+                    .get::<Option<u32>>("lifetime")
+                    .or_else(|_| spec.get::<Option<u32>>("lifetime_frames"))?
+                    .unwrap_or(60);
+                let owner = spec
+                    .get::<Option<u64>>("owner")
+                    .or_else(|_| spec.get::<Option<u64>>("owner_id"))?
+                    .or(source_entity)
+                    .unwrap_or(0);
+                let damage_tag = spec
+                    .get::<Option<String>>("damage_tag")?
+                    .unwrap_or_else(|| "player".to_string());
+                let width = spec.get::<Option<f32>>("width")?.unwrap_or(4.0).max(0.1);
+                let height = spec.get::<Option<f32>>("height")?.unwrap_or(4.0).max(0.1);
+                let (mut dir_x, mut dir_y) = (1.0f32, 0.0f32);
+                if let Ok(direction) = spec.get::<mlua::Table>("direction") {
+                    if let Ok(x) = direction.get::<f32>("x") { dir_x = x; }
+                    else if let Ok(x) = direction.get::<f32>(1) { dir_x = x; }
+                    if let Ok(y) = direction.get::<f32>("y") { dir_y = y; }
+                    else if let Ok(y) = direction.get::<f32>(2) { dir_y = y; }
                 }
-                if let Ok(d) = opts.get::<f32>("duration") { duration = Some(d); }
-                if let Ok(f) = opts.get::<bool>("fade") { fade = f; }
-                if let Ok(r) = opts.get::<f32>("rise_speed") { rise_speed = r; }
-                if let Ok(o) = opts.get::<u64>("owner_id") { owner_id = Some(o); }
-            }
-            spawn_text_cmds
-                .borrow_mut()
-                .push(ScriptWorldCommand::SpawnText {
-                    x, y, text, font_size, color, duration, fade, rise_speed, owner_id,
-                });
-            Ok(())
-        },
-    )?;
-    world_tbl.set("spawn_text", spawn_text_fn)?;
-
-    // world.set_weather(type, intensity, wind?)
-    let weather_cmds = pending_commands.clone();
-    let set_weather_fn = lua.create_function_mut(
-        move |_lua, (weather_type, intensity, wind): (String, f32, Option<f32>)| {
-            weather_cmds
-                .borrow_mut()
-                .push(ScriptWorldCommand::SetWeather {
-                    weather_type,
-                    intensity,
-                    wind: wind.unwrap_or(0.0),
-                });
-            Ok(())
-        },
-    )?;
-    world_tbl.set("set_weather", set_weather_fn)?;
-
-    // world.clear_weather()
-    let clear_weather_cmds = pending_commands.clone();
-    let clear_weather_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
-        clear_weather_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::ClearWeather);
-        Ok(())
-    })?;
-    world_tbl.set("clear_weather", clear_weather_fn)?;
-
-    // world.set_parallax(layers)
-    let parallax_cmds = pending_commands.clone();
-    let set_parallax_fn = lua.create_function_mut(move |_lua, layers_tbl: mlua::Table| {
-        let mut layers = Vec::new();
-        for item in layers_tbl.sequence_values::<mlua::Table>() {
-            if let Ok(layer_tbl) = item {
-                let mut layer = crate::parallax::ParallaxLayerDef {
-                    texture: layer_tbl.get("texture").ok(),
-                    color: None,
-                    scroll_factor: layer_tbl.get("scroll_factor").unwrap_or(0.5),
-                    z_depth: layer_tbl.get("z_depth").unwrap_or(-10.0),
-                    repeat_x: layer_tbl.get("repeat_x").unwrap_or(true),
-                    repeat_y: layer_tbl.get("repeat_y").unwrap_or(false),
-                    scale: layer_tbl.get("scale").ok(),
+                let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+                if len > 0.0001 { dir_x /= len; dir_y /= len; }
+                else { dir_x = 1.0; dir_y = 0.0; }
+                let mut tags = vec!["projectile".to_string()];
+                if let Ok(tag_tbl) = spec.get::<mlua::Table>("tags") {
+                    for tag in tag_tbl.sequence_values::<String>() {
+                        let tag = tag?;
+                        let trimmed = tag.trim();
+                        if !trimmed.is_empty() && !tags.iter().any(|t| t == trimmed) {
+                            tags.push(trimmed.to_string());
+                        }
+                    }
+                }
+                let request = EntitySpawnRequest {
+                    x, y,
+                    components: vec![
+                        ComponentDef::Collider { width, height },
+                        ComponentDef::Projectile {
+                            speed,
+                            direction: Vec2Def { x: dir_x, y: dir_y },
+                            lifetime_frames: lifetime,
+                            damage, owner_id: owner, damage_tag,
+                        },
+                    ],
+                    script: spec.get::<Option<String>>("script")?,
+                    tags,
+                    is_player: false,
+                    invisible: false,
                 };
-                if let Ok(c) = layer_tbl.get::<mlua::Table>("color") {
-                    let r: f32 = c.get(1).unwrap_or(0.0);
-                    let g: f32 = c.get(2).unwrap_or(0.0);
-                    let b: f32 = c.get(3).unwrap_or(0.0);
-                    let a: f32 = c.get(4).unwrap_or(1.0);
-                    layer.color = Some([r, g, b, a]);
+                spawn_projectile_commands_ref
+                    .borrow_mut()
+                    .push(ScriptWorldCommand::Spawn {
+                        request,
+                        script_name: spawn_projectile_script_name.clone(),
+                        source_entity,
+                    });
+                Ok(())
+            })?;
+            tbl.raw_set("spawn_projectile", spawn_projectile_fn)?;
+
+            let spawn_particles_ref = evts.clone();
+            let spawn_particles_commands_ref = cmds.clone();
+            let spawn_particles_script_name = sn.clone();
+            let spawn_particles_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (preset, x, y, angle): (String, f32, f32, Option<f32>)| {
+                    let preset = preset.trim().to_string();
+                    if preset.is_empty() { return Ok(()); }
+                    spawn_particles_commands_ref
+                        .borrow_mut()
+                        .push(ScriptWorldCommand::SpawnParticles {
+                            preset: preset.clone(), x, y, angle,
+                            script_name: spawn_particles_script_name.clone(),
+                            source_entity,
+                        });
+                    let data = lua_ctx2.to_value(&serde_json::json!({
+                        "preset": preset, "x": x, "y": y,
+                    }))?;
+                    spawn_particles_ref.borrow_mut().push(ScriptEvent {
+                        name: "spawn_particles".to_string(),
+                        data: lua_ctx2.from_value(data)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("spawn_particles", spawn_particles_fn)?;
+            Ok(())
+        })?;
+        builders.set("spawn", spawn_builder)?;
+        for k in &["spawn", "spawn_projectile", "spawn_particles"] {
+            key_map.set(*k, "spawn")?;
+        }
+    }
+
+    if flags.camera {
+        let evts = pending_events.clone();
+        let camera_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let camera_tbl = lua_ctx.create_table()?;
+            let camera_shake_ref = evts.clone();
+            let camera_shake_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (intensity, duration): (f32, Option<f32>)| {
+                    let payload = serde_json::json!({
+                        "intensity": intensity.max(0.0),
+                        "duration": duration.unwrap_or(0.25).max(0.0),
+                    });
+                    camera_shake_ref.borrow_mut().push(ScriptEvent {
+                        name: "camera_shake".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            camera_tbl.set("shake", camera_shake_fn)?;
+            let camera_zoom_ref = evts.clone();
+            let camera_zoom_fn = lua_ctx.create_function_mut(move |lua_ctx2, zoom: f32| {
+                let payload = serde_json::json!({ "zoom": zoom.max(0.05) });
+                camera_zoom_ref.borrow_mut().push(ScriptEvent {
+                    name: "camera_zoom".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            camera_tbl.set("zoom", camera_zoom_fn)?;
+            let camera_look_ref = evts.clone();
+            let camera_look_fn = lua_ctx.create_function_mut(move |lua_ctx2, (x, y): (f32, f32)| {
+                let payload = serde_json::json!({ "x": x, "y": y });
+                camera_look_ref.borrow_mut().push(ScriptEvent {
+                    name: "camera_look_at".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            camera_tbl.set("look_at", camera_look_fn)?;
+            tbl.raw_set("camera", camera_tbl)?;
+            Ok(())
+        })?;
+        builders.set("camera", camera_builder)?;
+        key_map.set("camera", "camera")?;
+    }
+
+    if flags.audio {
+        let evts = pending_events.clone();
+        let audio_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let sfx_events_ref = evts.clone();
+            let play_sfx_fn = lua_ctx.create_function_mut(
+                move |lua_ctx2, (name, opts): (String, Option<mlua::Table>)| {
+                    let mut payload = serde_json::json!({ "name": name });
+                    if let Some(opts) = opts {
+                        if let Ok(volume) = opts.get::<f32>("volume") { payload["volume"] = serde_json::json!(volume); }
+                        if let Ok(pitch) = opts.get::<f32>("pitch") { payload["pitch"] = serde_json::json!(pitch); }
+                    }
+                    sfx_events_ref.borrow_mut().push(ScriptEvent {
+                        name: "audio_play_sfx".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                },
+            )?;
+            tbl.raw_set("play_sfx", play_sfx_fn)?;
+
+            let music_events_ref = evts.clone();
+            let play_music_fn = lua_ctx.create_function_mut(
+                move |lua_ctx2, (name, opts): (String, Option<mlua::Table>)| {
+                    let mut payload = serde_json::json!({ "name": name });
+                    if let Some(opts) = opts {
+                        if let Ok(fade_in) = opts.get::<f32>("fade_in") { payload["fade_in"] = serde_json::json!(fade_in); }
+                    }
+                    music_events_ref.borrow_mut().push(ScriptEvent {
+                        name: "audio_play_music".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                },
+            )?;
+            tbl.raw_set("play_music", play_music_fn)?;
+
+            let stop_music_events_ref = evts.clone();
+            let stop_music_fn = lua_ctx.create_function_mut(move |lua_ctx2, opts: Option<mlua::Table>| {
+                let mut payload = serde_json::json!({});
+                if let Some(opts) = opts {
+                    if let Ok(fade_out) = opts.get::<f32>("fade_out") { payload["fade_out"] = serde_json::json!(fade_out); }
                 }
-                layers.push(layer);
+                stop_music_events_ref.borrow_mut().push(ScriptEvent {
+                    name: "audio_stop_music".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            tbl.raw_set("stop_music", stop_music_fn)?;
+
+            let volume_events_ref = evts.clone();
+            let set_volume_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (channel, value): (String, f32)| {
+                    let payload = serde_json::json!({ "channel": channel, "value": value });
+                    volume_events_ref.borrow_mut().push(ScriptEvent {
+                        name: "audio_set_volume".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("set_volume", set_volume_fn)?;
+            Ok(())
+        })?;
+        builders.set("audio", audio_builder)?;
+        for k in &["play_sfx", "play_music", "stop_music", "set_volume"] {
+            key_map.set(*k, "audio")?;
+        }
+    }
+
+    if flags.ui {
+        let evts = pending_events.clone();
+        let ui_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let ui_tbl = lua_ctx.create_table()?;
+            let ui_show_ref = evts.clone();
+            let ui_show_fn = lua_ctx.create_function_mut(move |lua_ctx2, name: String| {
+                let payload = serde_json::json!({ "name": name });
+                ui_show_ref.borrow_mut().push(ScriptEvent {
+                    name: "ui_show_screen".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            ui_tbl.set("show_screen", ui_show_fn)?;
+            let ui_hide_ref = evts.clone();
+            let ui_hide_fn = lua_ctx.create_function_mut(move |lua_ctx2, name: String| {
+                let payload = serde_json::json!({ "name": name });
+                ui_hide_ref.borrow_mut().push(ScriptEvent {
+                    name: "ui_hide_screen".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            ui_tbl.set("hide_screen", ui_hide_fn)?;
+            let ui_text_ref = evts.clone();
+            let ui_set_text_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (id, text): (String, String)| {
+                    let payload = serde_json::json!({ "id": id, "text": text });
+                    ui_text_ref.borrow_mut().push(ScriptEvent {
+                        name: "ui_set_text".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            ui_tbl.set("set_text", ui_set_text_fn)?;
+            let ui_progress_ref = evts.clone();
+            let ui_set_progress_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (id, value, max): (String, f32, f32)| {
+                    let payload = serde_json::json!({ "id": id, "value": value, "max": max });
+                    ui_progress_ref.borrow_mut().push(ScriptEvent {
+                        name: "ui_set_progress".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            ui_tbl.set("set_progress", ui_set_progress_fn)?;
+            tbl.raw_set("ui", ui_tbl)?;
+
+            let dialogue_tbl = lua_ctx.create_table()?;
+            let dialogue_start_ref = evts.clone();
+            let dialogue_start_fn = lua_ctx.create_function_mut(move |lua_ctx2, conversation: String| {
+                let payload = serde_json::json!({ "conversation": conversation });
+                dialogue_start_ref.borrow_mut().push(ScriptEvent {
+                    name: "dialogue_start".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            dialogue_tbl.set("start", dialogue_start_fn)?;
+            let dialogue_choose_ref = evts.clone();
+            let dialogue_choose_fn = lua_ctx.create_function_mut(move |lua_ctx2, choice: u32| {
+                let payload = serde_json::json!({ "choice": choice });
+                dialogue_choose_ref.borrow_mut().push(ScriptEvent {
+                    name: "dialogue_choose".to_string(),
+                    data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            dialogue_tbl.set("choose", dialogue_choose_fn)?;
+            tbl.raw_set("dialogue", dialogue_tbl)?;
+            Ok(())
+        })?;
+        builders.set("ui", ui_builder)?;
+        key_map.set("ui", "ui")?;
+        key_map.set("dialogue", "ui")?;
+    }
+
+    if flags.screen_effects {
+        let cmds = pending_commands.clone();
+        let screen_effects_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let flash_commands_ref = cmds.clone();
+            let screen_flash_fn =
+                lua_ctx.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+                    let color_arr = color.map(|tbl| {
+                        [tbl.get(1).unwrap_or(1.0f32), tbl.get(2).unwrap_or(1.0), tbl.get(3).unwrap_or(1.0)]
+                    });
+                    flash_commands_ref.borrow_mut().push(ScriptWorldCommand::ScreenEffect {
+                        effect: "flash".to_string(), duration, color: color_arr,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("screen_flash", screen_flash_fn)?;
+
+            let fade_out_commands_ref = cmds.clone();
+            let screen_fade_out_fn =
+                lua_ctx.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+                    let color_arr = color.map(|tbl| {
+                        [tbl.get(1).unwrap_or(0.0f32), tbl.get(2).unwrap_or(0.0), tbl.get(3).unwrap_or(0.0)]
+                    });
+                    fade_out_commands_ref.borrow_mut().push(ScriptWorldCommand::ScreenEffect {
+                        effect: "fade_out".to_string(), duration, color: color_arr,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("screen_fade_out", screen_fade_out_fn)?;
+
+            let fade_in_commands_ref = cmds.clone();
+            let screen_fade_in_fn =
+                lua_ctx.create_function_mut(move |_lua, (duration, color): (f32, Option<mlua::Table>)| {
+                    let color_arr = color.map(|tbl| {
+                        [tbl.get(1).unwrap_or(0.0f32), tbl.get(2).unwrap_or(0.0), tbl.get(3).unwrap_or(0.0)]
+                    });
+                    fade_in_commands_ref.borrow_mut().push(ScriptWorldCommand::ScreenEffect {
+                        effect: "fade_in".to_string(), duration, color: color_arr,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("screen_fade_in", screen_fade_in_fn)?;
+
+            let ambient_commands_ref = cmds.clone();
+            let set_ambient_fn =
+                lua_ctx.create_function_mut(move |_lua, (intensity, color): (f32, Option<mlua::Table>)| {
+                    let color_arr = color.map(|tbl| {
+                        [tbl.get(1).unwrap_or(1.0f32), tbl.get(2).unwrap_or(1.0), tbl.get(3).unwrap_or(1.0)]
+                    });
+                    ambient_commands_ref.borrow_mut().push(ScriptWorldCommand::SetAmbient {
+                        intensity, color: color_arr,
+                    });
+                    Ok(())
+                })?;
+            tbl.raw_set("set_ambient", set_ambient_fn)?;
+            Ok(())
+        })?;
+        builders.set("screen_effects", screen_effects_builder)?;
+        for k in &["screen_flash", "screen_fade_out", "screen_fade_in", "set_ambient"] {
+            key_map.set(*k, "screen_effects")?;
+        }
+    }
+
+    if flags.game_flow {
+        let evts = pending_events.clone();
+        let game_flow_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let game_tbl: mlua::Table = tbl.raw_get("game")?;
+            let game_transition_events_ref = evts.clone();
+            let game_transition_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (to, opts): (String, Option<mlua::Table>)| {
+                    let mut payload = serde_json::json!({ "to": to });
+                    if let Some(opts) = opts {
+                        if let Ok(effect) = opts.get::<String>("effect") { payload["effect"] = serde_json::json!(effect); }
+                        if let Ok(duration) = opts.get::<f32>("duration") { payload["duration"] = serde_json::json!(duration); }
+                    }
+                    game_transition_events_ref.borrow_mut().push(ScriptEvent {
+                        name: "game_transition".to_string(),
+                        data: lua_ctx2.from_value(lua_ctx2.to_value(&payload)?)?,
+                        frame, source_entity,
+                    });
+                    Ok(())
+                })?;
+            game_tbl.set("transition", game_transition_fn)?;
+            let game_pause_events_ref = evts.clone();
+            let game_pause_fn = lua_ctx.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+                game_pause_events_ref.borrow_mut().push(ScriptEvent {
+                    name: "game_pause".to_string(), data: serde_json::json!({}),
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            game_tbl.set("pause", game_pause_fn)?;
+            let game_resume_events_ref = evts.clone();
+            let game_resume_fn = lua_ctx.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+                game_resume_events_ref.borrow_mut().push(ScriptEvent {
+                    name: "game_resume".to_string(), data: serde_json::json!({}),
+                    frame, source_entity,
+                });
+                Ok(())
+            })?;
+            game_tbl.set("resume", game_resume_fn)?;
+            Ok(())
+        })?;
+        builders.set("game_flow", game_flow_builder)?;
+        // game_flow is triggered when game.transition/pause/resume is accessed on the game subtable,
+        // but we trigger it via a special key so scripts like game.transition(...) work.
+        // We map "game_flow" as a synthetic key that can be triggered by __index on the game table.
+    }
+
+    if flags.emit_log {
+        let evts = pending_events.clone();
+        let we = world_events.clone();
+        let sn = script_name.to_string();
+        let emit_log_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let pending_events_ref = evts.clone();
+            let emit_fn = lua_ctx.create_function_mut(move |lua_ctx2, (name, data): (String, Value)| {
+                let json = match data {
+                    Value::Nil => serde_json::Value::Null,
+                    v => lua_ctx2.from_value::<serde_json::Value>(v).unwrap_or(serde_json::Value::Null),
+                };
+                pending_events_ref.borrow_mut().push(ScriptEvent {
+                    name, data: json, frame, source_entity,
+                });
+                Ok(())
+            })?;
+            tbl.raw_set("emit", emit_fn)?;
+
+            let log_entries = lua_ctx.create_table()?;
+            let log_idx = Rc::new(RefCell::new(0usize));
+            let log_entries_ref = log_entries.clone();
+            let log_script_name = sn.clone();
+            let log_fn = lua_ctx.create_function_mut(move |lua_ctx2, args: mlua::MultiValue| {
+                let args_vec: Vec<Value> = args.into_iter().collect();
+                let (level, message) = if args_vec.len() >= 2 {
+                    let mut str_args = Vec::new();
+                    for val in &args_vec {
+                        if let Value::String(s) = val {
+                            str_args.push(s.to_string_lossy().to_string());
+                        }
+                    }
+                    if str_args.len() >= 2 { (str_args[0].clone(), str_args[1].clone()) }
+                    else if str_args.len() == 1 { ("info".to_string(), str_args[0].clone()) }
+                    else { ("info".to_string(), format!("{:?}", args_vec)) }
+                } else if let Some(Value::String(s)) = args_vec.first() {
+                    ("info".to_string(), s.to_string_lossy().to_string())
+                } else if let Some(val) = args_vec.first() {
+                    ("info".to_string(), format!("{:?}", val))
+                } else { return Ok(()); };
+                let entry = lua_ctx2.create_table()?;
+                entry.set("level", level)?;
+                entry.set("message", message)?;
+                entry.set("script_name", log_script_name.as_str())?;
+                entry.set("frame", frame)?;
+                entry.set("entity_id", source_entity)?;
+                let mut idx = log_idx.borrow_mut();
+                *idx += 1;
+                log_entries_ref.set(*idx, entry)?;
+                Ok(())
+            })?;
+            tbl.raw_set("log", log_fn)?;
+            tbl.raw_set("__axiom_pending_logs", log_entries)?;
+
+            let on_events = we.clone();
+            let on_fn =
+                lua_ctx.create_function_mut(move |lua_ctx2, (name, handler): (String, mlua::Function)| {
+                    let target = name.trim();
+                    if target.is_empty() { return Ok(0usize); }
+                    let mut called = 0usize;
+                    for ev in on_events.iter().filter(|ev| ev.name == target) {
+                        let payload = lua_ctx2.to_value(&ev.data).unwrap_or(Value::Nil);
+                        handler.call::<()>(payload)?;
+                        called += 1;
+                    }
+                    Ok(called)
+                })?;
+            tbl.raw_set("on", on_fn)?;
+            Ok(())
+        })?;
+        builders.set("emit_log", emit_log_builder)?;
+        for k in &["emit", "log", "__axiom_pending_logs", "on"] {
+            key_map.set(*k, "emit_log")?;
+        }
+    }
+
+    if flags.misc {
+        let cmds = pending_commands.clone();
+        let misc_builder = lua.create_function(move |lua_ctx, tbl: mlua::Table| {
+            let tween_commands_ref = cmds.clone();
+            let tween_fn = lua_ctx.create_function_mut(move |_lua, (entity_id, opts): (u64, mlua::Table)| {
+                let property: String = opts.get("property")?;
+                let to: f32 = opts.get("to")?;
+                let from: Option<f32> = opts.get("from").ok();
+                let duration: f32 = opts.get("duration").unwrap_or(0.5);
+                let easing: Option<String> = opts.get("easing").ok();
+                let tween_id: Option<String> = opts.get("tween_id").ok();
+                tween_commands_ref.borrow_mut().push(ScriptWorldCommand::TweenEntity {
+                    target_id: entity_id, property, to, from, duration, easing, tween_id,
+                });
+                Ok(())
+            })?;
+            tbl.raw_set("tween", tween_fn)?;
+
+            let tween_seq_commands_ref = cmds.clone();
+            let tween_seq_fn = lua_ctx.create_function_mut(move |_lua, (entity_id, steps_tbl, seq_id): (u64, mlua::Table, Option<String>)| {
+                let mut steps = Vec::new();
+                for pair in steps_tbl.sequence_values::<mlua::Table>() {
+                    let step_tbl = pair?;
+                    let property: String = step_tbl.get("property")?;
+                    let to: f32 = step_tbl.get("to")?;
+                    let from: Option<f32> = step_tbl.get("from").ok();
+                    let duration: f32 = step_tbl.get("duration").unwrap_or(0.5);
+                    let easing: Option<String> = step_tbl.get("easing").ok();
+                    steps.push(crate::tween::TweenStep { property, to, from, duration, easing });
+                }
+                tween_seq_commands_ref.borrow_mut().push(ScriptWorldCommand::TweenSequence {
+                    target_id: entity_id, steps, sequence_id: seq_id,
+                });
+                Ok(())
+            })?;
+            tbl.raw_set("tween_sequence", tween_seq_fn)?;
+
+            let spawn_text_cmds = cmds.clone();
+            let spawn_text_fn = lua_ctx.create_function_mut(
+                move |_lua, (x, y, text, opts): (f32, f32, String, Option<mlua::Table>)| {
+                    let mut font_size = 16.0f32;
+                    let mut color = [1.0f32, 1.0, 1.0, 1.0];
+                    let mut duration = None;
+                    let mut fade = false;
+                    let mut rise_speed = 0.0f32;
+                    let mut owner_id = None;
+                    if let Some(opts) = opts {
+                        if let Ok(fs) = opts.get::<f32>("font_size") { font_size = fs; }
+                        if let Ok(c) = opts.get::<mlua::Table>("color") {
+                            color[0] = c.get(1).unwrap_or(1.0);
+                            color[1] = c.get(2).unwrap_or(1.0);
+                            color[2] = c.get(3).unwrap_or(1.0);
+                            color[3] = c.get(4).unwrap_or(1.0);
+                        }
+                        if let Ok(d) = opts.get::<f32>("duration") { duration = Some(d); }
+                        if let Ok(f) = opts.get::<bool>("fade") { fade = f; }
+                        if let Ok(r) = opts.get::<f32>("rise_speed") { rise_speed = r; }
+                        if let Ok(o) = opts.get::<u64>("owner_id") { owner_id = Some(o); }
+                    }
+                    spawn_text_cmds.borrow_mut().push(ScriptWorldCommand::SpawnText {
+                        x, y, text, font_size, color, duration, fade, rise_speed, owner_id,
+                    });
+                    Ok(())
+                },
+            )?;
+            tbl.raw_set("spawn_text", spawn_text_fn)?;
+
+            let weather_cmds = cmds.clone();
+            let set_weather_fn = lua_ctx.create_function_mut(
+                move |_lua, (weather_type, intensity, wind): (String, f32, Option<f32>)| {
+                    weather_cmds.borrow_mut().push(ScriptWorldCommand::SetWeather {
+                        weather_type, intensity, wind: wind.unwrap_or(0.0),
+                    });
+                    Ok(())
+                },
+            )?;
+            tbl.raw_set("set_weather", set_weather_fn)?;
+
+            let clear_weather_cmds = cmds.clone();
+            let clear_weather_fn = lua_ctx.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+                clear_weather_cmds.borrow_mut().push(ScriptWorldCommand::ClearWeather);
+                Ok(())
+            })?;
+            tbl.raw_set("clear_weather", clear_weather_fn)?;
+
+            let parallax_cmds = cmds.clone();
+            let set_parallax_fn = lua_ctx.create_function_mut(move |_lua, layers_tbl: mlua::Table| {
+                let mut layers = Vec::new();
+                for item in layers_tbl.sequence_values::<mlua::Table>() {
+                    if let Ok(layer_tbl) = item {
+                        let mut layer = crate::parallax::ParallaxLayerDef {
+                            texture: layer_tbl.get("texture").ok(),
+                            color: None,
+                            scroll_factor: layer_tbl.get("scroll_factor").unwrap_or(0.5),
+                            z_depth: layer_tbl.get("z_depth").unwrap_or(-10.0),
+                            repeat_x: layer_tbl.get("repeat_x").unwrap_or(true),
+                            repeat_y: layer_tbl.get("repeat_y").unwrap_or(false),
+                            scale: layer_tbl.get("scale").ok(),
+                        };
+                        if let Ok(c) = layer_tbl.get::<mlua::Table>("color") {
+                            let r: f32 = c.get(1).unwrap_or(0.0);
+                            let g: f32 = c.get(2).unwrap_or(0.0);
+                            let b: f32 = c.get(3).unwrap_or(0.0);
+                            let a: f32 = c.get(4).unwrap_or(1.0);
+                            layer.color = Some([r, g, b, a]);
+                        }
+                        layers.push(layer);
+                    }
+                }
+                parallax_cmds.borrow_mut().push(ScriptWorldCommand::SetParallax { layers });
+                Ok(())
+            })?;
+            tbl.raw_set("set_parallax", set_parallax_fn)?;
+
+            let cutscene_play_cmds = cmds.clone();
+            let cutscene_fn = lua_ctx.create_function_mut(move |_lua, name: String| {
+                cutscene_play_cmds.borrow_mut().push(ScriptWorldCommand::PlayCutscene { name });
+                Ok(())
+            })?;
+            tbl.raw_set("cutscene", cutscene_fn)?;
+            let cutscene_stop_cmds = cmds.clone();
+            let stop_cutscene_fn = lua_ctx.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+                cutscene_stop_cmds.borrow_mut().push(ScriptWorldCommand::StopCutscene);
+                Ok(())
+            })?;
+            tbl.raw_set("stop_cutscene", stop_cutscene_fn)?;
+
+            let tod_cmds = cmds.clone();
+            let set_tod_fn = lua_ctx.create_function_mut(move |_lua, hour: f32| {
+                tod_cmds.borrow_mut().push(ScriptWorldCommand::SetTimeOfDay { hour });
+                Ok(())
+            })?;
+            tbl.raw_set("set_time_of_day", set_tod_fn)?;
+
+            // rebind is added to input subtable if it already exists
+            let rebind_cmds = cmds.clone();
+            let rebind_fn = lua_ctx.create_function_mut(move |_lua, (key, action): (String, String)| {
+                rebind_cmds.borrow_mut().push(ScriptWorldCommand::RebindInput { key, action });
+                Ok(())
+            })?;
+            if let Ok(input_tbl) = tbl.raw_get::<mlua::Table>("input") {
+                input_tbl.set("rebind", rebind_fn)?;
+            }
+            Ok(())
+        })?;
+        builders.set("misc", misc_builder)?;
+        for k in &[
+            "tween", "tween_sequence", "spawn_text",
+            "set_weather", "clear_weather", "set_parallax",
+            "cutscene", "stop_cutscene", "set_time_of_day",
+        ] {
+            key_map.set(*k, "misc")?;
+        }
+    }
+
+    // === Set __index metamethod for lazy loading ===
+    let meta = lua.create_table()?;
+    let index_fn = lua.create_function(move |_lua, (tbl, key): (mlua::Table, String)| {
+        // Check key_map for which group this key belongs to
+        let group: Option<String> = key_map.get(key.as_str()).ok();
+        if let Some(group) = group {
+            // Check if builder still exists (not yet fired)
+            let builder: Option<mlua::Function> = builders.get(group.as_str()).ok();
+            if let Some(builder) = builder {
+                builder.call::<()>(tbl.clone())?;
+                // Remove builder so it's one-shot
+                builders.set(group.as_str(), Value::Nil)?;
+                // Return the now-installed value
+                return tbl.raw_get(key.as_str());
             }
         }
-        parallax_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::SetParallax { layers });
-        Ok(())
+        // Also check if this is a game_flow trigger: game.transition/pause/resume
+        // are accessed on the game subtable, not the world table, so game_flow
+        // builder is triggered separately. Check if this is a builder name itself.
+        let builder: Option<mlua::Function> = builders.get(key.as_str()).ok();
+        if let Some(builder) = builder {
+            builder.call::<()>(tbl.clone())?;
+            builders.set(key.as_str(), Value::Nil)?;
+            return tbl.raw_get(key.as_str());
+        }
+        Ok(Value::Nil)
     })?;
-    world_tbl.set("set_parallax", set_parallax_fn)?;
+    meta.set("__index", index_fn)?;
+    world_tbl.set_metatable(Some(meta));
 
-    // world.cutscene(name) — play a defined cutscene
-    let cutscene_play_cmds = pending_commands.clone();
-    let cutscene_fn = lua.create_function_mut(move |_lua, name: String| {
-        cutscene_play_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::PlayCutscene { name });
-        Ok(())
-    })?;
-    world_tbl.set("cutscene", cutscene_fn)?;
-
-    // world.stop_cutscene()
-    let cutscene_stop_cmds = pending_commands.clone();
-    let stop_cutscene_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
-        cutscene_stop_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::StopCutscene);
-        Ok(())
-    })?;
-    world_tbl.set("stop_cutscene", stop_cutscene_fn)?;
-
-    // world.set_time_of_day(hour)
-    let tod_cmds = pending_commands.clone();
-    let set_tod_fn = lua.create_function_mut(move |_lua, hour: f32| {
-        tod_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::SetTimeOfDay { hour });
-        Ok(())
-    })?;
-    world_tbl.set("set_time_of_day", set_tod_fn)?;
-
-    // world.input.rebind(key, action)
-    let rebind_cmds = pending_commands.clone();
-    let rebind_fn = lua.create_function_mut(move |_lua, (key, action): (String, String)| {
-        rebind_cmds
-            .borrow_mut()
-            .push(ScriptWorldCommand::RebindInput { key, action });
-        Ok(())
-    })?;
-    {
-        let input_tbl: mlua::Table = world_tbl.get("input")?;
-        input_tbl.set("rebind", rebind_fn)?;
+    // === game_flow: set __index on game subtable for lazy loading ===
+    if flags.game_flow {
+        // We need to trigger game_flow builder when game.transition/pause/resume is first accessed
+        let game_tbl: mlua::Table = world_tbl.raw_get("game")?;
+        let world_ref = world_tbl.clone();
+        let game_meta = lua.create_table()?;
+        let game_flow_keys: Vec<&'static str> = vec!["transition", "pause", "resume"];
+        let game_flow_triggered = Rc::new(RefCell::new(false));
+        let game_index_fn = lua.create_function(move |_lua, (tbl, key): (mlua::Table, String)| {
+            if !*game_flow_triggered.borrow() && game_flow_keys.iter().any(|k| *k == key.as_str()) {
+                *game_flow_triggered.borrow_mut() = true;
+                // Trigger the world table's __index for "game_flow" which will call the builder
+                // But the builder is stored differently - let's access it through the world table
+                let _: Value = world_ref.get("game_flow")?;
+                return tbl.raw_get(key.as_str());
+            }
+            Ok(Value::Nil)
+        })?;
+        game_meta.set("__index", game_index_fn)?;
+        game_tbl.set_metatable(Some(game_meta));
     }
 
     Ok((world_tbl, pending_events, pending_commands))
@@ -4194,12 +4380,13 @@ fn run_always_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
         if engine.disabled_global_scripts.contains(&script_name) {
             continue;
         }
-        let update = {
+        let (update, world_api_flags) = {
             let Some(source) = engine.scripts.get(&script_name) else {
                 continue;
             };
+            let flags = analyze_world_api_usage(source);
             match get_or_compile_update(lua, &mut cache.compiled, &script_name, source) {
-                Ok(f) => f,
+                Ok(f) => (f, flags),
                 Err(err_msg) => {
                     let streak = engine
                         .global_error_streaks
@@ -4250,6 +4437,7 @@ fn run_always_global_scripts(ctx: GlobalScriptSystemCtx<'_, '_>) {
                 input: &input_snapshot,
                 world_events: &world_events,
                 game_state: &runtime_state.state,
+                flags: world_api_flags,
             },
         );
         let (world_tbl, pending_events, pending_commands) = match world_tbl {
@@ -4366,6 +4554,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4451,6 +4640,7 @@ mod tests {
                 vy: 0.0,
                 grounded: false,
                 alive: true,
+                visible: true,
                 is_player: false,
                 aabb: Some((Vec2::new(20.0, 0.0), Vec2::new(30.0, 20.0))),
                 tags: HashSet::from(["enemy".to_string()]),
@@ -4465,6 +4655,7 @@ mod tests {
                 vy: 0.0,
                 grounded: false,
                 alive: true,
+                visible: true,
                 is_player: false,
                 aabb: Some((Vec2::new(40.0, 0.0), Vec2::new(50.0, 20.0))),
                 tags: HashSet::from(["pickup".to_string()]),
@@ -4493,6 +4684,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4614,6 +4806,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4664,6 +4857,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4709,6 +4903,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4764,6 +4959,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4814,6 +5010,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");
@@ -4893,6 +5090,7 @@ mod tests {
                 input: &input,
                 world_events: &world_events,
                 game_state: "Playing",
+                flags: WorldApiFlags::all(),
             },
         )
         .expect("build world table");

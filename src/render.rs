@@ -98,13 +98,16 @@ fn add_fallback_sprites(
     headless: Res<HeadlessMode>,
     query: Query<
         (Entity, &Collider, &Tags),
-        (Without<Sprite>, Without<Player>, Without<FallbackSprite>),
+        (Without<Sprite>, Without<Player>, Without<FallbackSprite>, Without<Invisible>),
     >,
 ) {
     if headless.0 {
         return;
     }
     for (entity, collider, tags) in query.iter() {
+        if tags.0.contains("projectile") {
+            continue;
+        }
         let color = tag_to_color(&tags.0);
         commands.entity(entity).insert((
             Sprite::from_color(color, Vec2::new(collider.width, collider.height)),

@@ -37,6 +37,7 @@ pub(super) type ExtrasQueryItem<'a> = (
         Option<&'a CollisionLayer>,
         Option<&'a crate::state_machine::EntityStateMachine>,
         Option<&'a crate::inventory::Inventory>,
+        Option<&'a crate::components::Invisible>,
     ),
     (
         Option<&'a CoyoteTimer>,
@@ -99,7 +100,7 @@ pub(super) fn collect_save_entities(
                 ai_behavior,
                 particle_emitter,
                 invincibility,
-                (render_layer, collision_layer, state_machine, inventory),
+                (render_layer, collision_layer, state_machine, inventory, _invisible),
                 _physics_diag,
             )) => (
                 health,
@@ -296,6 +297,7 @@ pub(super) fn collect_save_entities(
                 .map(|t| t.0.iter().cloned().collect())
                 .unwrap_or_default(),
             is_player: player.is_some(),
+            invisible: false,
         };
         entities.push(SaveEntity {
             network_id: network_id.map(|n| n.0),
@@ -441,6 +443,7 @@ pub(super) fn apply_loaded_save_data(
             script: se.script.clone(),
             tags: se.tags.clone(),
             is_player: se.is_player,
+            invisible: false,
         };
         let entity = crate::spawn::spawn_entity_with_network_id(
             commands,

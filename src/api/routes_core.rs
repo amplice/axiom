@@ -131,6 +131,20 @@ pub(super) async fn set_physics(
             .transpose()
             .unwrap_or(None)
             .unwrap_or_default(),
+        debug_mode: req
+            .get("debug_mode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        screenshot_path: req
+            .get("screenshot_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        asset_path: req
+            .get("asset_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::SetPhysicsConfig(cfg, tx));

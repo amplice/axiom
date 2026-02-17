@@ -84,6 +84,7 @@ impl Default for InputBindings {
         keyboard.insert("Enter".into(), vec!["attack".into()]);
         keyboard.insert("ShiftLeft".into(), vec!["sprint".into()]);
         keyboard.insert("ShiftRight".into(), vec!["sprint".into()]);
+        keyboard.insert("Equal".into(), vec!["debug_screenshot".into()]);
 
         let mut gamepad = std::collections::HashMap::new();
         gamepad.insert("South".into(), vec!["jump".into()]);
@@ -143,6 +144,7 @@ fn keycode_from_name(name: &str) -> Option<KeyCode> {
         "Escape" => Some(KeyCode::Escape),
         "Tab" => Some(KeyCode::Tab),
         "Backspace" => Some(KeyCode::Backspace),
+        "Equal" => Some(KeyCode::Equal),
         _ => None,
     }
 }
@@ -165,6 +167,13 @@ impl Plugin for InputPlugin {
                     track_mouse.run_if(resource_exists::<ButtonInput<MouseButton>>),
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                debug_screenshot_trigger.run_if(
+                    resource_exists::<crate::api::PendingScreenshot>
+                        .and(resource_exists::<ButtonInput<KeyCode>>),
+                ),
             )
             .add_systems(FixedPostUpdate, (clear_just_pressed, clear_mouse_just_pressed));
     }
@@ -252,6 +261,23 @@ fn clear_mouse_just_pressed(mut mouse: ResMut<MouseInput>) {
     mouse.left_just_pressed = false;
     mouse.right_just_pressed = false;
     mouse.middle_just_pressed = false;
+}
+
+/// Trigger a screenshot when debug_mode is on and the `=` key is just pressed.
+/// Reads raw `ButtonInput<KeyCode>` directly instead of `VirtualInput` because
+/// `VirtualInput.just_pressed` is cleared in `FixedPostUpdate` (before this
+/// system runs in `Update`), so the key event would be lost.
+fn debug_screenshot_trigger(
+    config: Res<crate::components::GameConfig>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut pending: ResMut<crate::api::PendingScreenshot>,
+) {
+    if config.debug_mode && keyboard.just_pressed(KeyCode::Equal) {
+        let dir = crate::api::screenshot_dir(config.screenshot_path.as_deref());
+        let path = crate::api::next_screenshot_path(&dir);
+        pending.requested = true;
+        pending.path = Some(path);
+    }
 }
 
 /// Map gamepad buttons/axes to VirtualInput actions. Additive with keyboard.

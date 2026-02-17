@@ -16,6 +16,8 @@ pub(super) async fn get_config(
                 "fall_multiplier": cfg.fall_multiplier,
                 "coyote_frames": cfg.coyote_frames,
                 "jump_buffer_frames": cfg.jump_buffer_frames,
+                "screenshot_path": cfg.screenshot_path,
+                "asset_path": cfg.asset_path,
             });
             Json(ApiResponse::success(json))
         }
@@ -31,94 +33,25 @@ pub(super) async fn set_config(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> Json<ApiResponse<String>> {
-    let config_result: Result<GameConfig, ()> = (|| {
-        let gravity_x = req
-            .get("gravity")
-            .and_then(|g| g.get("x"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32;
-        let gravity_y = req
-            .get("gravity")
-            .and_then(|g| g.get("y"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(-980.0) as f32;
-        let tile_size = req
-            .get("tile_size")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(16.0) as f32;
-        let move_speed = req
-            .get("move_speed")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(200.0) as f32;
-        let jump_velocity = req
-            .get("jump_velocity")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(400.0) as f32;
-        let fall_multiplier = req
-            .get("fall_multiplier")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.5) as f32;
-        let coyote_frames = req
-            .get("coyote_frames")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5) as u32;
-        let jump_buffer_frames = req
-            .get("jump_buffer_frames")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4) as u32;
-        let tile_types = req
-            .get("tile_types")
-            .map(|v| serde_json::from_value::<TileTypeRegistry>(v.clone()).map_err(|_| ()))
-            .transpose()?
-            .unwrap_or_default();
+    // Get current config
+    let (tx_get, rx_get) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetConfig(tx_get));
+    let mut config = match rx_get.await {
+        Ok(v) => v,
+        Err(_) => return Json(ApiResponse::err("Channel closed")),
+    };
 
-        let pixel_snap = req
-            .get("pixel_snap")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let interpolate_transforms = req
-            .get("interpolate_transforms")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+    // Partial merge — only supplied fields are updated
+    if let Err(e) = apply_config_overrides(&mut config, &req) {
+        return Json(ApiResponse::err(e));
+    }
 
-        let max_fall_speed = req
-            .get("max_fall_speed")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(800.0) as f32;
-        let tile_mode: crate::components::TileMode = req
-            .get("tile_mode")
-            .map(|v| serde_json::from_value(v.clone()))
-            .transpose()
-            .unwrap_or(None)
-            .unwrap_or_default();
-
-        Ok(GameConfig {
-            gravity: Vec2::new(gravity_x, gravity_y),
-            tile_size,
-            tile_types,
-            move_speed,
-            jump_velocity,
-            fall_multiplier,
-            coyote_frames,
-            jump_buffer_frames,
-            pixel_snap,
-            interpolate_transforms,
-            max_fall_speed,
-            tile_mode,
-        })
-    })();
-
-    match config_result {
-        Ok(config) => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = state.sender.send(ApiCommand::SetConfig(config, tx));
-            match rx.await {
-                Ok(Ok(())) => Json(ApiResponse::ok()),
-                Ok(Err(e)) => Json(ApiResponse::err(e)),
-                Err(_) => Json(ApiResponse::err("Channel closed")),
-            }
-        }
-        Err(_) => Json(ApiResponse::err("Invalid tile type registry format")),
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetConfig(config, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
     }
 }
 

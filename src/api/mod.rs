@@ -45,6 +45,8 @@ use crate::sprites::SpriteAssets;
 use crate::tilemap::{TileEntity, Tilemap};
 use command_runtime::*;
 use commands::*;
+pub(crate) use commands::PendingScreenshot;
+pub(crate) use helpers::{screenshot_dir, next_screenshot_path};
 use helpers::*;
 pub(crate) use persistence::{ProjectExportData, SaveAiState, SaveEntity, SaveGameData};
 use router::build_router;
@@ -86,6 +88,7 @@ impl Plugin for ApiPlugin {
             .insert_resource(PendingLevelChange::default())
             .insert_resource(PendingPhysicsChange::default())
             .insert_resource(PendingScreenshot::default())
+            .add_observer(screenshot_captured_observer)
             .insert_resource(crate::simulation::PendingRealSim::default())
             .insert_resource(crate::simulation::PendingPlaytest::default())
             .insert_resource(SharedSnapshot {

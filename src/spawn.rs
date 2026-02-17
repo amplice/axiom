@@ -384,7 +384,23 @@ pub fn spawn_entity_with_network_id(
                     max_slots: *max_slots,
                 });
             }
+            ComponentDef::Invisible => {
+                entity.insert(Invisible);
+            }
+            ComponentDef::CircleCollider { radius } => {
+                entity.insert(CircleCollider { radius: *radius });
+            }
+            ComponentDef::VelocityDamping { factor } => {
+                entity.insert(VelocityDamping { factor: *factor });
+            }
+            ComponentDef::KnockbackImpulse { vx, vy } => {
+                entity.insert(KnockbackImpulse { vx: *vx, vy: *vy });
+            }
         }
+    }
+
+    if req.invisible {
+        entity.insert(Invisible);
     }
 
     // Backward compatibility for older tag-based enemy spawns.
@@ -811,6 +827,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: true,
+            invisible: false,
             script: None,
             tags: vec!["player".into()],
             components: vec![
@@ -853,6 +870,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: true,
+            invisible: false,
             script: None,
             tags: vec!["player".into()],
             components: vec![
@@ -888,6 +906,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "patrol".into()],
             components: vec![
@@ -940,6 +959,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "chaser".into()],
             components: vec![
@@ -996,6 +1016,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "guard".into()],
             components: vec![
@@ -1042,6 +1063,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "turret".into()],
             components: vec![
@@ -1081,6 +1103,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "flying".into()],
             components: vec![
@@ -1119,6 +1142,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["enemy".into(), "boss".into()],
             components: vec![
@@ -1171,6 +1195,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["pickup".into(), "health".into()],
             components: vec![
@@ -1188,6 +1213,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["projectile".into()],
             components: vec![ComponentDef::Collider {
@@ -1199,6 +1225,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec!["platform".into(), "moving_platform".into()],
             components: vec![
@@ -1221,6 +1248,7 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             x,
             y,
             is_player: false,
+            invisible: false,
             script: None,
             tags: vec![],
             components: vec![ComponentDef::Collider {

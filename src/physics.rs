@@ -20,6 +20,8 @@ impl Plugin for PhysicsPlugin {
                 horizontal_movement,
                 top_down_movement,
                 jump_system,
+                apply_drag,
+                apply_knockback_impulse,
                 apply_velocity,
                 check_grounded,
                 update_coyote_timer,
@@ -329,6 +331,29 @@ fn jump_system(
             &mut vel.y,
         );
         physics_core::apply_variable_jump(&mut vel.y, jump_pressed, jumper.variable_height);
+    }
+}
+
+fn apply_drag(
+    time: Res<Time<Fixed>>,
+    mut query: Query<(&mut Velocity, &VelocityDamping)>,
+) {
+    let dt = time.delta_secs();
+    for (mut vel, damping) in query.iter_mut() {
+        let retain: f32 = (1.0 - damping.factor).max(0.0).powf(dt * 60.0);
+        vel.x *= retain;
+        vel.y *= retain;
+    }
+}
+
+fn apply_knockback_impulse(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Velocity, &KnockbackImpulse)>,
+) {
+    for (entity, mut vel, impulse) in query.iter_mut() {
+        vel.x += impulse.vx;
+        vel.y += impulse.vy;
+        commands.entity(entity).remove::<KnockbackImpulse>();
     }
 }
 

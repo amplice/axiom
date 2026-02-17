@@ -968,6 +968,7 @@ fn restore_embedded_entities_after_startup(
             script: saved.script.clone(),
             tags: saved.tags.clone(),
             is_player: saved.is_player,
+            invisible: false,
         };
         let entity = crate::spawn::spawn_entity_with_network_id(
             &mut commands,

@@ -124,6 +124,25 @@ pub struct Collider {
     pub height: f32,
 }
 
+/// Circle collider (radius-based collision shape)
+#[derive(Component, Clone)]
+pub struct CircleCollider {
+    pub radius: f32,
+}
+
+/// Velocity damping applied each physics tick
+#[derive(Component, Clone)]
+pub struct VelocityDamping {
+    pub factor: f32,
+}
+
+/// One-shot knockback impulse added to velocity then auto-removed
+#[derive(Component, Clone)]
+pub struct KnockbackImpulse {
+    pub vx: f32,
+    pub vy: f32,
+}
+
 /// Entity affected by GameConfig.gravity
 #[derive(Component)]
 pub struct GravityBody;
@@ -328,6 +347,15 @@ pub struct Hitbox {
 pub struct PendingDeath {
     pub frame_marked: u64,
 }
+
+/// Marker that on_death() has already been called for this entity. Prevents repeated calls
+/// while PendingDeath persists across frames.
+#[derive(Component)]
+pub struct OnDeathFired;
+
+/// Marker that prevents any visual rendering (fallback sprites, sprite sheets, etc.)
+#[derive(Component)]
+pub struct Invisible;
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -622,6 +650,15 @@ pub struct GameConfig {
     /// Tile rendering mode: square grid or isometric diamond.
     #[serde(default)]
     pub tile_mode: TileMode,
+    /// When true, pressing the debug screenshot key (`=`) saves a screenshot.
+    #[serde(default)]
+    pub debug_mode: bool,
+    /// Directory where screenshots are saved. Falls back to AXIOM_SCREENSHOT_PATH env, then ".".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    /// Directory where assets are stored. Falls back to AXIOM_ASSETS_DIR env, then "assets".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_path: Option<String>,
 }
 
 fn default_max_fall_speed() -> f32 {
@@ -643,6 +680,9 @@ impl Default for GameConfig {
             interpolate_transforms: false,
             max_fall_speed: 800.0,
             tile_mode: TileMode::default(),
+            debug_mode: false,
+            screenshot_path: None,
+            asset_path: None,
         }
     }
 }

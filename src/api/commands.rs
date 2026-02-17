@@ -2,7 +2,13 @@ use super::*;
 
 /// Pending screenshot request
 #[derive(Resource, Default)]
-pub struct PendingScreenshot(pub bool);
+pub struct PendingScreenshot {
+    pub requested: bool,
+    /// The computed output path for the next screenshot (consumed by take_screenshot).
+    pub path: Option<std::path::PathBuf>,
+    /// The path waiting for the global observer to save to (persists across frames).
+    pub save_path: Option<std::path::PathBuf>,
+}
 
 /// Commands sent from API -> Bevy
 pub enum ApiCommand {
@@ -33,7 +39,7 @@ pub enum ApiCommand {
         SpriteSheetUpsertRequest,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
-    TakeScreenshot(tokio::sync::oneshot::Sender<Result<(), String>>),
+    TakeScreenshot(tokio::sync::oneshot::Sender<Result<String, String>>),
     GetConfig(tokio::sync::oneshot::Sender<GameConfig>),
     SetConfig(GameConfig, tokio::sync::oneshot::Sender<Result<(), String>>),
     SpawnEntity(

@@ -203,6 +203,8 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/evaluate/screenshot", post(evaluate_screenshot))
         .route("/docs", get(get_docs))
         .route("/docs/html", get(get_docs_html))
+        .route("/docs/quickstart", get(get_docs_quickstart))
+        .route("/docs/workflow", get(get_docs_workflow))
         .route("/docs/endpoints", get(get_docs_endpoints))
         .route("/docs/components", get(get_docs_components))
         .route("/docs/presets", get(get_docs_presets))

@@ -382,7 +382,7 @@ fn hitbox_system(
     mut io: InteractionIo,
     spatial: Res<SpatialHash>,
     attackers: Query<(Entity, &GamePosition, &Hitbox, &NetworkId, Option<&crate::components::CollisionLayer>)>,
-    targets: Query<TargetableEntityItem<'_>, Without<Hitbox>>,
+    targets: Query<TargetableEntityItem<'_>>,
     mut combat: CombatAccess,
 ) {
     let target_view: std::collections::HashMap<Entity, TargetView> = targets
