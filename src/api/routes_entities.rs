@@ -233,12 +233,16 @@ fn filter_entities(
     let near_y = params.get("near_y").and_then(|v| v.parse::<f32>().ok());
     let near_radius = params.get("near_radius").and_then(|v| v.parse::<f32>().ok());
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
+    let entity_state = params.get("entity_state");
+    let component = params.get("component");
 
     // If no filters specified, return all
     if tag.is_none()
         && alive.is_none()
         && has_script.is_none()
         && near_x.is_none()
+        && entity_state.is_none()
+        && component.is_none()
     {
         return if let Some(lim) = limit {
             entities.into_iter().take(lim).collect()
@@ -269,6 +273,17 @@ fn filter_entities(
                 let dx = e.x - nx;
                 let dy = e.y - ny;
                 if dx * dx + dy * dy > nr * nr {
+                    return false;
+                }
+            }
+            if let Some(state_filter) = entity_state {
+                match &e.machine_state {
+                    Some(s) if s == state_filter => {}
+                    _ => return false,
+                }
+            }
+            if let Some(comp_filter) = component {
+                if !e.components.iter().any(|c| c == comp_filter) {
                     return false;
                 }
             }

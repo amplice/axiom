@@ -137,6 +137,12 @@ pub struct TraceFrame {
     pub vx: f32,
     pub vy: f32,
     pub grounded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coyote: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_buffer: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -332,6 +338,9 @@ pub fn run_simulation(
                     vx: state.vx,
                     vy: state.vy,
                     grounded: state.grounded,
+                    health: None,
+                    coyote: Some(state.coyote),
+                    jump_buffer: Some(state.jump_buffer),
                 });
             }
             continue;
@@ -540,6 +549,9 @@ pub fn run_simulation(
                 vx: state.vx,
                 vy: state.vy,
                 grounded: state.grounded,
+                health: None,
+                coyote: Some(state.coyote),
+                jump_buffer: Some(state.jump_buffer),
             });
             break;
         }
@@ -564,6 +576,9 @@ pub fn run_simulation(
                     vx: state.vx,
                     vy: state.vy,
                     grounded: state.grounded,
+                    health: None,
+                    coyote: Some(state.coyote),
+                    jump_buffer: Some(state.jump_buffer),
                 });
                 break;
             }
@@ -597,6 +612,9 @@ pub fn run_simulation(
                 vx: state.vx,
                 vy: state.vy,
                 grounded: state.grounded,
+                health: None,
+                coyote: Some(state.coyote),
+                jump_buffer: Some(state.jump_buffer),
             });
             break;
         }
@@ -619,6 +637,9 @@ pub fn run_simulation(
                 vx: state.vx,
                 vy: state.vy,
                 grounded: state.grounded,
+                health: None,
+                coyote: Some(state.coyote),
+                jump_buffer: Some(state.jump_buffer),
             });
             break;
         }
@@ -632,6 +653,9 @@ pub fn run_simulation(
                 vx: state.vx,
                 vy: state.vy,
                 grounded: state.grounded,
+                health: None,
+                coyote: Some(state.coyote),
+                jump_buffer: Some(state.jump_buffer),
             });
         }
 
@@ -927,6 +951,18 @@ pub fn finalize_real_sim(
                 collision_mask: None,
                 machine_state: None,
                 inventory_slots: None,
+                coyote_frames: None,
+                jump_buffer_frames: None,
+                invincibility_frames: None,
+                grounded: None,
+                contact_damage: None,
+                contact_knockback: None,
+                pickup_effect: None,
+                trigger_event: None,
+                projectile_damage: None,
+                projectile_speed: None,
+                hitbox_active: None,
+                hitbox_damage: None,
             });
         }
 

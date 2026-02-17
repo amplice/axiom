@@ -2742,7 +2742,7 @@ fn lua_entity_table(
     Ok(tbl)
 }
 
-pub fn dry_run_script(source: &str) -> Result<(), String> {
+pub fn dry_run_script(source: &str) -> Result<ScriptTestResult, String> {
     let lua = Lua::new();
     lua.load(source)
         .set_name("test_script")
@@ -2948,9 +2948,41 @@ pub fn dry_run_script(source: &str) -> Result<(), String> {
         &lua,
         Duration::from_millis(100),
         crate::scripting::DEFAULT_SCRIPT_HOOK_INSTRUCTION_INTERVAL,
-        || update.call::<()>((entity_tbl, world_tbl, 1.0f32 / 60.0f32)),
+        || update.call::<()>((entity_tbl.clone(), world_tbl, 1.0f32 / 60.0f32)),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Collect diagnostics from entity state after execution
+    let post_health = entity_tbl.get::<f32>("health").unwrap_or(0.0);
+    let post_alive = entity_tbl.get::<bool>("alive").unwrap_or(true);
+    let post_vx = entity_tbl.get::<f32>("vx").unwrap_or(0.0);
+    let post_vy = entity_tbl.get::<f32>("vy").unwrap_or(0.0);
+    let post_animation = entity_tbl.get::<String>("animation").unwrap_or_default();
+
+    // Check which globals were defined
+    let has_on_death = globals.get::<mlua::Function>("on_death").is_ok();
+    let has_init = globals.get::<mlua::Function>("init").is_ok();
+
+    Ok(ScriptTestResult {
+        entity_health: post_health,
+        entity_alive: post_alive,
+        entity_vx: post_vx,
+        entity_vy: post_vy,
+        entity_animation: post_animation,
+        defines_on_death: has_on_death,
+        defines_init: has_init,
+    })
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ScriptTestResult {
+    pub entity_health: f32,
+    pub entity_alive: bool,
+    pub entity_vx: f32,
+    pub entity_vy: f32,
+    pub entity_animation: String,
+    pub defines_on_death: bool,
+    pub defines_init: bool,
 }
 
 fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildResult {

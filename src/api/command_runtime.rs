@@ -135,8 +135,9 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 path_follower,
                 ai_behavior,
                 particle_emitter,
-                _invincibility,
+                invincibility,
                 (render_layer, collision_layer, state_machine, inventory),
+                (coyote_timer, jump_buffer, grounded),
             )) => EntityInfoExtras {
                 health_current: health.map(|h| h.current),
                 health_max: health.map(|h| h.max),
@@ -167,6 +168,24 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 collision_mask: collision_layer.map(|c| c.mask),
                 machine_state: state_machine.map(|sm| sm.current.clone()),
                 inventory_slots: inventory.map(|inv| inv.max_slots),
+                // Physics diagnostics
+                coyote_frames: coyote_timer.map(|c| c.0),
+                jump_buffer_frames: jump_buffer.map(|j| j.0),
+                invincibility_frames: invincibility.map(|i| i.frames_remaining),
+                grounded: grounded.map(|g| g.0),
+                // Interaction details
+                contact_damage: contact.map(|c| c.amount),
+                contact_knockback: contact.map(|c| c.knockback),
+                pickup_effect: pickup.map(|p| match &p.effect {
+                    crate::components::PickupEffect::Heal(v) => format!("heal:{}", v),
+                    crate::components::PickupEffect::ScoreAdd(v) => format!("score:{}", v),
+                    crate::components::PickupEffect::Custom(s) => format!("custom:{}", s),
+                }),
+                trigger_event: trigger.map(|t| t.event_name.clone()),
+                projectile_damage: projectile.map(|p| p.damage),
+                projectile_speed: projectile.map(|p| p.speed),
+                hitbox_active: hitbox.map(|h| h.active),
+                hitbox_damage: hitbox.map(|h| h.damage),
             },
             Err(_) => EntityInfoExtras::default(),
         }
@@ -614,6 +633,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                             _particle_emitter,
                             _invincibility,
                             _render_layer,
+                            _physics_diag,
                         )| {
                             animation_controller.map(|anim| {
                                 crate::animation::AnimationEntityState {
@@ -2146,6 +2166,18 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                                     collision_mask: None,
                                     machine_state: None,
                                     inventory_slots: None,
+                                    coyote_frames: None,
+                                    jump_buffer_frames: None,
+                                    invincibility_frames: None,
+                                    grounded: Some(t.grounded),
+                                    contact_damage: None,
+                                    contact_knockback: None,
+                                    pickup_effect: None,
+                                    trigger_event: None,
+                                    projectile_damage: None,
+                                    projectile_speed: None,
+                                    hitbox_active: None,
+                                    hitbox_damage: None,
                                 }],
                                 vars: serde_json::json!({}),
                             }
@@ -2960,6 +2992,20 @@ struct EntityInfoExtras {
     collision_mask: Option<u16>,
     machine_state: Option<String>,
     inventory_slots: Option<usize>,
+    // Physics diagnostics
+    coyote_frames: Option<u32>,
+    jump_buffer_frames: Option<u32>,
+    invincibility_frames: Option<u32>,
+    grounded: Option<bool>,
+    // Interaction details
+    contact_damage: Option<f32>,
+    contact_knockback: Option<f32>,
+    pickup_effect: Option<String>,
+    trigger_event: Option<String>,
+    projectile_damage: Option<f32>,
+    projectile_speed: Option<f32>,
+    hitbox_active: Option<bool>,
+    hitbox_damage: Option<f32>,
 }
 
 struct EntityInfoSource<'a> {
@@ -3079,6 +3125,18 @@ fn build_entity_info(source: EntityInfoSource<'_>, extras: EntityInfoExtras) -> 
         collision_mask: extras.collision_mask,
         machine_state: extras.machine_state,
         inventory_slots: extras.inventory_slots,
+        coyote_frames: extras.coyote_frames,
+        jump_buffer_frames: extras.jump_buffer_frames,
+        invincibility_frames: extras.invincibility_frames,
+        grounded: extras.grounded,
+        contact_damage: extras.contact_damage,
+        contact_knockback: extras.contact_knockback,
+        pickup_effect: extras.pickup_effect,
+        trigger_event: extras.trigger_event,
+        projectile_damage: extras.projectile_damage,
+        projectile_speed: extras.projectile_speed,
+        hitbox_active: extras.hitbox_active,
+        hitbox_damage: extras.hitbox_damage,
     }
 }
 

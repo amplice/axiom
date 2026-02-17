@@ -38,6 +38,11 @@ pub(super) type ExtrasQueryItem<'a> = (
         Option<&'a crate::state_machine::EntityStateMachine>,
         Option<&'a crate::inventory::Inventory>,
     ),
+    (
+        Option<&'a CoyoteTimer>,
+        Option<&'a JumpBuffer>,
+        Option<&'a Grounded>,
+    ),
 );
 
 pub(super) fn collect_save_entities(
@@ -95,6 +100,7 @@ pub(super) fn collect_save_entities(
                 particle_emitter,
                 invincibility,
                 (render_layer, collision_layer, state_machine, inventory),
+                _physics_diag,
             )) => (
                 health,
                 contact,

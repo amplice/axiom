@@ -137,13 +137,13 @@ pub(super) async fn delete_script(
 pub(super) async fn test_named_script(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
-) -> Json<ApiResponse<String>> {
+) -> Json<ApiResponse<crate::scripting::vm::ScriptTestResult>> {
     let (get_tx, get_rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::GetScript(name, get_tx));
     let source = match get_rx.await {
         Ok(Some(script)) => script.source,
-        Ok(None) => return Json(ApiResponse::err("Script not found")),
-        Err(_) => return Json(ApiResponse::err("Channel closed")),
+        Ok(None) => return Json(ApiResponse { ok: false, data: None, error: Some("Script not found".into()) }),
+        Err(_) => return Json(ApiResponse { ok: false, data: None, error: Some("Channel closed".into()) }),
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -151,9 +151,9 @@ pub(super) async fn test_named_script(
         .sender
         .send(ApiCommand::TestScript(ScriptTestRequest { source }, tx));
     match rx.await {
-        Ok(Ok(())) => Json(ApiResponse::ok()),
-        Ok(Err(e)) => Json(ApiResponse::err(e)),
-        Err(_) => Json(ApiResponse::err("Channel closed")),
+        Ok(Ok(result)) => Json(ApiResponse::success(result)),
+        Ok(Err(e)) => Json(ApiResponse { ok: false, data: None, error: Some(e) }),
+        Err(_) => Json(ApiResponse { ok: false, data: None, error: Some("Channel closed".into()) }),
     }
 }
 

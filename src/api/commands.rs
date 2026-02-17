@@ -84,7 +84,7 @@ pub enum ApiCommand {
     DeleteScript(String, tokio::sync::oneshot::Sender<Result<(), String>>),
     TestScript(
         ScriptTestRequest,
-        tokio::sync::oneshot::Sender<Result<(), String>>,
+        tokio::sync::oneshot::Sender<Result<crate::scripting::vm::ScriptTestResult, String>>,
     ),
     GetScriptErrors(tokio::sync::oneshot::Sender<Vec<ScriptError>>),
     ClearScriptErrors(tokio::sync::oneshot::Sender<()>),

@@ -496,6 +496,32 @@ pub struct EntityInfo {
     pub machine_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_slots: Option<usize>,
+    // Physics diagnostics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coyote_frames: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_buffer_frames: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invincibility_frames: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grounded: Option<bool>,
+    // Interaction component details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_damage: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_knockback: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pickup_effect: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projectile_damage: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projectile_speed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitbox_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitbox_damage: Option<f32>,
 }
 
 #[derive(Deserialize)]
