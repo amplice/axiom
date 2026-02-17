@@ -94,6 +94,8 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/entities/{id}/velocity", post(set_entity_velocity))
         .route("/entities/{id}/tags", post(modify_entity_tags))
         .route("/entities/{id}/health", post(set_entity_health))
+        .route("/entities/{id}/contact_damage", post(set_entity_contact_damage))
+        .route("/entities/{id}/hitbox", post(set_entity_hitbox))
         .route(
             "/entities/{id}/animation",
             get(get_entity_animation).post(set_entity_animation),
@@ -147,6 +149,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
             "/entities/{id}/state",
             get(get_entity_state).post(transition_entity_state),
         )
+        .route("/tilemap/query", post(tilemap_query))
         .route("/tilemap/auto_tile", post(set_auto_tile))
         .route("/tilemap/layers", get(get_tile_layers).post(set_tile_layer))
         .route("/tilemap/layers/{name}", delete(delete_tile_layer))

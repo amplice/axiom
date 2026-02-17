@@ -231,6 +231,22 @@ pub(super) async fn physics_raycast_entities(
     }
 }
 
+pub(super) async fn tilemap_query(
+    State(state): State<AppState>,
+    Json(req): Json<TilemapQueryRequest>,
+) -> Json<ApiResponse<TilemapQueryResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::QueryTilemap(req, tx));
+    match rx.await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
 pub(super) async fn ai_pathfind(
     State(state): State<AppState>,
     Json(req): Json<PathfindRequest>,

@@ -856,6 +856,67 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Err("Entity not found".into()));
                 }
             }
+            ApiCommand::SetEntityContactDamage(id, req, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut cd) = world.get_mut::<ContactDamage>(entity) {
+                            if let Some(a) = req.amount { cd.amount = a; }
+                            if let Some(c) = req.cooldown_frames { cd.cooldown_frames = c; }
+                            if let Some(k) = req.knockback { cd.knockback = k; }
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
+            ApiCommand::SetEntityHitbox(id, req, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut hb) = world.get_mut::<Hitbox>(entity) {
+                            if let Some(a) = req.active { hb.active = a; }
+                            if let Some(d) = req.damage { hb.damage = d; }
+                            if let Some(w) = req.width { hb.width = w; }
+                            if let Some(h) = req.height { hb.height = h; }
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
+            ApiCommand::QueryTilemap(req, tx) => {
+                let ts = physics.tile_size;
+                let col1 = (req.x1 / ts).floor() as i32;
+                let row1 = (req.y1 / ts).floor() as i32;
+                let col2 = (req.x2 / ts).ceil() as i32;
+                let row2 = (req.y2 / ts).ceil() as i32;
+                let registry = &physics.tile_types;
+                let mut solid_tiles = Vec::new();
+                let mut total = 0usize;
+                for row in row1..=row2 {
+                    for col in col1..=col2 {
+                        total += 1;
+                        let tid = tilemap.tile_id(col, row);
+                        if tid == 0 { continue; }
+                        let type_name = registry.types.get(tid as usize)
+                            .map(|t| t.name.clone())
+                            .unwrap_or_else(|| format!("unknown_{}", tid));
+                        if registry.is_solid(tid) {
+                            solid_tiles.push(TileQueryHit {
+                                col,
+                                row,
+                                tile_id: tid,
+                                tile_type: type_name,
+                            });
+                        }
+                    }
+                }
+                let solid_count = solid_tiles.len();
+                let _ = tx.send(TilemapQueryResult { solid_tiles, total_tiles: total, solid_count });
+            }
             // ── Events & Performance ────────────────────────────────────
             ApiCommand::GetEvents(tx) => {
                 let _ = tx.send(event_bus.recent.iter().cloned().collect());

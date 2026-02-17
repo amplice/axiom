@@ -1683,6 +1683,53 @@ pub struct EntityHealthRequest {
     pub max: Option<f32>,
 }
 
+// === Combat Component Mutation types ===
+
+#[derive(Deserialize)]
+pub struct EntityContactDamageRequest {
+    #[serde(default)]
+    pub amount: Option<f32>,
+    #[serde(default)]
+    pub cooldown_frames: Option<u32>,
+    #[serde(default)]
+    pub knockback: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct EntityHitboxRequest {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub damage: Option<f32>,
+    #[serde(default)]
+    pub width: Option<f32>,
+    #[serde(default)]
+    pub height: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct TilemapQueryRequest {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TilemapQueryResult {
+    pub solid_tiles: Vec<TileQueryHit>,
+    pub total_tiles: usize,
+    pub solid_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TileQueryHit {
+    pub col: i32,
+    pub row: i32,
+    pub tile_id: u8,
+    pub tile_type: String,
+}
+
 // === Window Config API types ===
 
 #[derive(Deserialize, Clone)]

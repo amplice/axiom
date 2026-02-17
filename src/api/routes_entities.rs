@@ -397,6 +397,34 @@ pub(super) async fn set_entity_health(
     }
 }
 
+pub(super) async fn set_entity_contact_damage(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityContactDamageRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityContactDamage(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn set_entity_hitbox(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityHitboxRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityHitbox(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
 pub(super) async fn get_entity_animation(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<u64>,
