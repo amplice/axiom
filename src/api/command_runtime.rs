@@ -772,6 +772,70 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Err("Entity not found".into()));
                 }
             }
+            ApiCommand::SetEntityPosition(id, x, y, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut pos) = world.get_mut::<GamePosition>(entity) {
+                            pos.x = x;
+                            pos.y = y;
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
+            ApiCommand::SetEntityVelocity(id, vx, vy, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut vel) = world.get_mut::<Velocity>(entity) {
+                            vel.x = vx;
+                            vel.y = vy;
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
+            ApiCommand::ModifyEntityTags(id, add_tags, remove_tags, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut tags) = world.get_mut::<Tags>(entity) {
+                            for t in &remove_tags {
+                                tags.0.remove(t);
+                            }
+                            for t in add_tags {
+                                tags.0.insert(t);
+                            }
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
+            ApiCommand::SetEntityHealth(id, current, max, tx) => {
+                ensure_entity_id_index!();
+                if let Some(entity) = entity_id_index.get(&id).copied() {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut health) = world.get_mut::<Health>(entity) {
+                            if let Some(c) = current {
+                                health.current = c;
+                            }
+                            if let Some(m) = max {
+                                health.max = m;
+                            }
+                        }
+                    });
+                    let _ = tx.send(Ok(()));
+                } else {
+                    let _ = tx.send(Err("Entity not found".into()));
+                }
+            }
             // ── Events & Performance ────────────────────────────────────
             ApiCommand::GetEvents(tx) => {
                 let _ = tx.send(event_bus.recent.iter().cloned().collect());
@@ -2619,6 +2683,64 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         },
                         issues,
                         overall: overall.to_string(),
+                    });
+                });
+            }
+            ApiCommand::HealthCheck(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let mut issues = Vec::new();
+
+                    // Player check
+                    let mut has_player = false;
+                    let mut entity_count = 0usize;
+                    {
+                        let mut q = world.query::<Option<&crate::components::Player>>();
+                        for player in q.iter(world) {
+                            entity_count += 1;
+                            if player.is_some() { has_player = true; }
+                        }
+                    }
+                    if !has_player { issues.push("No player entity".to_string()); }
+
+                    // Script errors
+                    let script_error_count = world.resource::<ScriptErrors>().entries.len();
+                    if script_error_count > 0 {
+                        issues.push(format!("{} script error(s)", script_error_count));
+                    }
+
+                    // Game state
+                    let game_state = world
+                        .get_resource::<crate::game_runtime::RuntimeState>()
+                        .map(|s| s.state.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
+
+                    // Game vars
+                    let engine = world.resource::<ScriptEngine>();
+                    let snapshot = engine.snapshot();
+                    let game_vars_count = snapshot.vars.len();
+
+                    // Tilemap check
+                    let tm = world.resource::<Tilemap>();
+                    let tilemap_set = tm.width > 0 && tm.height > 0 && !tm.tiles.is_empty();
+                    if !tilemap_set { issues.push("No tilemap loaded".to_string()); }
+
+                    let status = if issues.is_empty() {
+                        "healthy"
+                    } else if script_error_count > 0 || !has_player {
+                        "unhealthy"
+                    } else {
+                        "warning"
+                    };
+
+                    let _ = tx.send(HealthCheckResult {
+                        status: status.to_string(),
+                        has_player,
+                        entity_count,
+                        script_error_count,
+                        game_state,
+                        game_vars_count,
+                        tilemap_set,
+                        issues,
                     });
                 });
             }

@@ -1858,6 +1858,21 @@ pub(super) async fn get_pool_status(
 
 // === Playtest ===
 
+pub(super) async fn health_check(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<HealthCheckResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::HealthCheck(tx));
+    match rx.await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
 pub(super) async fn set_window_config(
     State(state): State<AppState>,
     Json(req): Json<WindowConfigRequest>,

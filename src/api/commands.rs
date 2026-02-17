@@ -63,6 +63,10 @@ pub enum ApiCommand {
     DeleteEntity(u64, tokio::sync::oneshot::Sender<Result<(), String>>),
     ResetNonPlayerEntities(tokio::sync::oneshot::Sender<Result<(), String>>),
     DamageEntity(u64, f32, tokio::sync::oneshot::Sender<Result<(), String>>),
+    SetEntityPosition(u64, f32, f32, tokio::sync::oneshot::Sender<Result<(), String>>),
+    SetEntityVelocity(u64, f32, f32, tokio::sync::oneshot::Sender<Result<(), String>>),
+    ModifyEntityTags(u64, Vec<String>, Vec<String>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    SetEntityHealth(u64, Option<f32>, Option<f32>, tokio::sync::oneshot::Sender<Result<(), String>>),
     GetEvents(tokio::sync::oneshot::Sender<Vec<GameEvent>>),
     GetPerf(tokio::sync::oneshot::Sender<PerfStats>),
     GetPerfHistory(tokio::sync::oneshot::Sender<crate::perf::PerfHistory>),
@@ -346,6 +350,10 @@ pub enum ApiCommand {
     // Holistic evaluation
     EvaluateGame(
         tokio::sync::oneshot::Sender<EvaluationResult>,
+    ),
+    // Health check
+    HealthCheck(
+        tokio::sync::oneshot::Sender<HealthCheckResult>,
     ),
 }
 

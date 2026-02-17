@@ -176,6 +176,13 @@ pub fn docs_endpoints() -> Vec<serde_json::Value> {
         serde_json::json!({"method":"GET","path":"/docs/scripts","description":"Scripting API surface (Lua + Rhai helpers)"}),
         serde_json::json!({"method":"GET","path":"/docs/examples","description":"Built-in example recipes and defaults"}),
         serde_json::json!({"method":"GET","path":"/docs/security","description":"API auth and rate-limit configuration"}),
+        // Entity mutation
+        serde_json::json!({"method":"POST","path":"/entities/{id}/position","description":"Set entity position. Body: {x: f32, y: f32}"}),
+        serde_json::json!({"method":"POST","path":"/entities/{id}/velocity","description":"Set entity velocity. Body: {vx: f32, vy: f32}"}),
+        serde_json::json!({"method":"POST","path":"/entities/{id}/tags","description":"Add/remove entity tags. Body: {add?: [string], remove?: [string]}"}),
+        serde_json::json!({"method":"POST","path":"/entities/{id}/health","description":"Set entity health. Body: {current?: f32, max?: f32}"}),
+        // Health check
+        serde_json::json!({"method":"GET","path":"/health","description":"Unified health check: player exists, entity count, script errors, game state. Returns status (healthy/warning/unhealthy) and issues list"}),
         // Window config
         serde_json::json!({"method":"POST","path":"/window","description":"Set window title and/or background color. Body: {title?: string, background?: [r,g,b]}"}),
         // Evaluation

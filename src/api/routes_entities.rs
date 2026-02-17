@@ -205,17 +205,91 @@ pub(super) async fn reset_non_player_entities(
 
 pub(super) async fn list_entities(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<ApiResponse<Vec<EntityInfo>>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::ListEntities(tx));
     match rx.await {
-        Ok(entities) => Json(ApiResponse::success(entities)),
+        Ok(entities) => {
+            let filtered = filter_entities(entities, &params);
+            Json(ApiResponse::success(filtered))
+        }
         Err(_) => Json(ApiResponse {
             ok: false,
             data: None,
             error: Some("Channel closed".into()),
         }),
     }
+}
+
+fn filter_entities(
+    entities: Vec<EntityInfo>,
+    params: &std::collections::HashMap<String, String>,
+) -> Vec<EntityInfo> {
+    let tag = params.get("tag");
+    let alive = params.get("alive").and_then(|v| v.parse::<bool>().ok());
+    let has_script = params.get("has_script").and_then(|v| v.parse::<bool>().ok());
+    let near_x = params.get("near_x").and_then(|v| v.parse::<f32>().ok());
+    let near_y = params.get("near_y").and_then(|v| v.parse::<f32>().ok());
+    let near_radius = params.get("near_radius").and_then(|v| v.parse::<f32>().ok());
+    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
+
+    // If no filters specified, return all
+    if tag.is_none()
+        && alive.is_none()
+        && has_script.is_none()
+        && near_x.is_none()
+    {
+        return if let Some(lim) = limit {
+            entities.into_iter().take(lim).collect()
+        } else {
+            entities
+        };
+    }
+
+    let mut result: Vec<EntityInfo> = entities
+        .into_iter()
+        .filter(|e| {
+            if let Some(tag_filter) = tag {
+                if !e.tags.iter().any(|t| t == tag_filter) {
+                    return false;
+                }
+            }
+            if let Some(alive_filter) = alive {
+                if e.alive != Some(alive_filter) {
+                    return false;
+                }
+            }
+            if let Some(script_filter) = has_script {
+                if script_filter != e.script.is_some() {
+                    return false;
+                }
+            }
+            if let (Some(nx), Some(ny), Some(nr)) = (near_x, near_y, near_radius) {
+                let dx = e.x - nx;
+                let dy = e.y - ny;
+                if dx * dx + dy * dy > nr * nr {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    // Sort by distance if spatial query
+    if let (Some(nx), Some(ny)) = (near_x, near_y) {
+        result.sort_by(|a, b| {
+            let da = (a.x - nx).powi(2) + (a.y - ny).powi(2);
+            let db = (b.x - nx).powi(2) + (b.y - ny).powi(2);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    if let Some(lim) = limit {
+        result.truncate(lim);
+    }
+
+    result
 }
 
 pub(super) async fn get_entity(
@@ -245,6 +319,62 @@ pub(super) async fn delete_entity(
 ) -> Json<ApiResponse<String>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state.sender.send(ApiCommand::DeleteEntity(id, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn set_entity_position(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityPositionRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityPosition(id, req.x, req.y, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn set_entity_velocity(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityVelocityRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityVelocity(id, req.vx, req.vy, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn modify_entity_tags(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityTagsRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ModifyEntityTags(id, req.add, req.remove, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn set_entity_health(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<EntityHealthRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityHealth(id, req.current, req.max, tx));
     match rx.await {
         Ok(Ok(())) => Json(ApiResponse::ok()),
         Ok(Err(e)) => Json(ApiResponse::err(e)),

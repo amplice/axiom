@@ -1627,6 +1627,36 @@ fn default_asset_color() -> [u8; 3] {
     [128, 128, 128]
 }
 
+// === Entity Mutation API types ===
+
+#[derive(Deserialize)]
+pub struct EntityPositionRequest {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Deserialize)]
+pub struct EntityVelocityRequest {
+    pub vx: f32,
+    pub vy: f32,
+}
+
+#[derive(Deserialize)]
+pub struct EntityTagsRequest {
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct EntityHealthRequest {
+    #[serde(default)]
+    pub current: Option<f32>,
+    #[serde(default)]
+    pub max: Option<f32>,
+}
+
 // === Window Config API types ===
 
 #[derive(Deserialize, Clone)]
@@ -1635,6 +1665,20 @@ pub struct WindowConfigRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub background: Option<[f32; 3]>,
+}
+
+// === Health Check API types ===
+
+#[derive(Serialize, Clone)]
+pub struct HealthCheckResult {
+    pub status: String,
+    pub has_player: bool,
+    pub entity_count: usize,
+    pub script_error_count: usize,
+    pub game_state: String,
+    pub game_vars_count: usize,
+    pub tilemap_set: bool,
+    pub issues: Vec<String>,
 }
 
 // === Evaluation API types ===

@@ -90,6 +90,10 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
             get(get_entity).delete(delete_entity).post(damage_entity),
         )
         .route("/entities/{id}/damage", post(damage_entity))
+        .route("/entities/{id}/position", post(set_entity_position))
+        .route("/entities/{id}/velocity", post(set_entity_velocity))
+        .route("/entities/{id}/tags", post(modify_entity_tags))
+        .route("/entities/{id}/health", post(set_entity_health))
         .route(
             "/entities/{id}/animation",
             get(get_entity_animation).post(set_entity_animation),
@@ -185,6 +189,8 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/assets/upload", post(upload_asset))
         .route("/assets/generate", post(generate_asset))
         .route("/assets/list", get(list_assets))
+        // Health check
+        .route("/health", get(health_check))
         // Window config
         .route("/window", post(set_window_config))
         // Evaluation
