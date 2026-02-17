@@ -96,6 +96,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/entities/{id}/health", post(set_entity_health))
         .route("/entities/{id}/contact_damage", post(set_entity_contact_damage))
         .route("/entities/{id}/hitbox", post(set_entity_hitbox))
+        .route("/entities/bulk", post(bulk_entity_mutate))
         .route(
             "/entities/{id}/animation",
             get(get_entity_animation).post(set_entity_animation),
@@ -112,6 +113,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/scripts/{name}/test", post(test_named_script))
         .route("/scripts/errors", get(get_script_errors).delete(clear_script_errors))
         .route("/scripts/vars", get(get_script_vars).post(set_script_vars))
+        .route("/scripts/vars/diff", get(get_script_vars_diff))
         .route("/scripts/events", get(get_script_events))
         .route("/scripts/stats", get(get_script_stats))
         .route("/scripts/logs", get(get_script_logs).delete(clear_script_logs))

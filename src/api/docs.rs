@@ -184,6 +184,8 @@ pub fn docs_endpoints() -> Vec<serde_json::Value> {
         serde_json::json!({"method":"POST","path":"/entities/{id}/contact_damage","description":"Modify ContactDamage component. Body: {amount?: f32, cooldown_frames?: u32, knockback?: f32}"}),
         serde_json::json!({"method":"POST","path":"/entities/{id}/hitbox","description":"Modify Hitbox component. Body: {active?: bool, damage?: f32, width?: f32, height?: f32}"}),
         serde_json::json!({"method":"POST","path":"/tilemap/query","description":"Query solid tiles in AABB region. Body: {x1, y1, x2, y2}. Returns solid_tiles array with col, row, tile_id, tile_type"}),
+        serde_json::json!({"method":"POST","path":"/entities/bulk","description":"Bulk mutate entities matching filter. Body: {filter: {tag?, component?, alive?, ids?}, mutations: {health_current?, add_tags?, contact_damage?, hitbox_active?, alive?, ...}}"}),
+        serde_json::json!({"method":"GET","path":"/scripts/vars/diff","description":"Get script var changes since last diff call. Returns {changed, added, removed, snapshot_id}. First call establishes baseline."}),
         // Health check
         serde_json::json!({"method":"GET","path":"/health","description":"Unified health check: player exists, entity count, script errors, game state. Returns status (healthy/warning/unhealthy) and issues list"}),
         // Window config

@@ -70,6 +70,7 @@ pub enum ApiCommand {
     SetEntityContactDamage(u64, EntityContactDamageRequest, tokio::sync::oneshot::Sender<Result<(), String>>),
     SetEntityHitbox(u64, EntityHitboxRequest, tokio::sync::oneshot::Sender<Result<(), String>>),
     QueryTilemap(TilemapQueryRequest, tokio::sync::oneshot::Sender<TilemapQueryResult>),
+    BulkEntityMutate(BulkEntityRequest, tokio::sync::oneshot::Sender<BulkEntityResult>),
     GetEvents(tokio::sync::oneshot::Sender<Vec<GameEvent>>),
     GetPerf(tokio::sync::oneshot::Sender<PerfStats>),
     GetPerfHistory(tokio::sync::oneshot::Sender<crate::perf::PerfHistory>),

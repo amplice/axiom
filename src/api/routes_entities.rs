@@ -397,6 +397,22 @@ pub(super) async fn set_entity_health(
     }
 }
 
+pub(super) async fn bulk_entity_mutate(
+    State(state): State<AppState>,
+    Json(req): Json<BulkEntityRequest>,
+) -> Json<ApiResponse<BulkEntityResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::BulkEntityMutate(req, tx));
+    match rx.await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
 pub(super) async fn set_entity_contact_damage(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<u64>,

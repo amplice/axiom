@@ -15,6 +15,13 @@ pub(super) struct AppState {
     pub(super) level_packs: Arc<RwLock<LevelPackStore>>,
     pub(super) game_runtime: Arc<RwLock<GameRuntimeStore>>,
     pub(super) replay_store: Arc<RwLock<ReplayStore>>,
+    pub(super) var_snapshot: Arc<RwLock<VarDiffStore>>,
+}
+
+#[derive(Default)]
+pub(super) struct VarDiffStore {
+    pub(super) last_vars: HashMap<String, serde_json::Value>,
+    pub(super) snapshot_id: u64,
 }
 
 #[derive(Default)]

@@ -125,6 +125,7 @@ impl Plugin for ApiPlugin {
             level_packs,
             game_runtime,
             replay_store,
+            var_snapshot: Arc::new(RwLock::new(VarDiffStore::default())),
         };
         let security = ApiSecurity::from_env();
         std::thread::spawn(move || {

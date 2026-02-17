@@ -215,6 +215,67 @@ pub(super) async fn set_script_vars(
     }
 }
 
+pub(super) async fn get_script_vars_diff(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<ScriptVarDiff>> {
+    // Get current vars
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetScriptVars(tx));
+    let current_vars = match rx.await {
+        Ok(vars) => vars,
+        Err(_) => return Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    };
+
+    // Parse current vars as map
+    let current_map: std::collections::HashMap<String, serde_json::Value> = match current_vars {
+        serde_json::Value::Object(m) => m.into_iter().collect(),
+        _ => std::collections::HashMap::new(),
+    };
+
+    // Compare with last snapshot
+    let mut store = state.var_snapshot.write().unwrap();
+    let mut changed = std::collections::HashMap::new();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+
+    // Find changed and added
+    for (key, val) in &current_map {
+        match store.last_vars.get(key) {
+            Some(old_val) if old_val != val => {
+                changed.insert(key.clone(), val.clone());
+            }
+            None => {
+                added.push(key.clone());
+                changed.insert(key.clone(), val.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Find removed
+    for key in store.last_vars.keys() {
+        if !current_map.contains_key(key) {
+            removed.push(key.clone());
+        }
+    }
+
+    // Update snapshot
+    store.last_vars = current_map;
+    store.snapshot_id += 1;
+    let snapshot_id = store.snapshot_id;
+
+    Json(ApiResponse::success(ScriptVarDiff {
+        changed,
+        added,
+        removed,
+        snapshot_id,
+    }))
+}
+
 pub(super) async fn get_script_events(
     State(state): State<AppState>,
 ) -> Json<ApiResponse<Vec<ScriptEvent>>> {

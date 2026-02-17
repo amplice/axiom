@@ -856,6 +856,102 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Err("Entity not found".into()));
                 }
             }
+            ApiCommand::BulkEntityMutate(req, tx) => {
+                ensure_entity_id_index!();
+                let filter = &req.filter;
+                let mutations = req.mutations;
+
+                // Collect matching entity IDs
+                let mut matched_ids: Vec<(u64, Entity)> = Vec::new();
+                if let Some(ref ids) = filter.ids {
+                    for &id in ids {
+                        if let Some(&entity) = entity_id_index.get(&id) {
+                            matched_ids.push((id, entity));
+                        }
+                    }
+                } else {
+                    for (
+                        entity, _pos, _vel, _col, _player, _grav, _hm, _jmp, _tdm,
+                        _grounded, alive, network_id, tags, script,
+                    ) in entity_query.iter() {
+                        let Some(nid) = network_id else { continue; };
+                        // Apply filters
+                        if let Some(ref tag_filter) = filter.tag {
+                            let has = tags.map_or(false, |t| t.0.contains(tag_filter));
+                            if !has { continue; }
+                        }
+                        if let Some(alive_filter) = filter.alive {
+                            let is_alive = alive.map_or(true, |a| a.0);
+                            if is_alive != alive_filter { continue; }
+                        }
+                        if let Some(script_filter) = filter.has_script {
+                            if script_filter != script.is_some() { continue; }
+                        }
+                        if let Some(ref comp_filter) = filter.component {
+                            let extras = entity_extras(entity);
+                            let comps = [
+                                extras.has_contact.then_some("ContactDamage"),
+                                extras.has_trigger.then_some("TriggerZone"),
+                                extras.has_pickup.then_some("Pickup"),
+                                extras.has_projectile.then_some("Projectile"),
+                                extras.has_hitbox.then_some("Hitbox"),
+                                extras.has_moving_platform.then_some("MovingPlatform"),
+                                extras.has_ai_behavior.then_some("AiBehavior"),
+                            ];
+                            if !comps.iter().any(|c| c == &Some(comp_filter.as_str())) { continue; }
+                        }
+                        if let Some(ref state_filter) = filter.entity_state {
+                            let extras = entity_extras(entity);
+                            match extras.machine_state {
+                                Some(ref s) if s == state_filter => {}
+                                _ => continue,
+                            }
+                        }
+                        matched_ids.push((nid.0, entity));
+                    }
+                }
+
+                let matched = matched_ids.len();
+                let mutated = matched;
+                commands.queue(move |world: &mut World| {
+                    for (_nid, entity) in &matched_ids {
+                        if let Some(set_alive) = mutations.alive {
+                            if let Some(mut a) = world.get_mut::<Alive>(*entity) {
+                                a.0 = set_alive;
+                            }
+                        }
+                        if mutations.health_current.is_some() || mutations.health_max.is_some() {
+                            if let Some(mut h) = world.get_mut::<Health>(*entity) {
+                                if let Some(c) = mutations.health_current { h.current = c; }
+                                if let Some(m) = mutations.health_max { h.max = m; }
+                            }
+                        }
+                        if mutations.add_tags.is_some() || mutations.remove_tags.is_some() {
+                            if let Some(mut tags) = world.get_mut::<Tags>(*entity) {
+                                if let Some(ref remove) = mutations.remove_tags {
+                                    for t in remove { tags.0.remove(t); }
+                                }
+                                if let Some(ref add) = mutations.add_tags {
+                                    for t in add { tags.0.insert(t.clone()); }
+                                }
+                            }
+                        }
+                        if mutations.contact_damage.is_some() || mutations.contact_knockback.is_some() {
+                            if let Some(mut cd) = world.get_mut::<ContactDamage>(*entity) {
+                                if let Some(d) = mutations.contact_damage { cd.amount = d; }
+                                if let Some(k) = mutations.contact_knockback { cd.knockback = k; }
+                            }
+                        }
+                        if mutations.hitbox_active.is_some() || mutations.hitbox_damage.is_some() {
+                            if let Some(mut hb) = world.get_mut::<Hitbox>(*entity) {
+                                if let Some(a) = mutations.hitbox_active { hb.active = a; }
+                                if let Some(d) = mutations.hitbox_damage { hb.damage = d; }
+                            }
+                        }
+                    }
+                    let _ = tx.send(BulkEntityResult { matched, mutated });
+                });
+            }
             ApiCommand::SetEntityContactDamage(id, req, tx) => {
                 ensure_entity_id_index!();
                 if let Some(entity) = entity_id_index.get(&id).copied() {

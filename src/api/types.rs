@@ -1683,6 +1683,72 @@ pub struct EntityHealthRequest {
     pub max: Option<f32>,
 }
 
+// === Bulk Entity Operations ===
+
+#[derive(Deserialize)]
+pub struct BulkEntityRequest {
+    /// Filter criteria (same as GET /entities query params)
+    #[serde(default)]
+    pub filter: BulkEntityFilter,
+    /// Mutations to apply to each matched entity
+    pub mutations: BulkEntityMutations,
+}
+
+#[derive(Deserialize, Default)]
+pub struct BulkEntityFilter {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub alive: Option<bool>,
+    #[serde(default)]
+    pub has_script: Option<bool>,
+    #[serde(default)]
+    pub entity_state: Option<String>,
+    /// Explicit entity IDs to target (overrides other filters)
+    #[serde(default)]
+    pub ids: Option<Vec<u64>>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct BulkEntityMutations {
+    #[serde(default)]
+    pub health_current: Option<f32>,
+    #[serde(default)]
+    pub health_max: Option<f32>,
+    #[serde(default)]
+    pub add_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub remove_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub contact_damage: Option<f32>,
+    #[serde(default)]
+    pub contact_knockback: Option<f32>,
+    #[serde(default)]
+    pub hitbox_active: Option<bool>,
+    #[serde(default)]
+    pub hitbox_damage: Option<f32>,
+    #[serde(default)]
+    pub alive: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct BulkEntityResult {
+    pub matched: usize,
+    pub mutated: usize,
+}
+
+// === Script Var Diff ===
+
+#[derive(Serialize, Clone)]
+pub struct ScriptVarDiff {
+    pub changed: std::collections::HashMap<String, serde_json::Value>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub snapshot_id: u64,
+}
+
 // === Combat Component Mutation types ===
 
 #[derive(Deserialize)]
