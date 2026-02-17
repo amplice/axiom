@@ -1,5 +1,8 @@
+use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::components::GameConfig;
 
 #[derive(Serialize)]
 pub struct GameState {
@@ -249,6 +252,44 @@ pub enum ComponentDef {
         #[serde(default = "default_light_color")]
         color: [f32; 3],
     },
+    #[serde(rename = "collision_layer")]
+    CollisionLayer {
+        #[serde(default = "default_collision_layer")]
+        layer: u16,
+        #[serde(default = "default_collision_mask")]
+        mask: u16,
+    },
+    #[serde(rename = "sprite_color_tint")]
+    SpriteColorTint {
+        #[serde(default = "default_tint_color")]
+        color: [f32; 4],
+        #[serde(default)]
+        flash_color: Option<[f32; 4]>,
+        #[serde(default)]
+        flash_frames: u32,
+    },
+    #[serde(rename = "trail_effect")]
+    TrailEffect {
+        #[serde(default = "default_trail_interval")]
+        interval: u32,
+        #[serde(default = "default_trail_duration")]
+        duration: f32,
+        #[serde(default = "default_f32_one")]
+        alpha_start: f32,
+        #[serde(default)]
+        alpha_end: f32,
+    },
+    #[serde(rename = "state_machine")]
+    StateMachine {
+        states: std::collections::HashMap<String, crate::state_machine::StateConfig>,
+        #[serde(default = "default_state_machine_initial")]
+        initial: String,
+    },
+    #[serde(rename = "inventory")]
+    Inventory {
+        #[serde(default = "default_max_slots")]
+        max_slots: usize,
+    },
 }
 
 fn default_left() -> String {
@@ -298,6 +339,27 @@ fn default_facing_direction() -> u8 {
 }
 fn default_light_color() -> [f32; 3] {
     [1.0, 1.0, 1.0]
+}
+fn default_collision_layer() -> u16 {
+    1
+}
+fn default_collision_mask() -> u16 {
+    0xFFFF
+}
+fn default_tint_color() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+fn default_trail_interval() -> u32 {
+    3
+}
+fn default_trail_duration() -> f32 {
+    0.3
+}
+fn default_state_machine_initial() -> String {
+    "idle".to_string()
+}
+fn default_max_slots() -> usize {
+    20
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -426,6 +488,14 @@ pub struct EntityInfo {
     pub animation_facing_right: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_layer: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collision_layer: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collision_mask: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_slots: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -908,6 +978,24 @@ pub struct TweenRequest {
     pub tween_id: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct TweenSequenceRequest {
+    pub steps: Vec<TweenStepRequest>,
+    #[serde(default)]
+    pub sequence_id: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct TweenStepRequest {
+    pub property: String,
+    pub to: f32,
+    #[serde(default)]
+    pub from: Option<f32>,
+    pub duration: f32,
+    #[serde(default)]
+    pub easing: Option<String>,
+}
+
 // === Screen Effect API types ===
 
 #[derive(Deserialize, Clone)]
@@ -955,4 +1043,585 @@ pub struct LightingStateResponse {
     pub ambient_intensity: f32,
     pub ambient_color: [f32; 3],
     pub light_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_of_day: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day_phase: Option<String>,
+}
+
+// === Tint API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct TintRequest {
+    #[serde(default = "default_tint_color")]
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub flash_color: Option<[f32; 4]>,
+    #[serde(default)]
+    pub flash_frames: u32,
+}
+
+// === Trail API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct TrailRequest {
+    #[serde(default = "default_trail_interval")]
+    pub interval: u32,
+    #[serde(default = "default_trail_duration")]
+    pub duration: f32,
+    #[serde(default = "default_f32_one")]
+    pub alpha_start: f32,
+    #[serde(default)]
+    pub alpha_end: f32,
+}
+
+// === Input Bindings API types ===
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InputBindingsRequest {
+    #[serde(default)]
+    pub keyboard: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub gamepad: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct InputBindingsResponse {
+    pub keyboard: HashMap<String, Vec<String>>,
+    pub gamepad: HashMap<String, Vec<String>>,
+}
+
+// === Day/Night Cycle API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct DayNightRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub time_of_day: Option<f32>,
+    #[serde(default)]
+    pub speed: Option<f32>,
+    #[serde(default)]
+    pub phases: Option<Vec<DayPhaseRequest>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DayPhaseRequest {
+    pub name: String,
+    pub start_hour: f32,
+    pub ambient_intensity: f32,
+    #[serde(default = "default_light_color")]
+    pub ambient_color: [f32; 3],
+}
+
+#[derive(Serialize, Clone)]
+pub struct DayNightResponse {
+    pub enabled: bool,
+    pub time_of_day: f32,
+    pub speed: f32,
+    pub current_phase: String,
+    pub phases: Vec<DayPhaseRequest>,
+}
+
+// === World Text API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct WorldTextRequest {
+    pub x: f32,
+    pub y: f32,
+    pub text: String,
+    #[serde(default = "default_world_text_font_size")]
+    pub font_size: f32,
+    #[serde(default = "default_tint_color")]
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub duration: Option<f32>,
+    #[serde(default)]
+    pub fade: bool,
+    #[serde(default)]
+    pub rise_speed: f32,
+    #[serde(default)]
+    pub owner_id: Option<u64>,
+}
+
+fn default_world_text_font_size() -> f32 {
+    16.0
+}
+
+// === State Machine API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct StateTransitionRequest {
+    pub state: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StateMachineResponse {
+    pub current: String,
+    pub previous: Option<String>,
+    pub entered_at_frame: u64,
+    pub states: Vec<String>,
+}
+
+// === Auto-Tile API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct AutoTileRequest {
+    pub rules: HashMap<String, AutoTileSetDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AutoTileSetDef {
+    pub base_tile_id: u8,
+    /// 4-bit bitmask (N/S/E/W) -> sprite index.
+    pub variants: HashMap<u8, usize>,
+}
+
+// === Tile Layer API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct TileLayerRequest {
+    pub name: String,
+    pub tiles: Vec<u8>,
+    #[serde(default)]
+    pub z_offset: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TileLayersResponse {
+    pub layers: Vec<TileLayerInfo>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TileLayerInfo {
+    pub name: String,
+    pub z_offset: f32,
+    pub tile_count: usize,
+}
+
+// === Entity Pool API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct PoolInitRequest {
+    pub pool_name: String,
+    pub preset: String,
+    pub count: usize,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct PoolAcquireRequest {
+    pub pool_name: String,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PoolStatusResponse {
+    pub pools: Vec<PoolInfo>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PoolInfo {
+    pub name: String,
+    pub available: usize,
+    pub active: usize,
+}
+
+// === Parallax API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct ParallaxRequest {
+    pub layers: Vec<crate::parallax::ParallaxLayerDef>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ParallaxResponse {
+    pub layers: Vec<crate::parallax::ParallaxLayerDef>,
+}
+
+// === Weather API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct WeatherRequest {
+    pub weather_type: String,
+    #[serde(default = "default_f32_one")]
+    pub intensity: f32,
+    #[serde(default)]
+    pub wind: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WeatherResponse {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weather_type: Option<String>,
+    pub intensity: f32,
+    pub wind: f32,
+}
+
+// === Inventory API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct ItemDefineRequest {
+    pub items: HashMap<String, crate::inventory::ItemDef>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct InventoryActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default = "default_item_count")]
+    pub count: u32,
+}
+
+fn default_item_count() -> u32 {
+    1
+}
+
+#[derive(Serialize, Clone)]
+pub struct InventoryResponse {
+    pub slots: Vec<crate::inventory::ItemSlot>,
+    pub max_slots: usize,
+}
+
+// === Cutscene API types ===
+
+#[derive(Deserialize, Clone)]
+pub struct CutsceneDefineRequest {
+    pub name: String,
+    pub steps: Vec<crate::cutscene::CutsceneStep>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct CutscenePlayRequest {
+    pub name: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct CutsceneStateResponse {
+    pub playing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_steps: Option<usize>,
+    pub defined_cutscenes: Vec<String>,
+}
+
+// === Spatial Grid (scene_describe ?grid=N) ===
+
+#[derive(Serialize, Clone)]
+pub struct SpatialGrid {
+    pub rows: usize,
+    pub cols: usize,
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub cells: Vec<SpatialGridCell>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct SpatialGridCell {
+    pub row: usize,
+    pub col: usize,
+    pub world_min: [f32; 2],
+    pub world_max: [f32; 2],
+    pub tile_types: Vec<String>,
+    pub entity_ids: Vec<u64>,
+    pub entity_tags: Vec<String>,
+    pub entity_count: usize,
+}
+
+// === Screenshot Analysis ===
+
+#[derive(Serialize, Clone)]
+pub struct ScreenshotAnalysis {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub quadrant_colors: Vec<QuadrantInfo>,
+    pub entity_bboxes: Vec<EntityBBox>,
+    pub overlap_pairs: Vec<(u64, u64)>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct QuadrantInfo {
+    pub name: String,
+    pub avg_color: [u8; 3],
+    pub avg_brightness: f32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct EntityBBox {
+    pub id: u64,
+    pub screen_x: f32,
+    pub screen_y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+// === Screenshot Diff ===
+
+#[derive(Deserialize, Clone)]
+pub struct ScreenshotDiffRequest {
+    #[serde(default)]
+    pub baseline_path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ScreenshotDiffResult {
+    pub diff_percentage: f32,
+    pub quadrant_diffs: Vec<QuadrantDiff>,
+    pub baseline_path: String,
+    pub current_path: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct QuadrantDiff {
+    pub name: String,
+    pub diff_percentage: f32,
+}
+
+// === Gameplay Telemetry ===
+
+#[derive(Serialize, Deserialize, Clone, Default, Resource)]
+pub struct GameplayTelemetry {
+    pub death_locations: Vec<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_reached_at: Option<u64>,
+    pub input_counts: HashMap<String, u64>,
+    pub entity_count_samples: Vec<(u64, usize)>,
+    pub damage_taken: f32,
+    pub damage_dealt: f32,
+    pub pickups_collected: u64,
+    pub total_frames: u64,
+}
+
+// === Scenario Testing ===
+
+#[derive(Deserialize, Clone)]
+pub struct ScenarioRequest {
+    pub setup: Vec<ScenarioStep>,
+    pub frames: u32,
+    #[serde(default)]
+    pub inputs: Vec<crate::simulation::SimInput>,
+    pub assertions: Vec<Assertion>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ScenarioStep {
+    pub action: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct Assertion {
+    pub check: String,
+    #[serde(default)]
+    pub expected: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ScenarioResult {
+    pub passed: bool,
+    pub assertions: Vec<AssertionResult>,
+    pub frames_run: u32,
+    pub events: Vec<crate::events::GameEvent>,
+    pub final_vars: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AssertionResult {
+    pub check: String,
+    pub passed: bool,
+    pub expected: serde_json::Value,
+    pub actual: serde_json::Value,
+}
+
+// === World Simulation ===
+
+#[derive(Deserialize, Clone)]
+pub struct WorldSimRequest {
+    pub frames: u32,
+    #[serde(default)]
+    pub record_interval: Option<u32>,
+    #[serde(default)]
+    pub inputs: Vec<crate::simulation::SimInput>,
+    #[serde(default)]
+    pub real: bool,
+}
+
+// === Playtest ===
+
+#[derive(Deserialize, Clone)]
+pub struct PlaytestRequest {
+    #[serde(default = "default_playtest_frames")]
+    pub frames: u32,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+fn default_playtest_frames() -> u32 {
+    600
+}
+
+#[derive(Serialize, Clone)]
+pub struct PlaytestResult {
+    pub frames_played: u32,
+    pub alive: bool,
+    pub deaths: Vec<PlaytestEvent>,
+    pub damage_taken: f32,
+    pub distance_traveled: f32,
+    pub tiles_explored: usize,
+    pub events: Vec<PlaytestEvent>,
+    pub stuck_count: u32,
+    pub input_summary: HashMap<String, u32>,
+    pub difficulty_rating: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PlaytestEvent {
+    pub frame: u32,
+    pub event_type: String,
+    pub x: f32,
+    pub y: f32,
+    pub detail: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WorldSimResult {
+    pub frames_run: u32,
+    pub snapshots: Vec<WorldSimSnapshot>,
+    pub events: Vec<crate::events::GameEvent>,
+    pub script_errors: Vec<crate::scripting::ScriptError>,
+    pub final_vars: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WorldSimSnapshot {
+    pub frame: u32,
+    pub entities: Vec<EntityInfo>,
+    pub vars: serde_json::Value,
+}
+
+// === Enriched Sim Entities ===
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SimEntity {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    #[serde(default = "default_sim_entity_size")]
+    pub width: f32,
+    #[serde(default = "default_sim_entity_size")]
+    pub height: f32,
+    #[serde(default)]
+    pub entity_type: String,
+    #[serde(default)]
+    pub damage: Option<f32>,
+}
+
+fn default_sim_entity_size() -> f32 {
+    16.0
+}
+
+// === Import Result ===
+
+#[derive(Serialize, Clone)]
+pub struct ImportResult {
+    pub entities_spawned: usize,
+    pub scripts_loaded: usize,
+    pub scripts_failed: Vec<String>,
+    pub config_applied: bool,
+    pub tilemap_applied: bool,
+    pub animation_graphs: usize,
+    pub sprite_sheets: usize,
+    pub warnings: Vec<String>,
+}
+
+// === Atomic Build ===
+
+#[derive(Deserialize, Clone)]
+pub struct BuildRequest {
+    #[serde(default)]
+    pub config: Option<GameConfig>,
+    #[serde(default)]
+    pub tilemap: Option<SetLevelRequest>,
+    #[serde(default)]
+    pub entities: Vec<EntitySpawnRequest>,
+    #[serde(default)]
+    pub scripts: HashMap<String, String>,
+    #[serde(default)]
+    pub global_scripts: Vec<String>,
+    #[serde(default)]
+    pub game_vars: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub animation_graphs: Option<HashMap<String, crate::animation::AnimationGraphDef>>,
+    #[serde(default)]
+    pub sprite_sheets: Option<HashMap<String, crate::sprites::SpriteSheetDef>>,
+    #[serde(default)]
+    pub presets: Option<HashMap<String, EntitySpawnRequest>>,
+    #[serde(default)]
+    pub validate_first: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct BuildResult {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_result: Option<ImportResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::constraints::ValidateResult>,
+    pub errors: Vec<String>,
+}
+
+// === Asset Pipeline ===
+
+#[derive(Deserialize, Clone)]
+pub struct AssetUploadRequest {
+    pub name: String,
+    pub data: String,
+    #[serde(default)]
+    pub asset_type: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct AssetInfo {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AssetGenerateRequest {
+    pub name: String,
+    #[serde(default = "default_asset_gen_size")]
+    pub width: u32,
+    #[serde(default = "default_asset_gen_size")]
+    pub height: u32,
+    #[serde(default = "default_asset_color")]
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+fn default_asset_gen_size() -> u32 {
+    32
+}
+
+fn default_asset_color() -> [u8; 3] {
+    [128, 128, 128]
 }

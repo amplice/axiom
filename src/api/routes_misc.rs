@@ -871,6 +871,7 @@ pub(super) async fn get_dialogue_state(
 
 pub(super) async fn scene_describe(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<ApiResponse<serde_json::Value>> {
     let (state_tx, state_rx) = tokio::sync::oneshot::channel();
     let (entities_tx, entities_rx) = tokio::sync::oneshot::channel();
@@ -955,7 +956,7 @@ pub(super) async fn scene_describe(
         })
     };
 
-    Json(ApiResponse::success(serde_json::json!({
+    let mut result = serde_json::json!({
         "game": game,
         "visible_entities": visible_entities,
         "tile_summary": tile_summary,
@@ -965,7 +966,120 @@ pub(super) async fn scene_describe(
         "camera": camera,
         "vars": vars.unwrap_or_else(|| serde_json::json!({})),
         "perf": perf,
-    })))
+    });
+
+    // Spatial grid: ?grid=N divides world into NxN cells
+    if let Some(grid_str) = params.get("grid") {
+        if let Ok(grid_n) = grid_str.parse::<usize>() {
+            if grid_n > 0 {
+                if let Some(ref gs) = game_state {
+                    let spatial = build_spatial_grid(gs, &visible_entities, grid_n);
+                    result.as_object_mut().unwrap().insert(
+                        "spatial_grid".to_string(),
+                        serde_json::to_value(spatial).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+
+    Json(ApiResponse::success(result))
+}
+
+fn build_spatial_grid(
+    game_state: &GameState,
+    entities: &[serde_json::Value],
+    grid_n: usize,
+) -> SpatialGrid {
+    let tile_size = 16.0f32; // default tile size
+    let world_w = game_state.tilemap.width as f32 * tile_size;
+    let world_h = game_state.tilemap.height as f32 * tile_size;
+    let cell_w = world_w / grid_n as f32;
+    let cell_h = world_h / grid_n as f32;
+
+    let tile_type_name = |t: u8| -> &'static str {
+        match t {
+            0 => "empty",
+            1 => "solid",
+            2 => "spike",
+            3 => "goal",
+            4 => "platform",
+            5 => "slope_up",
+            6 => "slope_down",
+            7 => "ladder",
+            _ => "unknown",
+        }
+    };
+
+    let mut cells = Vec::with_capacity(grid_n * grid_n);
+    for row in 0..grid_n {
+        for col in 0..grid_n {
+            let min_x = col as f32 * cell_w;
+            let min_y = row as f32 * cell_h;
+            let max_x = min_x + cell_w;
+            let max_y = min_y + cell_h;
+
+            // Sample tile types in this cell
+            let tile_min_col = (min_x / tile_size).floor() as usize;
+            let tile_max_col = ((max_x / tile_size).ceil() as usize).min(game_state.tilemap.width);
+            let tile_min_row = (min_y / tile_size).floor() as usize;
+            let tile_max_row =
+                ((max_y / tile_size).ceil() as usize).min(game_state.tilemap.height);
+
+            let mut tile_types_set = std::collections::BTreeSet::new();
+            for ty in tile_min_row..tile_max_row {
+                for tx in tile_min_col..tile_max_col {
+                    let idx = ty * game_state.tilemap.width + tx;
+                    if let Some(&tile) = game_state.tilemap.tiles.get(idx) {
+                        tile_types_set.insert(tile_type_name(tile).to_string());
+                    }
+                }
+            }
+
+            // Map entities to this cell
+            let mut cell_entity_ids = Vec::new();
+            let mut cell_tags_set = std::collections::BTreeSet::new();
+            for e in entities {
+                let pos = e.get("pos").and_then(|v| v.as_array());
+                if let Some(pos) = pos {
+                    let ex = pos.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    let ey = pos.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    if ex >= min_x && ex < max_x && ey >= min_y && ey < max_y {
+                        if let Some(id) = e.get("id").and_then(|v| v.as_u64()) {
+                            cell_entity_ids.push(id);
+                        }
+                        if let Some(tags) = e.get("tags").and_then(|v| v.as_array()) {
+                            for tag in tags {
+                                if let Some(s) = tag.as_str() {
+                                    cell_tags_set.insert(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let entity_count = cell_entity_ids.len();
+            cells.push(SpatialGridCell {
+                row,
+                col,
+                world_min: [min_x, min_y],
+                world_max: [max_x, max_y],
+                tile_types: tile_types_set.into_iter().collect(),
+                entity_ids: cell_entity_ids,
+                entity_tags: cell_tags_set.into_iter().collect(),
+                entity_count,
+            });
+        }
+    }
+
+    SpatialGrid {
+        rows: grid_n,
+        cols: grid_n,
+        cell_width: cell_w,
+        cell_height: cell_h,
+        cells,
+    }
 }
 
 fn build_tile_summary(tiles: &[u8]) -> serde_json::Value {
@@ -1048,6 +1162,20 @@ pub(super) async fn tween_entity(
     }
 }
 
+pub(super) async fn tween_sequence_entity(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<TweenSequenceRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityTweenSequence(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
 // === Screen Effects ===
 
 pub(super) async fn trigger_screen_effect(
@@ -1104,6 +1232,654 @@ pub(super) async fn get_lighting_state(
             ok: false,
             data: None,
             error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Entity Tint ===
+
+pub(super) async fn set_entity_tint(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<TintRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityTint(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Entity Trail ===
+
+pub(super) async fn set_entity_trail(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<Option<TrailRequest>>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetEntityTrail(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Input Bindings ===
+
+pub(super) async fn get_input_bindings(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<InputBindingsResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetInputBindings(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn set_input_bindings(
+    State(state): State<AppState>,
+    Json(req): Json<InputBindingsRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetInputBindings(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Day/Night Cycle ===
+
+pub(super) async fn get_day_night(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<DayNightResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetDayNight(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn set_day_night(
+    State(state): State<AppState>,
+    Json(req): Json<DayNightRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetDayNight(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === World Text ===
+
+pub(super) async fn spawn_world_text(
+    State(state): State<AppState>,
+    Json(req): Json<WorldTextRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SpawnWorldText(req, tx));
+    match rx.await {
+        Ok(Ok(id)) => Json(ApiResponse::success(serde_json::json!({ "id": id }))),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Entity State Machine ===
+
+pub(super) async fn get_entity_state(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Json<ApiResponse<StateMachineResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetEntityState(id, tx));
+    match rx.await {
+        Ok(Some(val)) => Json(ApiResponse::success(val)),
+        Ok(None) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Entity or state machine not found".into()),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn transition_entity_state(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<StateTransitionRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .sender
+        .send(ApiCommand::TransitionEntityState(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Auto-Tile ===
+
+pub(super) async fn set_auto_tile(
+    State(state): State<AppState>,
+    Json(req): Json<AutoTileRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetAutoTile(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Parallax ===
+
+pub(super) async fn get_parallax(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<ParallaxResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetParallax(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn set_parallax(
+    State(state): State<AppState>,
+    Json(req): Json<ParallaxRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetParallax(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Weather ===
+
+pub(super) async fn get_weather(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<WeatherResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetWeather(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn set_weather(
+    State(state): State<AppState>,
+    Json(req): Json<WeatherRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetWeather(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn clear_weather(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ClearWeather(tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Items/Inventory ===
+
+pub(super) async fn define_items(
+    State(state): State<AppState>,
+    Json(req): Json<ItemDefineRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::DefineItems(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn get_entity_inventory(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Json<ApiResponse<InventoryResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetEntityInventory(id, tx));
+    match rx.await {
+        Ok(Some(val)) => Json(ApiResponse::success(val)),
+        Ok(None) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Entity or inventory not found".into()),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn entity_inventory_action(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(req): Json<InventoryActionRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state
+        .sender
+        .send(ApiCommand::EntityInventoryAction(id, req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Cutscene ===
+
+pub(super) async fn define_cutscene(
+    State(state): State<AppState>,
+    Json(req): Json<CutsceneDefineRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::DefineCutscene(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn play_cutscene(
+    State(state): State<AppState>,
+    Json(req): Json<CutscenePlayRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::PlayCutscene(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn stop_cutscene(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::StopCutscene(tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn get_cutscene_state(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<CutsceneStateResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetCutsceneState(tx));
+    match rx.await {
+        Ok(val) => Json(ApiResponse::success(val)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Spawn Presets ===
+
+pub(super) async fn define_presets(
+    State(state): State<AppState>,
+    Json(presets): Json<std::collections::HashMap<String, EntitySpawnRequest>>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::DefinePresets(presets, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn list_presets(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<std::collections::HashMap<String, EntitySpawnRequest>>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ListPresets(tx));
+    match rx.await {
+        Ok(presets) => Json(ApiResponse::success(presets)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Tile Layers ===
+
+pub(super) async fn set_tile_layer(
+    State(state): State<AppState>,
+    Json(req): Json<TileLayerRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SetTileLayer(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn get_tile_layers(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<TileLayersResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetTileLayers(tx));
+    match rx.await {
+        Ok(resp) => Json(ApiResponse::success(resp)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn delete_tile_layer(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::DeleteTileLayer(name, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Entity Pool ===
+
+pub(super) async fn init_pool(
+    State(state): State<AppState>,
+    Json(req): Json<PoolInitRequest>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::InitPool(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+pub(super) async fn acquire_from_pool(
+    State(state): State<AppState>,
+    Json(req): Json<PoolAcquireRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::AcquireFromPool(req, tx));
+    match rx.await {
+        Ok(Ok(id)) => Json(ApiResponse::success(serde_json::json!({"id": id}))),
+        Ok(Err(e)) => Json(ApiResponse { ok: false, data: None, error: Some(e) }),
+        Err(_) => Json(ApiResponse { ok: false, data: None, error: Some("Channel closed".into()) }),
+    }
+}
+
+pub(super) async fn release_to_pool(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ReleaseToPool(id, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === Telemetry ===
+
+pub(super) async fn get_telemetry(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<GameplayTelemetry>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetTelemetry(tx));
+    match rx.await {
+        Ok(data) => Json(ApiResponse::success(data)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn reset_telemetry(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ResetTelemetry(tx));
+    match rx.await {
+        Ok(()) => Json(ApiResponse::ok()),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
+// === World Simulation ===
+
+pub(super) async fn simulate_world(
+    State(state): State<AppState>,
+    Json(req): Json<WorldSimRequest>,
+) -> Json<ApiResponse<WorldSimResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::SimulateWorld(req, tx));
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(result))) => Json(ApiResponse::success(result)),
+        Ok(Ok(Err(e))) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Ok(Err(_)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("World simulation timed out (30s)".into()),
+        }),
+    }
+}
+
+// === Scenario Testing ===
+
+pub(super) async fn run_scenario(
+    State(state): State<AppState>,
+    Json(req): Json<ScenarioRequest>,
+) -> Json<ApiResponse<ScenarioResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::RunScenario(req, tx));
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(result))) => Json(ApiResponse::success(result)),
+        Ok(Ok(Err(e))) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Ok(Err(_)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Scenario timed out (30s)".into()),
+        }),
+    }
+}
+
+// === Asset Pipeline ===
+
+pub(super) async fn upload_asset(
+    State(state): State<AppState>,
+    Json(req): Json<AssetUploadRequest>,
+) -> Json<ApiResponse<AssetInfo>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::UploadAsset(req, tx));
+    match rx.await {
+        Ok(Ok(info)) => Json(ApiResponse::success(info)),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn generate_asset(
+    State(state): State<AppState>,
+    Json(req): Json<AssetGenerateRequest>,
+) -> Json<ApiResponse<AssetInfo>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GenerateAsset(req, tx));
+    match rx.await {
+        Ok(Ok(info)) => Json(ApiResponse::success(info)),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn list_assets(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<AssetInfo>>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::ListAssets(tx));
+    match rx.await {
+        Ok(items) => Json(ApiResponse::success(items)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn get_pool_status(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<PoolStatusResponse>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::GetPoolStatus(tx));
+    match rx.await {
+        Ok(resp) => Json(ApiResponse::success(resp)),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+// === Playtest ===
+
+pub(super) async fn run_playtest(
+    State(state): State<AppState>,
+    Json(req): Json<PlaytestRequest>,
+) -> Json<ApiResponse<PlaytestResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::RunPlaytest(req, tx));
+    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+        Ok(Ok(Ok(result))) => Json(ApiResponse::success(result)),
+        Ok(Ok(Err(e))) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Ok(Err(_)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Playtest timed out (120s)".into()),
         }),
     }
 }

@@ -10,6 +10,12 @@ pub struct ValidateRequest {
     #[serde(default)]
     pub entities: Vec<ValidateEntity>,
     pub constraints: Vec<String>,
+    #[serde(default)]
+    pub script_errors: Vec<String>,
+    #[serde(default)]
+    pub perf_fps: Option<f32>,
+    #[serde(default)]
+    pub available_assets: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -22,14 +28,14 @@ pub struct ValidateEntity {
     pub config: serde_json::Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ValidateResult {
     pub valid: bool,
     pub violations: Vec<Violation>,
     pub passed: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Violation {
     pub constraint: String,
     pub message: String,
@@ -41,6 +47,18 @@ pub fn validate(
     physics: &GameConfig,
     constraints: &[String],
     entities: &[ValidateEntity],
+) -> ValidateResult {
+    validate_full(tilemap, physics, constraints, entities, &[], None, &[])
+}
+
+pub fn validate_full(
+    tilemap: &Tilemap,
+    physics: &GameConfig,
+    constraints: &[String],
+    entities: &[ValidateEntity],
+    script_errors: &[String],
+    perf_fps: Option<f32>,
+    available_assets: &[String],
 ) -> ValidateResult {
     let mut violations = Vec::new();
     let mut passed = Vec::new();
@@ -215,6 +233,112 @@ pub fn validate(
                     details: v.1,
                 }),
             },
+            "entity_overlap" => {
+                let threshold = spec.args.first().and_then(|v| v.parse::<f32>().ok()).unwrap_or(8.0);
+                let mut overlaps = Vec::new();
+                for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        let dx = entities[i].x - entities[j].x;
+                        let dy = entities[i].y - entities[j].y;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if dist < threshold {
+                            overlaps.push(serde_json::json!({
+                                "entity_a": { "x": entities[i].x, "y": entities[i].y, "preset": entities[i].preset },
+                                "entity_b": { "x": entities[j].x, "y": entities[j].y, "preset": entities[j].preset },
+                                "distance": dist,
+                            }));
+                        }
+                    }
+                }
+                if overlaps.is_empty() {
+                    passed.push(raw.clone());
+                } else {
+                    violations.push(Violation {
+                        constraint: raw.clone(),
+                        message: format!("{} entity overlap(s) within {}px", overlaps.len(), threshold),
+                        details: serde_json::json!({ "overlaps": overlaps }),
+                    });
+                }
+            }
+            "spawn_in_solid" => {
+                let mut in_solid = Vec::new();
+                for e in entities {
+                    let tx = (e.x / physics.tile_size) as i32;
+                    let ty = (e.y / physics.tile_size) as i32;
+                    if tilemap.is_solid(tx, ty) {
+                        in_solid.push(serde_json::json!({
+                            "x": e.x, "y": e.y, "preset": e.preset,
+                            "tile": [tx, ty],
+                        }));
+                    }
+                }
+                if in_solid.is_empty() {
+                    passed.push(raw.clone());
+                } else {
+                    violations.push(Violation {
+                        constraint: raw.clone(),
+                        message: format!("{} entities spawned inside solid tiles", in_solid.len()),
+                        details: serde_json::json!({ "entities_in_solid": in_solid }),
+                    });
+                }
+            }
+            "script_errors" => {
+                if script_errors.is_empty() {
+                    passed.push(raw.clone());
+                } else {
+                    violations.push(Violation {
+                        constraint: raw.clone(),
+                        message: format!("{} script error(s)", script_errors.len()),
+                        details: serde_json::json!({ "errors": script_errors }),
+                    });
+                }
+            }
+            "performance" => {
+                let fps_min = spec.args.first().and_then(|v| {
+                    if let Some(stripped) = v.strip_prefix("fps_min=") {
+                        stripped.parse::<f32>().ok()
+                    } else {
+                        v.parse::<f32>().ok()
+                    }
+                }).unwrap_or(30.0);
+                if let Some(fps) = perf_fps {
+                    if fps >= fps_min {
+                        passed.push(raw.clone());
+                    } else {
+                        violations.push(Violation {
+                            constraint: raw.clone(),
+                            message: format!("FPS {:.1} below minimum {:.1}", fps, fps_min),
+                            details: serde_json::json!({ "fps": fps, "fps_min": fps_min }),
+                        });
+                    }
+                } else {
+                    passed.push(raw.clone()); // no perf data = pass
+                }
+            }
+            "asset_missing" => {
+                if available_assets.is_empty() {
+                    passed.push(raw.clone()); // no asset list provided = pass
+                } else {
+                    let asset_set: HashSet<&str> = available_assets.iter().map(|s| s.as_str()).collect();
+                    let mut missing = Vec::new();
+                    for e in entities {
+                        if let Some(sheet) = e.config.get("sprite_sheet").and_then(|v| v.as_str()) {
+                            if !asset_set.contains(sheet) {
+                                missing.push(sheet.to_string());
+                            }
+                        }
+                    }
+                    if missing.is_empty() {
+                        passed.push(raw.clone());
+                    } else {
+                        violations.push(Violation {
+                            constraint: raw.clone(),
+                            message: format!("{} missing asset(s)", missing.len()),
+                            details: serde_json::json!({ "missing": missing }),
+                        });
+                    }
+                }
+            }
             other => {
                 violations.push(Violation {
                     constraint: other.to_string(),

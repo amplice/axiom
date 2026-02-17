@@ -67,6 +67,8 @@ pub(crate) struct SaveEntity {
     pub path_follower_path: Vec<(f32, f32)>,
     #[serde(default)]
     pub path_follower_frames_until_recalc: Option<u32>,
+    #[serde(default)]
+    pub inventory_slots: Vec<crate::inventory::ItemSlot>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

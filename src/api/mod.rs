@@ -25,7 +25,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use bevy::prelude::*;
@@ -84,6 +84,8 @@ impl Plugin for ApiPlugin {
             .insert_resource(PendingLevelChange::default())
             .insert_resource(PendingPhysicsChange::default())
             .insert_resource(PendingScreenshot::default())
+            .insert_resource(crate::simulation::PendingRealSim::default())
+            .insert_resource(crate::simulation::PendingPlaytest::default())
             .insert_resource(SharedSnapshot {
                 data: snapshot.clone(),
             })
@@ -99,6 +101,20 @@ impl Plugin for ApiPlugin {
                     take_screenshot,
                 )
                     .chain(),
+            )
+            .add_systems(
+                FixedFirst,
+                (
+                    crate::simulation::tick_real_sim,
+                    crate::simulation::tick_playtest_agent,
+                ),
+            )
+            .add_systems(
+                FixedPostUpdate,
+                (
+                    crate::simulation::finalize_real_sim,
+                    crate::simulation::finalize_playtest,
+                ),
             );
 
         let state = AppState {
@@ -167,6 +183,7 @@ mod tests {
                 invincibility_frames: Some(8),
                 path_follower_path: vec![(10.0, 20.0)],
                 path_follower_frames_until_recalc: Some(3),
+                inventory_slots: vec![],
             }],
             scripts: std::collections::HashMap::new(),
             global_scripts: vec![],
@@ -299,6 +316,7 @@ mod tests {
                 tiles: generated.tilemap.tiles.clone(),
                 player_spawn: generated.player_spawn,
                 goal: Some(generated.goal),
+                ..Default::default()
             };
             let solved = crate::pathfinding::solve(&tilemap, &cfg);
             assert!(

@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bevy::prelude::*;
 use serde::Serialize;
 
@@ -13,7 +15,7 @@ pub struct GameEvent {
 
 #[derive(Resource, Default)]
 pub struct GameEventBus {
-    pub recent: Vec<GameEvent>,
+    pub recent: VecDeque<GameEvent>,
     pub frame: u64,
     pub dropped_events: u64,
     last_overflow_log_frame: u64,
@@ -26,7 +28,7 @@ impl GameEventBus {
         data: serde_json::Value,
         source_entity: Option<u64>,
     ) {
-        self.recent.push(GameEvent {
+        self.recent.push_back(GameEvent {
             name: name.into(),
             data,
             frame: self.frame,
@@ -34,7 +36,10 @@ impl GameEventBus {
         });
         if self.recent.len() > MAX_EVENTS {
             let excess = self.recent.len() - MAX_EVENTS;
-            self.recent.drain(0..excess);
+            // O(1) amortized front removal with VecDeque
+            for _ in 0..excess {
+                self.recent.pop_front();
+            }
             self.dropped_events = self.dropped_events.saturating_add(excess as u64);
             if self.frame.saturating_sub(self.last_overflow_log_frame) >= 60 {
                 self.last_overflow_log_frame = self.frame;

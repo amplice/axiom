@@ -521,6 +521,7 @@ mod tests {
             tiles,
             player_spawn: (8.0, 8.0),
             goal: None,
+            ..Default::default()
         }
     }
 

@@ -8,8 +8,26 @@ pub struct TweenPlugin;
 
 impl Plugin for TweenPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, tick_tweens);
+        app.add_systems(Update, (tick_tweens, advance_tween_sequences).chain());
     }
+}
+
+#[derive(Clone)]
+pub struct TweenStep {
+    pub property: String,
+    pub to: f32,
+    pub from: Option<f32>,
+    pub duration: f32,
+    pub easing: Option<String>,
+}
+
+/// Holds a queue of tween steps to apply sequentially.
+#[derive(Component, Clone, Default)]
+pub struct TweenSequence {
+    pub steps: Vec<TweenStep>,
+    pub current_index: usize,
+    pub sequence_id: Option<String>,
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,7 +196,7 @@ fn tick_tweens(
             if let Some(tween_id) = &tween.tween_id {
                 data["tween_id"] = serde_json::json!(tween_id);
             }
-            event_bus.recent.push(GameEvent {
+            event_bus.recent.push_back(GameEvent {
                 name: "tween_complete".to_string(),
                 data,
                 frame: 0,
@@ -269,5 +287,109 @@ pub fn apply_tween_command(
         world.entity_mut(entity).insert(TweenSet(vec![instance]));
     }
 
+    Ok(())
+}
+
+/// System that advances tween sequences when the current step finishes.
+fn advance_tween_sequences(
+    mut commands: Commands,
+    mut event_bus: ResMut<GameEventBus>,
+    mut query: Query<(
+        Entity,
+        &mut TweenSequence,
+        &mut GamePosition,
+        &NetworkId,
+        Option<&Sprite>,
+        Option<&Transform>,
+        Option<&TweenSet>,
+    )>,
+) {
+    for (entity, mut seq, pos, network_id, sprite, transform, tween_set) in query.iter_mut() {
+        if !seq.active {
+            continue;
+        }
+        // Check if the entity still has an active tween — if so, wait
+        let has_active_tween = tween_set.is_some_and(|ts| !ts.0.is_empty());
+        if has_active_tween {
+            continue;
+        }
+
+        // Current step completed (or sequence just started), advance to next
+        if seq.current_index >= seq.steps.len() {
+            // Sequence complete
+            let mut data = serde_json::json!({ "entity_id": network_id.0 });
+            if let Some(ref sid) = seq.sequence_id {
+                data["sequence_id"] = serde_json::json!(sid);
+            }
+            event_bus.recent.push_back(GameEvent {
+                name: "tween_sequence_complete".to_string(),
+                data,
+                frame: 0,
+                source_entity: Some(network_id.0),
+            });
+            commands.entity(entity).remove::<TweenSequence>();
+            continue;
+        }
+
+        let step = &seq.steps[seq.current_index];
+        let Some(property) = TweenProperty::from_str(&step.property) else {
+            // Skip invalid step
+            seq.current_index += 1;
+            continue;
+        };
+        let easing = step.easing.as_deref().map(EasingFunction::from_str).unwrap_or(EasingFunction::Linear);
+        let from = step.from.unwrap_or_else(|| {
+            get_current_value(
+                &pos,
+                sprite,
+                transform,
+                property,
+            )
+        });
+        let instance = TweenInstance {
+            property,
+            from,
+            to: step.to,
+            duration: step.duration.max(0.001),
+            elapsed: 0.0,
+            easing,
+            tween_id: seq.sequence_id.clone().map(|s| format!("{}_{}", s, seq.current_index)),
+        };
+        seq.current_index += 1;
+
+        commands.entity(entity).insert(TweenSet(vec![instance]));
+    }
+}
+
+/// Apply a tween sequence command from the API
+pub fn apply_tween_sequence_command(
+    world: &mut World,
+    entity_network_id: u64,
+    steps: Vec<TweenStep>,
+    sequence_id: Option<String>,
+) -> Result<(), String> {
+    if steps.is_empty() {
+        return Err("Tween sequence must have at least one step".to_string());
+    }
+
+    let mut entity_id = None;
+    let mut query = world.query::<(Entity, &NetworkId)>();
+    for (entity, nid) in query.iter(world) {
+        if nid.0 == entity_network_id {
+            entity_id = Some(entity);
+            break;
+        }
+    }
+    let entity = entity_id
+        .ok_or_else(|| format!("Entity with network_id {} not found", entity_network_id))?;
+
+    let sequence = TweenSequence {
+        steps,
+        current_index: 0,
+        sequence_id,
+        active: true,
+    };
+
+    world.entity_mut(entity).insert(sequence);
     Ok(())
 }

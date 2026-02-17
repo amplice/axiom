@@ -8,6 +8,7 @@ mod audio;
 mod camera;
 mod components;
 mod constraints;
+mod cutscene;
 mod debug;
 mod events;
 mod feel;
@@ -15,7 +16,9 @@ mod game_runtime;
 mod generation;
 mod input;
 mod interaction;
+mod inventory;
 pub mod lighting;
+mod parallax;
 mod particles;
 mod pathfinding;
 mod perf;
@@ -28,14 +31,19 @@ pub mod screen_effects;
 mod scripting;
 mod simulation;
 mod spatial_hash;
+mod state_machine;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod spawn;
 mod sprites;
+mod telemetry;
 mod tilemap;
+mod trail;
 pub mod tween;
 mod ui;
+mod weather;
 #[cfg(any(feature = "web_export", feature = "desktop_export"))]
 mod web_bootstrap;
+mod world_text;
 
 use bevy::prelude::*;
 use components::{GameConfig, HeadlessMode, NextNetworkId};

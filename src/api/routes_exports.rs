@@ -25,13 +25,15 @@ pub(super) async fn export_level(
 pub(super) async fn import_level(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
-) -> Json<ApiResponse<String>> {
+) -> Json<ApiResponse<ImportResult>> {
     let save: SaveGameData = match serde_json::from_value(req) {
         Ok(v) => v,
         Err(e) => {
-            return Json(ApiResponse::err(format!(
-                "Invalid level import payload: {e}"
-            )))
+            return Json(ApiResponse {
+                ok: false,
+                data: None,
+                error: Some(format!("Invalid level import payload: {e}")),
+            })
         }
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -39,9 +41,17 @@ pub(super) async fn import_level(
         .sender
         .send(ApiCommand::LoadSaveData(Box::new(save), tx));
     match rx.await {
-        Ok(Ok(())) => Json(ApiResponse::ok()),
-        Ok(Err(e)) => Json(ApiResponse::err(e)),
-        Err(_) => Json(ApiResponse::err("Channel closed")),
+        Ok(Ok(result)) => Json(ApiResponse::success(result)),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
     }
 }
 
@@ -71,7 +81,7 @@ pub(super) async fn export_game(
 pub(super) async fn import_game(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
-) -> Json<ApiResponse<String>> {
+) -> Json<ApiResponse<ImportResult>> {
     // Backward compat: accept old SaveGameData payload or new ProjectExportData payload.
     let project = if let Ok(project) = serde_json::from_value::<ProjectExportData>(req.clone()) {
         project
@@ -79,9 +89,11 @@ pub(super) async fn import_game(
         let save = match serde_json::from_value::<SaveGameData>(req) {
             Ok(v) => v,
             Err(e) => {
-                return Json(ApiResponse::err(format!(
-                    "Invalid game import payload: {e}"
-                )))
+                return Json(ApiResponse {
+                    ok: false,
+                    data: None,
+                    error: Some(format!("Invalid game import payload: {e}")),
+                })
             }
         };
         ProjectExportData {
@@ -96,17 +108,25 @@ pub(super) async fn import_game(
         .sender
         .send(ApiCommand::LoadSaveData(Box::new(project.save), tx));
     match rx.await {
-        Ok(Ok(())) => {
+        Ok(Ok(result)) => {
             let mut store = state.level_packs.write().unwrap();
             store.packs.clear();
             store.progress.clear();
             for pack in project.level_packs {
                 store.packs.insert(pack.name.clone(), pack);
             }
-            Json(ApiResponse::ok())
+            Json(ApiResponse::success(result))
         }
-        Ok(Err(e)) => Json(ApiResponse::err(e)),
-        Err(_) => Json(ApiResponse::err("Channel closed")),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
     }
 }
 
@@ -702,6 +722,137 @@ fn format_command_error(output: &std::process::Output) -> String {
     }
 }
 
+pub(super) async fn atomic_build(
+    State(state): State<AppState>,
+    Json(req): Json<BuildRequest>,
+) -> Json<ApiResponse<BuildResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::AtomicBuild(Box::new(req), tx));
+    match rx.await {
+        Ok(Ok(result)) => Json(ApiResponse {
+            ok: result.success,
+            data: Some(result),
+            error: None,
+        }),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
+    }
+}
+
+pub(super) async fn validate_manifest(
+    Json(req): Json<BuildRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 1. Valid tile types in tilemap (values in range 0-7)
+    if let Some(ref tilemap) = req.tilemap {
+        for (i, &tile) in tilemap.tiles.iter().enumerate() {
+            if tile > 7 {
+                errors.push(format!(
+                    "Invalid tile type {} at index {} (valid range 0-7)",
+                    tile, i
+                ));
+            }
+        }
+
+        // 2. Entity positions within tilemap bounds
+        let tile_size = 16.0_f32;
+        let map_width_px = tilemap.width as f32 * tile_size;
+        let map_height_px = tilemap.height as f32 * tile_size;
+        for (idx, entity) in req.entities.iter().enumerate() {
+            if entity.x < 0.0
+                || entity.y < 0.0
+                || entity.x >= map_width_px
+                || entity.y >= map_height_px
+            {
+                errors.push(format!(
+                    "Entity {} at ({}, {}) is outside tilemap bounds ({}x{} px)",
+                    idx, entity.x, entity.y, map_width_px, map_height_px
+                ));
+            }
+        }
+
+        // Bounds check: tile buffer length matches width*height
+        let expected = tilemap.width * tilemap.height;
+        if tilemap.tiles.len() != expected {
+            errors.push(format!(
+                "Tilemap tiles length {} does not match width*height ({}*{}={})",
+                tilemap.tiles.len(),
+                tilemap.width,
+                tilemap.height,
+                expected
+            ));
+        }
+    }
+
+    // 3. All global_scripts have corresponding entries in scripts map
+    for gs in &req.global_scripts {
+        if !req.scripts.contains_key(gs) {
+            errors.push(format!(
+                "Global script '{}' has no corresponding entry in scripts map",
+                gs
+            ));
+        }
+    }
+
+    // 4. Script syntax check using mlua
+    {
+        let lua = mlua::Lua::new();
+        for (name, source) in &req.scripts {
+            if let Err(e) = lua.load(source).set_name(name).into_function() {
+                errors.push(format!("Script '{}' has syntax error: {}", name, e));
+            }
+        }
+    }
+
+    // 5. Referenced presets exist: check entity scripts referencing preset names
+    if let Some(ref presets) = req.presets {
+        // Validate that preset entity definitions themselves are sensible
+        for (name, preset_entity) in presets {
+            if let Some(ref script_name) = preset_entity.script {
+                if !req.scripts.contains_key(script_name) {
+                    warnings.push(format!(
+                        "Preset '{}' references script '{}' not found in scripts map",
+                        name, script_name
+                    ));
+                }
+            }
+        }
+    }
+
+    // Also check entity scripts exist in scripts map
+    for (idx, entity) in req.entities.iter().enumerate() {
+        if let Some(ref script_name) = entity.script {
+            if !req.scripts.contains_key(script_name) {
+                warnings.push(format!(
+                    "Entity {} references script '{}' not found in scripts map",
+                    idx, script_name
+                ));
+            }
+        }
+    }
+
+    let valid = errors.is_empty();
+    Json(ApiResponse {
+        ok: true,
+        data: Some(serde_json::json!({
+            "valid": valid,
+            "errors": errors,
+            "warnings": warnings,
+        })),
+        error: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +922,7 @@ mod tests {
                     invincibility_frames: None,
                     path_follower_path: Vec::new(),
                     path_follower_frames_until_recalc: None,
+                    inventory_slots: vec![],
                 }],
                 scripts: std::collections::HashMap::from([(
                     "enemy_patrol".to_string(),
@@ -839,6 +991,7 @@ mod tests {
                     invincibility_frames: None,
                     path_follower_path: Vec::new(),
                     path_follower_frames_until_recalc: None,
+                    inventory_slots: vec![],
                 }],
                 scripts: std::collections::HashMap::from([(
                     "lua_hard".to_string(),

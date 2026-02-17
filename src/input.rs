@@ -60,6 +60,93 @@ impl Default for GamepadConfig {
     }
 }
 
+/// Configurable input bindings.
+#[derive(Resource, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InputBindings {
+    pub keyboard: std::collections::HashMap<String, Vec<String>>,
+    pub gamepad: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Default for InputBindings {
+    fn default() -> Self {
+        let mut keyboard = std::collections::HashMap::new();
+        keyboard.insert("KeyA".into(), vec!["left".into()]);
+        keyboard.insert("ArrowLeft".into(), vec!["left".into()]);
+        keyboard.insert("KeyD".into(), vec!["right".into()]);
+        keyboard.insert("ArrowRight".into(), vec!["right".into()]);
+        keyboard.insert("KeyW".into(), vec!["jump".into(), "up".into()]);
+        keyboard.insert("ArrowUp".into(), vec!["jump".into(), "up".into()]);
+        keyboard.insert("KeyS".into(), vec!["down".into()]);
+        keyboard.insert("ArrowDown".into(), vec!["down".into()]);
+        keyboard.insert("Space".into(), vec!["attack".into()]);
+        keyboard.insert("KeyZ".into(), vec!["attack".into()]);
+        keyboard.insert("KeyX".into(), vec!["attack".into()]);
+        keyboard.insert("Enter".into(), vec!["attack".into()]);
+        keyboard.insert("ShiftLeft".into(), vec!["sprint".into()]);
+        keyboard.insert("ShiftRight".into(), vec!["sprint".into()]);
+
+        let mut gamepad = std::collections::HashMap::new();
+        gamepad.insert("South".into(), vec!["jump".into()]);
+        gamepad.insert("West".into(), vec!["attack".into()]);
+        gamepad.insert("East".into(), vec!["attack".into()]);
+
+        Self { keyboard, gamepad }
+    }
+}
+
+fn keycode_from_name(name: &str) -> Option<KeyCode> {
+    match name {
+        "KeyA" => Some(KeyCode::KeyA),
+        "KeyB" => Some(KeyCode::KeyB),
+        "KeyC" => Some(KeyCode::KeyC),
+        "KeyD" => Some(KeyCode::KeyD),
+        "KeyE" => Some(KeyCode::KeyE),
+        "KeyF" => Some(KeyCode::KeyF),
+        "KeyG" => Some(KeyCode::KeyG),
+        "KeyH" => Some(KeyCode::KeyH),
+        "KeyI" => Some(KeyCode::KeyI),
+        "KeyJ" => Some(KeyCode::KeyJ),
+        "KeyK" => Some(KeyCode::KeyK),
+        "KeyL" => Some(KeyCode::KeyL),
+        "KeyM" => Some(KeyCode::KeyM),
+        "KeyN" => Some(KeyCode::KeyN),
+        "KeyO" => Some(KeyCode::KeyO),
+        "KeyP" => Some(KeyCode::KeyP),
+        "KeyQ" => Some(KeyCode::KeyQ),
+        "KeyR" => Some(KeyCode::KeyR),
+        "KeyS" => Some(KeyCode::KeyS),
+        "KeyT" => Some(KeyCode::KeyT),
+        "KeyU" => Some(KeyCode::KeyU),
+        "KeyV" => Some(KeyCode::KeyV),
+        "KeyW" => Some(KeyCode::KeyW),
+        "KeyX" => Some(KeyCode::KeyX),
+        "KeyY" => Some(KeyCode::KeyY),
+        "KeyZ" => Some(KeyCode::KeyZ),
+        "Digit1" => Some(KeyCode::Digit1),
+        "Digit2" => Some(KeyCode::Digit2),
+        "Digit3" => Some(KeyCode::Digit3),
+        "Digit4" => Some(KeyCode::Digit4),
+        "Digit5" => Some(KeyCode::Digit5),
+        "Digit6" => Some(KeyCode::Digit6),
+        "Digit7" => Some(KeyCode::Digit7),
+        "Digit8" => Some(KeyCode::Digit8),
+        "Digit9" => Some(KeyCode::Digit9),
+        "Digit0" => Some(KeyCode::Digit0),
+        "ArrowLeft" => Some(KeyCode::ArrowLeft),
+        "ArrowRight" => Some(KeyCode::ArrowRight),
+        "ArrowUp" => Some(KeyCode::ArrowUp),
+        "ArrowDown" => Some(KeyCode::ArrowDown),
+        "Space" => Some(KeyCode::Space),
+        "Enter" => Some(KeyCode::Enter),
+        "ShiftLeft" => Some(KeyCode::ShiftLeft),
+        "ShiftRight" => Some(KeyCode::ShiftRight),
+        "Escape" => Some(KeyCode::Escape),
+        "Tab" => Some(KeyCode::Tab),
+        "Backspace" => Some(KeyCode::Backspace),
+        _ => None,
+    }
+}
+
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
@@ -68,6 +155,7 @@ impl Plugin for InputPlugin {
             .insert_resource(LocalPlayerId::default())
             .insert_resource(MouseInput::default())
             .insert_resource(GamepadConfig::default())
+            .insert_resource(InputBindings::default())
             .add_systems(
                 PreUpdate,
                 (
@@ -93,65 +181,27 @@ fn sync_local_player_id(
 /// NOTE: `just_pressed` is NOT cleared here — it accumulates across frames so that
 /// FixedUpdate (which may not tick every frame) never misses a key-press event.
 /// It is cleared in `FixedPostUpdate` after scripts have consumed it.
-fn keyboard_to_virtual(keyboard: Res<ButtonInput<KeyCode>>, mut vinput: ResMut<VirtualInput>) {
+fn keyboard_to_virtual(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    bindings: Res<InputBindings>,
+    mut vinput: ResMut<VirtualInput>,
+) {
     vinput.active.clear();
 
-    // Left
-    if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
-        vinput.active.insert("left".into());
-    }
-    if keyboard.just_pressed(KeyCode::KeyA) || keyboard.just_pressed(KeyCode::ArrowLeft) {
-        vinput.just_pressed.insert("left".into());
-    }
-
-    // Right
-    if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
-        vinput.active.insert("right".into());
-    }
-    if keyboard.just_pressed(KeyCode::KeyD) || keyboard.just_pressed(KeyCode::ArrowRight) {
-        vinput.just_pressed.insert("right".into());
-    }
-
-    // Up
-    if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
-        vinput.active.insert("jump".into());
-        vinput.active.insert("up".into());
-    }
-    if keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::ArrowUp) {
-        vinput.just_pressed.insert("jump".into());
-        vinput.just_pressed.insert("up".into());
-    }
-
-    // Down
-    if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
-        vinput.active.insert("down".into());
-    }
-    if keyboard.just_pressed(KeyCode::KeyS) || keyboard.just_pressed(KeyCode::ArrowDown) {
-        vinput.just_pressed.insert("down".into());
-    }
-
-    // Attack (Space, Z, X, or Enter)
-    if keyboard.pressed(KeyCode::Space)
-        || keyboard.pressed(KeyCode::KeyZ)
-        || keyboard.pressed(KeyCode::KeyX)
-        || keyboard.pressed(KeyCode::Enter)
-    {
-        vinput.active.insert("attack".into());
-    }
-    if keyboard.just_pressed(KeyCode::Space)
-        || keyboard.just_pressed(KeyCode::KeyZ)
-        || keyboard.just_pressed(KeyCode::KeyX)
-        || keyboard.just_pressed(KeyCode::Enter)
-    {
-        vinput.just_pressed.insert("attack".into());
-    }
-
-    // Sprint (Shift)
-    if keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight) {
-        vinput.active.insert("sprint".into());
-    }
-    if keyboard.just_pressed(KeyCode::ShiftLeft) || keyboard.just_pressed(KeyCode::ShiftRight) {
-        vinput.just_pressed.insert("sprint".into());
+    for (key_name, actions) in &bindings.keyboard {
+        let Some(keycode) = keycode_from_name(key_name) else {
+            continue;
+        };
+        if keyboard.pressed(keycode) {
+            for action in actions {
+                vinput.active.insert(action.clone());
+            }
+        }
+        if keyboard.just_pressed(keycode) {
+            for action in actions {
+                vinput.just_pressed.insert(action.clone());
+            }
+        }
     }
 }
 

@@ -439,7 +439,12 @@ type ScriptEntityRuntimeQueryItem<'a> = (
     Option<&'a mut AnimationController>,
     Option<&'a mut TopDownMover>,
     Option<&'a PendingDeath>,
-    Option<&'a mut RenderLayer>,
+    (
+        Option<&'a mut RenderLayer>,
+        Option<&'a mut crate::components::CollisionLayer>,
+        Option<&'a crate::state_machine::EntityStateMachine>,
+        Option<&'a crate::inventory::Inventory>,
+    ),
 );
 
 type WorldTableBuildResult = mlua::Result<(
@@ -519,6 +524,7 @@ struct GlobalScriptSystemCtx<'w, 's> {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum ScriptWorldCommand {
     Spawn {
         request: EntitySpawnRequest,
@@ -581,6 +587,11 @@ enum ScriptWorldCommand {
         easing: Option<String>,
         tween_id: Option<String>,
     },
+    TweenSequence {
+        target_id: u64,
+        steps: Vec<crate::tween::TweenStep>,
+        sequence_id: Option<String>,
+    },
     ScreenEffect {
         effect: String,
         duration: f32,
@@ -589,6 +600,75 @@ enum ScriptWorldCommand {
     SetAmbient {
         intensity: f32,
         color: Option<[f32; 3]>,
+    },
+    SpawnText {
+        x: f32,
+        y: f32,
+        text: String,
+        font_size: f32,
+        color: [f32; 4],
+        duration: Option<f32>,
+        fade: bool,
+        rise_speed: f32,
+        owner_id: Option<u64>,
+    },
+    SetWeather {
+        weather_type: String,
+        intensity: f32,
+        wind: f32,
+    },
+    ClearWeather,
+    SetParallax {
+        layers: Vec<crate::parallax::ParallaxLayerDef>,
+    },
+    PlayCutscene {
+        name: String,
+    },
+    StopCutscene,
+    SetTimeOfDay {
+        hour: f32,
+    },
+    TransitionEntityState {
+        target_id: u64,
+        state: String,
+    },
+    InventoryAdd {
+        target_id: u64,
+        item_id: String,
+        count: u32,
+    },
+    InventoryRemove {
+        target_id: u64,
+        item_id: String,
+        count: u32,
+    },
+    SetTint {
+        target_id: u64,
+        color: [f32; 4],
+    },
+    FlashTint {
+        target_id: u64,
+        color: [f32; 4],
+        frames: u32,
+    },
+    SetTrail {
+        target_id: u64,
+        interval: u32,
+        duration: f32,
+        alpha_start: f32,
+        alpha_end: f32,
+    },
+    ClearTrail {
+        target_id: u64,
+    },
+    SetCollisionLayer {
+        target_id: u64,
+        layer: u16,
+        mask: u16,
+    },
+    RebindInput {
+        key: String,
+        action: String,
     },
 }
 
@@ -759,7 +839,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         mut animation_controller,
         mut top_down_mover,
         pending_death,
-        mut render_layer,
+        (mut render_layer, mut collision_layer, state_machine, inventory),
     ) in query.iter_mut()
     {
         lua.expire_registry_values();
@@ -881,6 +961,28 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             let _ = entity_tbl.set("speed", tdm.speed);
         }
         let _ = entity_tbl.set("render_layer", render_layer.as_ref().map_or(0, |r| r.0));
+        if let Some(cl) = collision_layer.as_ref() {
+            let _ = entity_tbl.set("collision_layer", cl.layer);
+            let _ = entity_tbl.set("collision_mask", cl.mask);
+        }
+        if let Some(sm) = state_machine.as_ref() {
+            let _ = entity_tbl.set("machine_state", sm.current.clone());
+            if let Some(prev) = &sm.previous {
+                let _ = entity_tbl.set("previous_machine_state", prev.clone());
+            }
+        }
+        if let Some(inv) = inventory.as_ref() {
+            if let Ok(inv_tbl) = lua.create_table() {
+                for (i, slot) in inv.slots.iter().enumerate() {
+                    if let Ok(slot_tbl) = lua.create_table() {
+                        let _ = slot_tbl.set("item_id", slot.item_id.clone());
+                        let _ = slot_tbl.set("count", slot.count);
+                        let _ = inv_tbl.set(i + 1, slot_tbl);
+                    }
+                }
+                let _ = entity_tbl.set("__axiom_inventory", inv_tbl);
+            }
+        }
         let _ = entity_tbl.set("state", lua.to_value(&script.state).unwrap_or(Value::Nil));
         if uses_tag_helpers {
             let tags_tbl = match lua.create_table() {
@@ -1045,26 +1147,26 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         script.disabled_reason = None;
 
         if let Ok(v) = entity_tbl.get::<f32>("x") {
-            pos.x = v;
+            if v.is_finite() { pos.x = v; }
         }
         if let Ok(v) = entity_tbl.get::<f32>("y") {
-            pos.y = v;
+            if v.is_finite() { pos.y = v; }
         }
         if let Some(v) = vel.as_deref_mut() {
             if let Ok(x) = entity_tbl.get::<f32>("vx") {
-                v.x = x;
+                if x.is_finite() { v.x = x; }
             }
             if let Ok(y) = entity_tbl.get::<f32>("vy") {
-                v.y = y;
+                if y.is_finite() { v.y = y; }
             }
         }
         let mut alive_override = entity_tbl.get::<bool>("alive").ok();
         if let Some(h) = health.as_deref_mut() {
             if let Ok(max_health) = entity_tbl.get::<f32>("max_health") {
-                h.max = max_health.max(0.0);
+                if max_health.is_finite() { h.max = max_health.max(0.0); }
             }
             if let Ok(current_health) = entity_tbl.get::<f32>("health") {
-                h.current = current_health.clamp(0.0, h.max.max(0.0));
+                if current_health.is_finite() { h.current = current_health.clamp(0.0, h.max.max(0.0)); }
             }
             if h.current <= 0.0 {
                 alive_override = Some(false);
@@ -1078,22 +1180,22 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         if let Some(hb) = hitbox.as_deref_mut() {
             if let Ok(hitbox_tbl) = entity_tbl.get::<mlua::Table>("hitbox") {
                 if let Ok(width) = hitbox_tbl.get::<f32>("width") {
-                    hb.width = width.max(0.0);
+                    if width.is_finite() { hb.width = width.max(0.0); }
                 }
                 if let Ok(height) = hitbox_tbl.get::<f32>("height") {
-                    hb.height = height.max(0.0);
+                    if height.is_finite() { hb.height = height.max(0.0); }
                 }
                 if let Ok(offset_x) = hitbox_tbl.get::<f32>("offset_x") {
-                    hb.offset.x = offset_x;
+                    if offset_x.is_finite() { hb.offset.x = offset_x; }
                 }
                 if let Ok(offset_y) = hitbox_tbl.get::<f32>("offset_y") {
-                    hb.offset.y = offset_y;
+                    if offset_y.is_finite() { hb.offset.y = offset_y; }
                 }
                 if let Ok(active) = hitbox_tbl.get::<bool>("active") {
                     hb.active = active;
                 }
                 if let Ok(damage) = hitbox_tbl.get::<f32>("damage") {
-                    hb.damage = damage.max(0.0);
+                    if damage.is_finite() { hb.damage = damage.max(0.0); }
                 }
                 if let Ok(tag) = hitbox_tbl.get::<String>("damage_tag") {
                     hb.damage_tag = tag;
@@ -1102,7 +1204,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         }
         if let Some(pf) = path_follower.as_deref_mut() {
             if let Ok(speed) = entity_tbl.get::<f32>("__axiom_follow_speed") {
-                pf.speed = speed.max(0.0);
+                if speed.is_finite() { pf.speed = speed.max(0.0); }
             }
             if let Ok(path_tbl) = entity_tbl.get::<mlua::Table>("__axiom_follow_path") {
                 let mut points = Vec::new();
@@ -1119,6 +1221,7 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                     let Ok(y) = point.get::<f32>("y") else {
                         continue;
                     };
+                    if !x.is_finite() || !y.is_finite() { continue; }
                     points.push(Vec2::new(x, y));
                 }
                 if let Some(last) = points.last().copied() {
@@ -1146,6 +1249,8 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
             }
         }
         if let Some(anim) = animation_controller.as_deref_mut() {
+            let orig_frame = anim.frame;
+            let mut state_changed = false;
             if let Ok(next_state) = entity_tbl.get::<String>("animation") {
                 let state = next_state.trim();
                 if !state.is_empty() && state != anim.state {
@@ -1153,10 +1258,16 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
                     anim.frame = 0;
                     anim.timer = 0.0;
                     anim.playing = true;
+                    state_changed = true;
                 }
             }
             if let Ok(frame_override) = entity_tbl.get::<usize>("animation_frame") {
-                anim.frame = frame_override;
+                // Only apply frame override if the script explicitly changed it.
+                // When animation state just changed, the old frame value would
+                // incorrectly overwrite the reset to 0.
+                if !state_changed || frame_override != orig_frame {
+                    anim.frame = frame_override;
+                }
             }
             if let Ok(flip_x) = entity_tbl.get::<bool>("flip_x") {
                 anim.facing_right = !flip_x;
@@ -1179,13 +1290,89 @@ fn run_entity_scripts(ctx: EntityScriptSystemCtx<'_, '_>) {
         // Write back speed to TopDownMover
         if let Some(tdm) = top_down_mover.as_deref_mut() {
             if let Ok(speed) = entity_tbl.get::<f32>("speed") {
-                tdm.speed = speed.max(0.0);
+                if speed.is_finite() { tdm.speed = speed.max(0.0); }
             }
         }
         // Write back render_layer
         if let Ok(layer) = entity_tbl.get::<i32>("render_layer") {
             if let Some(rl) = render_layer.as_deref_mut() {
                 rl.0 = layer;
+            }
+        }
+        // Write back collision_layer and collision_mask
+        if let Some(cl) = collision_layer.as_deref_mut() {
+            if let Ok(layer) = entity_tbl.get::<u16>("collision_layer") {
+                cl.layer = layer;
+            }
+            if let Ok(mask) = entity_tbl.get::<u16>("collision_mask") {
+                cl.mask = mask;
+            }
+        }
+        // Process deferred entity commands: flash, tint, trail, transition_state, inventory
+        let ent_id = network_id.0;
+        if let Ok(flash_tbl) = entity_tbl.get::<mlua::Table>("__axiom_flash") {
+            let r = flash_tbl.get::<f32>("r").unwrap_or(1.0);
+            let g = flash_tbl.get::<f32>("g").unwrap_or(1.0);
+            let b = flash_tbl.get::<f32>("b").unwrap_or(1.0);
+            let a = flash_tbl.get::<f32>("a").unwrap_or(1.0);
+            let frames = flash_tbl.get::<u32>("frames").unwrap_or(6);
+            pending_world_commands.push(ScriptWorldCommand::FlashTint {
+                target_id: ent_id,
+                color: [r, g, b, a],
+                frames,
+            });
+        }
+        if let Ok(tint_tbl) = entity_tbl.get::<mlua::Table>("tint") {
+            let r: f32 = tint_tbl.get(1).unwrap_or(1.0);
+            let g: f32 = tint_tbl.get(2).unwrap_or(1.0);
+            let b: f32 = tint_tbl.get(3).unwrap_or(1.0);
+            let a: f32 = tint_tbl.get(4).unwrap_or(1.0);
+            pending_world_commands.push(ScriptWorldCommand::SetTint {
+                target_id: ent_id,
+                color: [r, g, b, a],
+            });
+        }
+        if let Ok(trail_tbl) = entity_tbl.get::<mlua::Table>("trail") {
+            let interval = trail_tbl.get::<u32>("interval").unwrap_or(3);
+            let duration = trail_tbl.get::<f32>("duration").unwrap_or(0.3);
+            let alpha_start = trail_tbl.get::<f32>("alpha_start").unwrap_or(0.6);
+            let alpha_end = trail_tbl.get::<f32>("alpha_end").unwrap_or(0.0);
+            pending_world_commands.push(ScriptWorldCommand::SetTrail {
+                target_id: ent_id,
+                interval,
+                duration,
+                alpha_start,
+                alpha_end,
+            });
+        }
+        if let Ok(state_name) = entity_tbl.get::<String>("__axiom_transition_state") {
+            pending_world_commands.push(ScriptWorldCommand::TransitionEntityState {
+                target_id: ent_id,
+                state: state_name,
+            });
+        }
+        if let Ok(inv_cmds) = entity_tbl.get::<mlua::Table>("__axiom_inv_cmds") {
+            for item in inv_cmds.sequence_values::<mlua::Table>() {
+                if let Ok(cmd_tbl) = item {
+                    let action: String = cmd_tbl.get("action").unwrap_or_default();
+                    let item_id: String = cmd_tbl.get("item_id").unwrap_or_default();
+                    let count: u32 = cmd_tbl.get("count").unwrap_or(1);
+                    if !item_id.is_empty() {
+                        match action.as_str() {
+                            "add" => pending_world_commands.push(ScriptWorldCommand::InventoryAdd {
+                                target_id: ent_id,
+                                item_id,
+                                count,
+                            }),
+                            "remove" => pending_world_commands.push(ScriptWorldCommand::InventoryRemove {
+                                target_id: ent_id,
+                                item_id,
+                                count,
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         // on_death lifecycle hook: if entity has PendingDeath, call on_death() if defined
@@ -1951,6 +2138,17 @@ fn apply_script_world_commands(
                     let _ = crate::tween::apply_tween_command(world, target_id, req);
                 });
             }
+            ScriptWorldCommand::TweenSequence {
+                target_id,
+                steps,
+                sequence_id,
+            } => {
+                commands.queue(move |world: &mut World| {
+                    let _ = crate::tween::apply_tween_sequence_command(
+                        world, target_id, steps, sequence_id,
+                    );
+                });
+            }
             ScriptWorldCommand::ScreenEffect {
                 effect,
                 duration,
@@ -1974,6 +2172,246 @@ fn apply_script_world_commands(
                 };
                 commands.queue(move |world: &mut World| {
                     let _ = crate::lighting::apply_lighting_config(world, req);
+                });
+            }
+            ScriptWorldCommand::SpawnText {
+                x, y, text, font_size, color, duration, fade, rise_speed, owner_id,
+            } => {
+                commands.queue(move |world: &mut World| {
+                    let mut counter = world.resource_mut::<crate::world_text::WorldTextIdCounter>();
+                    let text_id = counter.0;
+                    counter.0 += 1;
+                    world.spawn((
+                        crate::world_text::WorldText {
+                            text_id,
+                            text,
+                            font_size,
+                            color,
+                            offset: Vec2::ZERO,
+                            owner_entity: owner_id,
+                            duration,
+                            elapsed: 0.0,
+                            fade,
+                            rise_speed,
+                        },
+                        Transform::from_xyz(x, y, 100.0),
+                    ));
+                });
+            }
+            ScriptWorldCommand::SetWeather { weather_type, intensity, wind } => {
+                commands.queue(move |world: &mut World| {
+                    let wtype = match weather_type.to_lowercase().as_str() {
+                        "rain" => crate::weather::WeatherType::Rain,
+                        "snow" => crate::weather::WeatherType::Snow,
+                        "dust" => crate::weather::WeatherType::Dust,
+                        _ => crate::weather::WeatherType::Rain,
+                    };
+                    let mut ws = world.resource_mut::<crate::weather::WeatherSystem>();
+                    ws.active = Some(crate::weather::WeatherConfig {
+                        weather_type: wtype,
+                        intensity,
+                        wind,
+                    });
+                });
+            }
+            ScriptWorldCommand::ClearWeather => {
+                commands.queue(move |world: &mut World| {
+                    let mut ws = world.resource_mut::<crate::weather::WeatherSystem>();
+                    ws.active = None;
+                });
+            }
+            ScriptWorldCommand::SetParallax { layers } => {
+                commands.queue(move |world: &mut World| {
+                    let mut config = world.resource_mut::<crate::parallax::ParallaxConfig>();
+                    config.layers = layers;
+                });
+            }
+            ScriptWorldCommand::PlayCutscene { name } => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut manager: Mut<crate::cutscene::CutsceneManager>| {
+                        world.resource_scope(|world, mut events: Mut<GameEventBus>| {
+                            world.resource_scope(|_world, mut runtime_state: Mut<crate::game_runtime::RuntimeState>| {
+                                let _ = crate::cutscene::play_cutscene(
+                                    &mut manager, &mut events, &mut runtime_state, &name,
+                                );
+                            });
+                        });
+                    });
+                });
+            }
+            ScriptWorldCommand::StopCutscene => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut manager: Mut<crate::cutscene::CutsceneManager>| {
+                        world.resource_scope(|world, mut events: Mut<GameEventBus>| {
+                            world.resource_scope(|_world, mut runtime_state: Mut<crate::game_runtime::RuntimeState>| {
+                                crate::cutscene::stop_cutscene(
+                                    &mut manager, &mut events, &mut runtime_state,
+                                );
+                            });
+                        });
+                    });
+                });
+            }
+            ScriptWorldCommand::SetTimeOfDay { hour } => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut cycle) = world.get_resource_mut::<crate::lighting::DayNightCycle>() {
+                        cycle.time_of_day = hour.rem_euclid(24.0);
+                    }
+                });
+            }
+            ScriptWorldCommand::TransitionEntityState { target_id, state } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut sm) = world.get_mut::<crate::state_machine::EntityStateMachine>(entity) {
+                            let prev = sm.current.clone();
+                            // Validate transition if allowed_transitions is non-empty
+                            if let Some(config) = sm.states.get(&sm.current) {
+                                if !config.allowed_transitions.is_empty()
+                                    && !config.allowed_transitions.contains(&state)
+                                {
+                                    return; // Invalid transition
+                                }
+                            }
+                            sm.previous = Some(prev);
+                            sm.current = state;
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::InventoryAdd { target_id, item_id, count } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        let registry = world.resource::<crate::inventory::ItemRegistry>().clone();
+                        if let Some(mut inv) = world.get_mut::<crate::inventory::Inventory>(entity) {
+                            let added = inv.add_item(&item_id, count, &registry);
+                            if added > 0 {
+                                let new_total = inv.count_item(&item_id);
+                                drop(inv);
+                                if let Some(mut bus) = world.get_resource_mut::<GameEventBus>() {
+                                    bus.emit(
+                                        "item_added",
+                                        serde_json::json!({
+                                            "entity": target_id,
+                                            "item_id": item_id,
+                                            "count": added,
+                                            "new_total": new_total,
+                                        }),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::InventoryRemove { target_id, item_id, count } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        let registry = world.resource::<crate::inventory::ItemRegistry>().clone();
+                        drop(registry);
+                        if let Some(mut inv) = world.get_mut::<crate::inventory::Inventory>(entity) {
+                            let removed = inv.remove_item(&item_id, count);
+                            if removed > 0 {
+                                let new_total = inv.count_item(&item_id);
+                                drop(inv);
+                                if let Some(mut bus) = world.get_resource_mut::<GameEventBus>() {
+                                    bus.emit(
+                                        "item_removed",
+                                        serde_json::json!({
+                                            "entity": target_id,
+                                            "item_id": item_id,
+                                            "count": removed,
+                                            "new_total": new_total,
+                                        }),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetTint { target_id, color } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut tint) = world.get_mut::<crate::components::SpriteColorTint>(entity) {
+                            tint.color = color;
+                        } else {
+                            world.entity_mut(entity).insert(crate::components::SpriteColorTint {
+                                color,
+                                flash_color: None,
+                                flash_frames: 0,
+                            });
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::FlashTint { target_id, color, frames } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut tint) = world.get_mut::<crate::components::SpriteColorTint>(entity) {
+                            tint.flash_color = Some(color);
+                            tint.flash_frames = frames;
+                        } else {
+                            world.entity_mut(entity).insert(crate::components::SpriteColorTint {
+                                color: [1.0, 1.0, 1.0, 1.0],
+                                flash_color: Some(color),
+                                flash_frames: frames,
+                            });
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::SetTrail { target_id, interval, duration, alpha_start, alpha_end } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut trail) = world.get_mut::<crate::trail::TrailEffect>(entity) {
+                            trail.interval = interval;
+                            trail.duration = duration;
+                            trail.alpha_start = alpha_start;
+                            trail.alpha_end = alpha_end;
+                        } else {
+                            world.entity_mut(entity).insert(crate::trail::TrailEffect {
+                                interval,
+                                duration,
+                                alpha_start,
+                                alpha_end,
+                                frame_counter: 0,
+                            });
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::ClearTrail { target_id } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        world.entity_mut(entity).remove::<crate::trail::TrailEffect>();
+                    });
+                }
+            }
+            ScriptWorldCommand::SetCollisionLayer { target_id, layer, mask } => {
+                if let Some(&entity) = network_lookup.get(&target_id) {
+                    commands.queue(move |world: &mut World| {
+                        if let Some(mut cl) = world.get_mut::<crate::components::CollisionLayer>(entity) {
+                            cl.layer = layer;
+                            cl.mask = mask;
+                        } else {
+                            world.entity_mut(entity).insert(crate::components::CollisionLayer {
+                                layer,
+                                mask,
+                            });
+                        }
+                    });
+                }
+            }
+            ScriptWorldCommand::RebindInput { key, action } => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut bindings) = world.get_resource_mut::<crate::input::InputBindings>() {
+                        bindings.keyboard
+                            .entry(key)
+                            .or_insert_with(Vec::new)
+                            .push(action);
+                    }
                 });
             }
         }
@@ -2104,6 +2542,67 @@ fn install_entity_snapshot_metatable(lua: &Lua) -> mlua::Result<()> {
                 end
                 rawset(entity, "__axiom_follow_path", p)
                 if s then rawset(entity, "__axiom_follow_speed", math.max(s, 0)) end
+            end)
+            -- Flash tint: entity.flash({r,g,b,a}, frames)
+            rawset(entity, "flash", function(first, ...)
+                local color, frames
+                if type(first) == "table" and first ~= entity then
+                    color = first; frames = select(1, ...)
+                else
+                    color = select(1, ...); frames = select(2, ...)
+                end
+                if type(color) ~= "table" then return end
+                rawset(entity, "__axiom_flash", {
+                    r = color[1] or 1, g = color[2] or 1, b = color[3] or 1, a = color[4] or 1,
+                    frames = frames or 6,
+                })
+            end)
+            -- Transition entity state machine: entity.transition_state("attacking")
+            rawset(entity, "transition_state", function(first, second)
+                local st = first
+                if type(first) ~= "string" and type(second) == "string" then st = second end
+                if type(st) == "string" then
+                    rawset(entity, "__axiom_transition_state", st)
+                end
+            end)
+            -- Inventory: entity.add_item("id", count), entity.remove_item("id", count)
+            rawset(entity, "add_item", function(first, second, third)
+                local id, count
+                if type(first) == "string" then id = first; count = second
+                else id = second; count = third end
+                local cmds = rawget(entity, "__axiom_inv_cmds") or {}
+                cmds[#cmds + 1] = { action = "add", item_id = id, count = count or 1 }
+                rawset(entity, "__axiom_inv_cmds", cmds)
+            end)
+            rawset(entity, "remove_item", function(first, second, third)
+                local id, count
+                if type(first) == "string" then id = first; count = second
+                else id = second; count = third end
+                local cmds = rawget(entity, "__axiom_inv_cmds") or {}
+                cmds[#cmds + 1] = { action = "remove", item_id = id, count = count or 1 }
+                rawset(entity, "__axiom_inv_cmds", cmds)
+            end)
+            -- Inventory read: entity.has_item("id"), entity.count_item("id")
+            rawset(entity, "has_item", function(first, second)
+                local id = first
+                if type(first) ~= "string" then id = second end
+                local inv = rawget(entity, "__axiom_inventory")
+                if not inv then return false end
+                for _, slot in ipairs(inv) do
+                    if slot.item_id == id and slot.count > 0 then return true end
+                end
+                return false
+            end)
+            rawset(entity, "count_item", function(first, second)
+                local id = first
+                if type(first) ~= "string" then id = second end
+                local inv = rawget(entity, "__axiom_inventory")
+                if not inv then return 0 end
+                local total = 0
+                for _, slot in ipairs(inv) do
+                    if slot.item_id == id then total = total + slot.count end
+                end
+                return total
             end)
         end
     "##).exec()?;
@@ -2938,6 +3437,30 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
     })?;
     world_tbl.set("tween", tween_fn)?;
 
+    // world.tween_sequence(entity_id, {{property="x", to=100, duration=0.5}, {property="y", to=200, duration=0.3}}, "seq_id")
+    let tween_seq_commands_ref = pending_commands.clone();
+    let tween_seq_fn = lua.create_function_mut(move |_lua, (entity_id, steps_tbl, seq_id): (u64, mlua::Table, Option<String>)| {
+        let mut steps = Vec::new();
+        for pair in steps_tbl.sequence_values::<mlua::Table>() {
+            let step_tbl = pair?;
+            let property: String = step_tbl.get("property")?;
+            let to: f32 = step_tbl.get("to")?;
+            let from: Option<f32> = step_tbl.get("from").ok();
+            let duration: f32 = step_tbl.get("duration").unwrap_or(0.5);
+            let easing: Option<String> = step_tbl.get("easing").ok();
+            steps.push(crate::tween::TweenStep { property, to, from, duration, easing });
+        }
+        tween_seq_commands_ref
+            .borrow_mut()
+            .push(ScriptWorldCommand::TweenSequence {
+                target_id: entity_id,
+                steps,
+                sequence_id: seq_id,
+            });
+        Ok(())
+    })?;
+    world_tbl.set("tween_sequence", tween_seq_fn)?;
+
     // world.screen_flash(duration, color?)
     let flash_commands_ref = pending_commands.clone();
     let screen_flash_fn =
@@ -3367,6 +3890,140 @@ fn build_world_table(lua: &Lua, args: &WorldBuildArgs<'_>) -> WorldTableBuildRes
     camera_tbl.set("look_at", camera_look_fn)?;
     world_tbl.set("camera", camera_tbl)?;
 
+    // world.spawn_text(x, y, text, opts?)
+    let spawn_text_cmds = pending_commands.clone();
+    let spawn_text_fn = lua.create_function_mut(
+        move |_lua, (x, y, text, opts): (f32, f32, String, Option<mlua::Table>)| {
+            let mut font_size = 16.0f32;
+            let mut color = [1.0f32, 1.0, 1.0, 1.0];
+            let mut duration = None;
+            let mut fade = false;
+            let mut rise_speed = 0.0f32;
+            let mut owner_id = None;
+            if let Some(opts) = opts {
+                if let Ok(fs) = opts.get::<f32>("font_size") { font_size = fs; }
+                if let Ok(c) = opts.get::<mlua::Table>("color") {
+                    color[0] = c.get(1).unwrap_or(1.0);
+                    color[1] = c.get(2).unwrap_or(1.0);
+                    color[2] = c.get(3).unwrap_or(1.0);
+                    color[3] = c.get(4).unwrap_or(1.0);
+                }
+                if let Ok(d) = opts.get::<f32>("duration") { duration = Some(d); }
+                if let Ok(f) = opts.get::<bool>("fade") { fade = f; }
+                if let Ok(r) = opts.get::<f32>("rise_speed") { rise_speed = r; }
+                if let Ok(o) = opts.get::<u64>("owner_id") { owner_id = Some(o); }
+            }
+            spawn_text_cmds
+                .borrow_mut()
+                .push(ScriptWorldCommand::SpawnText {
+                    x, y, text, font_size, color, duration, fade, rise_speed, owner_id,
+                });
+            Ok(())
+        },
+    )?;
+    world_tbl.set("spawn_text", spawn_text_fn)?;
+
+    // world.set_weather(type, intensity, wind?)
+    let weather_cmds = pending_commands.clone();
+    let set_weather_fn = lua.create_function_mut(
+        move |_lua, (weather_type, intensity, wind): (String, f32, Option<f32>)| {
+            weather_cmds
+                .borrow_mut()
+                .push(ScriptWorldCommand::SetWeather {
+                    weather_type,
+                    intensity,
+                    wind: wind.unwrap_or(0.0),
+                });
+            Ok(())
+        },
+    )?;
+    world_tbl.set("set_weather", set_weather_fn)?;
+
+    // world.clear_weather()
+    let clear_weather_cmds = pending_commands.clone();
+    let clear_weather_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+        clear_weather_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::ClearWeather);
+        Ok(())
+    })?;
+    world_tbl.set("clear_weather", clear_weather_fn)?;
+
+    // world.set_parallax(layers)
+    let parallax_cmds = pending_commands.clone();
+    let set_parallax_fn = lua.create_function_mut(move |_lua, layers_tbl: mlua::Table| {
+        let mut layers = Vec::new();
+        for item in layers_tbl.sequence_values::<mlua::Table>() {
+            if let Ok(layer_tbl) = item {
+                let mut layer = crate::parallax::ParallaxLayerDef {
+                    texture: layer_tbl.get("texture").ok(),
+                    color: None,
+                    scroll_factor: layer_tbl.get("scroll_factor").unwrap_or(0.5),
+                    z_depth: layer_tbl.get("z_depth").unwrap_or(-10.0),
+                    repeat_x: layer_tbl.get("repeat_x").unwrap_or(true),
+                    repeat_y: layer_tbl.get("repeat_y").unwrap_or(false),
+                    scale: layer_tbl.get("scale").ok(),
+                };
+                if let Ok(c) = layer_tbl.get::<mlua::Table>("color") {
+                    let r: f32 = c.get(1).unwrap_or(0.0);
+                    let g: f32 = c.get(2).unwrap_or(0.0);
+                    let b: f32 = c.get(3).unwrap_or(0.0);
+                    let a: f32 = c.get(4).unwrap_or(1.0);
+                    layer.color = Some([r, g, b, a]);
+                }
+                layers.push(layer);
+            }
+        }
+        parallax_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::SetParallax { layers });
+        Ok(())
+    })?;
+    world_tbl.set("set_parallax", set_parallax_fn)?;
+
+    // world.cutscene(name) — play a defined cutscene
+    let cutscene_play_cmds = pending_commands.clone();
+    let cutscene_fn = lua.create_function_mut(move |_lua, name: String| {
+        cutscene_play_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::PlayCutscene { name });
+        Ok(())
+    })?;
+    world_tbl.set("cutscene", cutscene_fn)?;
+
+    // world.stop_cutscene()
+    let cutscene_stop_cmds = pending_commands.clone();
+    let stop_cutscene_fn = lua.create_function_mut(move |_lua, _: Option<mlua::Table>| {
+        cutscene_stop_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::StopCutscene);
+        Ok(())
+    })?;
+    world_tbl.set("stop_cutscene", stop_cutscene_fn)?;
+
+    // world.set_time_of_day(hour)
+    let tod_cmds = pending_commands.clone();
+    let set_tod_fn = lua.create_function_mut(move |_lua, hour: f32| {
+        tod_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::SetTimeOfDay { hour });
+        Ok(())
+    })?;
+    world_tbl.set("set_time_of_day", set_tod_fn)?;
+
+    // world.input.rebind(key, action)
+    let rebind_cmds = pending_commands.clone();
+    let rebind_fn = lua.create_function_mut(move |_lua, (key, action): (String, String)| {
+        rebind_cmds
+            .borrow_mut()
+            .push(ScriptWorldCommand::RebindInput { key, action });
+        Ok(())
+    })?;
+    {
+        let input_tbl: mlua::Table = world_tbl.get("input")?;
+        input_tbl.set("rebind", rebind_fn)?;
+    }
+
     Ok((world_tbl, pending_events, pending_commands))
 }
 
@@ -3743,6 +4400,7 @@ mod tests {
             tiles,
             player_spawn: (8.0, 8.0),
             goal: None,
+            ..Default::default()
         });
         let config = GameConfig::default();
         let raycast_entities = Arc::new(vec![

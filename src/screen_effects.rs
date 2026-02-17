@@ -97,7 +97,7 @@ fn tick_standalone_effects(
                 ScreenEffectType::Flash => "flash",
                 ScreenEffectType::Tint => "tint",
             };
-            event_bus.recent.push(GameEvent {
+            event_bus.recent.push_back(GameEvent {
                 name: "screen_effect_complete".to_string(),
                 data: serde_json::json!({ "effect": effect_name }),
                 frame: 0,

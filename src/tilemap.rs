@@ -11,13 +11,29 @@ impl Plugin for TilemapPlugin {
     }
 }
 
-#[derive(Resource, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TileLayer {
+    pub name: String,
+    pub tiles: Vec<u8>,
+    pub z_offset: f32,
+}
+
+#[derive(Resource, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct Tilemap {
     pub width: usize,
     pub height: usize,
     pub tiles: Vec<u8>,
     pub player_spawn: (f32, f32),
     pub goal: Option<(i32, i32)>,
+    /// Auto-tile rules: name -> AutoTileSetDef (visual variant mapping).
+    #[serde(default)]
+    pub auto_tile_rules: std::collections::HashMap<String, crate::api::types::AutoTileSetDef>,
+    /// Visual variant indices parallel to `tiles`. Used by auto-tiling.
+    #[serde(default)]
+    pub tile_visuals: Vec<u16>,
+    /// Extra decorative tile layers (visual-only, no physics).
+    #[serde(default)]
+    pub extra_layers: Vec<TileLayer>,
 }
 
 impl Tilemap {
@@ -60,6 +76,35 @@ impl Tilemap {
 
     pub fn is_ground(&self, x: i32, y: i32) -> bool {
         self.get(x, y).is_ground_like()
+    }
+
+    /// Recalculate auto-tile visual variants for all tiles.
+    /// Uses 4-bit neighbor bitmask (N=1, S=2, E=4, W=8).
+    pub fn recalculate_auto_tiles(&mut self) {
+        if self.auto_tile_rules.is_empty() {
+            self.tile_visuals.clear();
+            return;
+        }
+        self.tile_visuals = vec![0u16; self.tiles.len()];
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                let tile_id = self.get_tile(x, y);
+                // Find matching rule by base_tile_id
+                let mut visual = 0u16;
+                for rule in self.auto_tile_rules.values() {
+                    if rule.base_tile_id == tile_id {
+                        let mut mask: u8 = 0;
+                        if self.get_tile(x, y + 1) == tile_id { mask |= 1; } // N
+                        if self.get_tile(x, y - 1) == tile_id { mask |= 2; } // S
+                        if self.get_tile(x + 1, y) == tile_id { mask |= 4; } // E
+                        if self.get_tile(x - 1, y) == tile_id { mask |= 8; } // W
+                        visual = rule.variants.get(&mask).copied().unwrap_or(0) as u16;
+                        break;
+                    }
+                }
+                self.tile_visuals[y as usize * self.width + x as usize] = visual;
+            }
+        }
     }
 
     /// A simple test level for development
@@ -130,6 +175,7 @@ impl Tilemap {
             tiles,
             player_spawn: (2.0 * 16.0 + 8.0, 1.0 * 16.0 + 8.0), // above ground
             goal: Some((52, 2)),
+            ..Default::default()
         }
     }
 }

@@ -317,25 +317,45 @@ pub(super) async fn save_game(
 pub(super) async fn load_game(
     State(state): State<AppState>,
     Json(req): Json<SaveSlotRequest>,
-) -> Json<ApiResponse<String>> {
+) -> Json<ApiResponse<ImportResult>> {
     let slot = sanitize_slot(&req.slot);
     let path = save_dir().join(format!("{slot}.json"));
     let body = match std::fs::read_to_string(&path) {
         Ok(v) => v,
-        Err(e) => return Json(ApiResponse::err(format!("Failed to read save file: {e}"))),
+        Err(e) => {
+            return Json(ApiResponse {
+                ok: false,
+                data: None,
+                error: Some(format!("Failed to read save file: {e}")),
+            })
+        }
     };
     let save: SaveGameData = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return Json(ApiResponse::err(format!("Invalid save format: {e}"))),
+        Err(e) => {
+            return Json(ApiResponse {
+                ok: false,
+                data: None,
+                error: Some(format!("Invalid save format: {e}")),
+            })
+        }
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = state
         .sender
         .send(ApiCommand::LoadSaveData(Box::new(save), tx));
     match rx.await {
-        Ok(Ok(())) => Json(ApiResponse::ok()),
-        Ok(Err(e)) => Json(ApiResponse::err(e)),
-        Err(_) => Json(ApiResponse::err("Channel closed")),
+        Ok(Ok(result)) => Json(ApiResponse::success(result)),
+        Ok(Err(e)) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(e),
+        }),
+        Err(_) => Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some("Channel closed".into()),
+        }),
     }
 }
 

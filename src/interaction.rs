@@ -27,6 +27,15 @@ impl Plugin for InteractionPlugin {
     }
 }
 
+fn collision_layers_compatible(
+    a: Option<&crate::components::CollisionLayer>,
+    b: Option<&crate::components::CollisionLayer>,
+) -> bool {
+    let a = a.copied().unwrap_or_default();
+    let b = b.copied().unwrap_or_default();
+    (a.layer & b.mask) != 0 && (b.layer & a.mask) != 0
+}
+
 #[derive(Clone)]
 struct CollisionView {
     entity: Entity,
@@ -38,6 +47,7 @@ struct CollisionView {
     network_id: u64,
     contact_damage: Option<ContactDamage>,
     pickup: Option<Pickup>,
+    collision_layer: Option<crate::components::CollisionLayer>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +65,7 @@ type ContactInteractionQueryItem<'a> = (
     Option<&'a Tags>,
     &'a NetworkId,
     Option<&'a ContactDamage>,
+    Option<&'a crate::components::CollisionLayer>,
 );
 
 type ProjectileQueryItem<'a> = (
@@ -63,6 +74,7 @@ type ProjectileQueryItem<'a> = (
     &'a mut Projectile,
     Option<&'a Collider>,
     &'a NetworkId,
+    Option<&'a crate::components::CollisionLayer>,
 );
 
 type TargetableEntityItem<'a> = (
@@ -71,9 +83,10 @@ type TargetableEntityItem<'a> = (
     &'a Collider,
     Option<&'a Tags>,
     &'a NetworkId,
+    Option<&'a crate::components::CollisionLayer>,
 );
 
-type TargetView = (f32, f32, f32, f32, Vec<String>, u64);
+type TargetView = (f32, f32, f32, f32, Vec<String>, u64, Option<crate::components::CollisionLayer>);
 
 type PickupInteractionQueryItem<'a> = (
     Entity,
@@ -82,6 +95,7 @@ type PickupInteractionQueryItem<'a> = (
     Option<&'a Tags>,
     &'a NetworkId,
     Option<&'a Pickup>,
+    Option<&'a crate::components::CollisionLayer>,
 );
 
 type ActorView = (f32, f32, u64, Vec<String>);
@@ -143,7 +157,7 @@ fn contact_damage_system(
 ) {
     let items: Vec<CollisionView> = query
         .iter()
-        .map(|(entity, pos, col, tags, nid, contact)| CollisionView {
+        .map(|(entity, pos, col, tags, nid, contact, cl)| CollisionView {
             entity,
             x: pos.x,
             y: pos.y,
@@ -155,6 +169,7 @@ fn contact_damage_system(
             network_id: nid.0,
             contact_damage: contact.cloned(),
             pickup: None,
+            collision_layer: cl.copied(),
         })
         .collect();
     let by_entity: std::collections::HashMap<Entity, &CollisionView> =
@@ -188,6 +203,9 @@ fn contact_damage_system(
                     h: b.h,
                 },
             ) {
+                continue;
+            }
+            if !collision_layers_compatible(a.collision_layer.as_ref(), b.collision_layer.as_ref()) {
                 continue;
             }
             if let Some(cd) = &a.contact_damage {
@@ -235,7 +253,7 @@ fn projectile_system(
 
     let target_view: std::collections::HashMap<Entity, TargetView> = targets
         .iter()
-        .map(|(e, pos, col, tags, nid)| {
+        .map(|(e, pos, col, tags, nid, cl)| {
             (
                 e,
                 (
@@ -246,12 +264,13 @@ fn projectile_system(
                     tags.map(|t| t.0.iter().cloned().collect())
                         .unwrap_or_default(),
                     nid.0,
+                    cl.copied(),
                 ),
             )
         })
         .collect();
 
-    for (entity, mut pos, mut proj, collider, nid) in projectiles.iter_mut() {
+    for (entity, mut pos, mut proj, collider, nid, proj_cl) in projectiles.iter_mut() {
         let dir = if proj.direction.length_squared() > 0.0 {
             proj.direction.normalize()
         } else {
@@ -297,10 +316,13 @@ fn projectile_system(
             if cand == entity {
                 continue;
             }
-            let Some((tx, ty, tw, th, tags, target_nid)) = target_view.get(&cand) else {
+            let Some((tx, ty, tw, th, tags, target_nid, target_cl)) = target_view.get(&cand) else {
                 continue;
             };
             if *target_nid == proj.owner_id {
+                continue;
+            }
+            if !collision_layers_compatible(proj_cl, target_cl.as_ref()) {
                 continue;
             }
             if !tag_matches(tags, &proj.damage_tag) {
@@ -359,13 +381,13 @@ fn projectile_system(
 fn hitbox_system(
     mut io: InteractionIo,
     spatial: Res<SpatialHash>,
-    attackers: Query<(Entity, &GamePosition, &Hitbox, &NetworkId)>,
+    attackers: Query<(Entity, &GamePosition, &Hitbox, &NetworkId, Option<&crate::components::CollisionLayer>)>,
     targets: Query<TargetableEntityItem<'_>, Without<Hitbox>>,
     mut combat: CombatAccess,
 ) {
     let target_view: std::collections::HashMap<Entity, TargetView> = targets
         .iter()
-        .map(|(e, pos, col, tags, nid)| {
+        .map(|(e, pos, col, tags, nid, cl)| {
             (
                 e,
                 (
@@ -376,12 +398,13 @@ fn hitbox_system(
                     tags.map(|t| t.0.iter().cloned().collect())
                         .unwrap_or_default(),
                     nid.0,
+                    cl.copied(),
                 ),
             )
         })
         .collect();
 
-    for (attacker, pos, hitbox, attacker_nid) in attackers.iter() {
+    for (attacker, pos, hitbox, attacker_nid, attacker_cl) in attackers.iter() {
         if !hitbox.active {
             continue;
         }
@@ -397,9 +420,12 @@ fn hitbox_system(
             if cand == attacker {
                 continue;
             }
-            let Some((tx, ty, tw, th, tags, target_nid)) = target_view.get(&cand) else {
+            let Some((tx, ty, tw, th, tags, target_nid, target_cl)) = target_view.get(&cand) else {
                 continue;
             };
+            if !collision_layers_compatible(attacker_cl, target_cl.as_ref()) {
+                continue;
+            }
             if !tag_matches(tags, &hitbox.damage_tag) {
                 continue;
             }
@@ -512,7 +538,7 @@ fn pickup_system(
 ) {
     let items: Vec<CollisionView> = query
         .iter()
-        .map(|(entity, pos, col, tags, nid, pickup)| CollisionView {
+        .map(|(entity, pos, col, tags, nid, pickup, cl)| CollisionView {
             entity,
             x: pos.x,
             y: pos.y,
@@ -524,6 +550,7 @@ fn pickup_system(
             network_id: nid.0,
             contact_damage: None,
             pickup: pickup.cloned(),
+            collision_layer: cl.copied(),
         })
         .collect();
     let by_entity: std::collections::HashMap<Entity, &CollisionView> =
@@ -557,6 +584,9 @@ fn pickup_system(
                     h: b.h,
                 },
             ) {
+                continue;
+            }
+            if !collision_layers_compatible(a.collision_layer.as_ref(), b.collision_layer.as_ref()) {
                 continue;
             }
             if let Some(pickup) = &a.pickup {

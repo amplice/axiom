@@ -12,6 +12,7 @@ pub(super) fn resolve_simulation_context(
             tiles: tm.tiles.clone(),
             player_spawn: tm.player_spawn.unwrap_or(base_tilemap.player_spawn),
             goal: tm.goal,
+            ..Default::default()
         }
     } else {
         base_tilemap.clone()

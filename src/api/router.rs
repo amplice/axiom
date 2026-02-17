@@ -96,6 +96,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         )
         .route("/entities/{id}/particles", post(set_entity_particles))
         .route("/entities/{id}/tween", post(tween_entity))
+        .route("/entities/{id}/tween_sequence", post(tween_sequence_entity))
         .route("/events", get(get_events))
         .route("/events/subscribe", get(subscribe_events))
         .route("/perf", get(get_perf))
@@ -127,6 +128,63 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
             post(set_lighting_config),
         )
         .route("/lighting/state", get(get_lighting_state))
+        .route("/entities/{id}/tint", post(set_entity_tint))
+        .route("/entities/{id}/trail", post(set_entity_trail))
+        .route(
+            "/input/bindings",
+            get(get_input_bindings).post(set_input_bindings),
+        )
+        .route(
+            "/lighting/day_night",
+            get(get_day_night).post(set_day_night),
+        )
+        .route("/world_text", post(spawn_world_text))
+        .route(
+            "/entities/{id}/state",
+            get(get_entity_state).post(transition_entity_state),
+        )
+        .route("/tilemap/auto_tile", post(set_auto_tile))
+        .route("/tilemap/layers", get(get_tile_layers).post(set_tile_layer))
+        .route("/tilemap/layers/{name}", delete(delete_tile_layer))
+        .route(
+            "/parallax/layers",
+            get(get_parallax).post(set_parallax),
+        )
+        .route(
+            "/weather",
+            get(get_weather).post(set_weather).delete(clear_weather),
+        )
+        .route("/items/define", post(define_items))
+        .route(
+            "/entities/{id}/inventory",
+            get(get_entity_inventory).post(entity_inventory_action),
+        )
+        .route("/cutscene/define", post(define_cutscene))
+        .route("/cutscene/play", post(play_cutscene))
+        .route("/cutscene/stop", post(stop_cutscene))
+        .route("/cutscene/state", get(get_cutscene_state))
+        .route("/presets", get(list_presets).post(define_presets))
+        .route("/pool/init", post(init_pool))
+        .route("/pool/acquire", post(acquire_from_pool))
+        .route("/pool/release/{id}", post(release_to_pool))
+        .route("/pool/status", get(get_pool_status))
+        // Telemetry
+        .route("/telemetry", get(get_telemetry).delete(reset_telemetry))
+        // World simulation & scenario testing
+        .route("/simulate/world", post(simulate_world))
+        .route("/test/scenario", post(run_scenario))
+        .route("/test/playtest", post(run_playtest))
+        // Screenshot extras
+        .route("/screenshot/baseline", post(screenshot_baseline))
+        .route("/screenshot/diff", post(screenshot_diff))
+        // Atomic build
+        .route("/build", post(atomic_build))
+        // Manifest validation
+        .route("/validate/manifest", post(validate_manifest))
+        // Asset pipeline
+        .route("/assets/upload", post(upload_asset))
+        .route("/assets/generate", post(generate_asset))
+        .route("/assets/list", get(list_assets))
         .route("/docs", get(get_docs))
         .route("/docs/html", get(get_docs_html))
         .route("/docs/endpoints", get(get_docs_endpoints))

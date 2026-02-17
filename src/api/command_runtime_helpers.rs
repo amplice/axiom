@@ -32,7 +32,12 @@ pub(super) type ExtrasQueryItem<'a> = (
     Option<&'a AiBehavior>,
     Option<&'a crate::particles::ParticleEmitter>,
     Option<&'a Invincibility>,
-    Option<&'a RenderLayer>,
+    (
+        Option<&'a RenderLayer>,
+        Option<&'a CollisionLayer>,
+        Option<&'a crate::state_machine::EntityStateMachine>,
+        Option<&'a crate::inventory::Inventory>,
+    ),
 );
 
 pub(super) fn collect_save_entities(
@@ -71,6 +76,9 @@ pub(super) fn collect_save_entities(
             particle_emitter,
             invincibility,
             _render_layer,
+            collision_layer,
+            state_machine,
+            inventory,
         ) = match extras_query.get(entity) {
             Ok((
                 _e,
@@ -86,7 +94,7 @@ pub(super) fn collect_save_entities(
                 ai_behavior,
                 particle_emitter,
                 invincibility,
-                render_layer,
+                (render_layer, collision_layer, state_machine, inventory),
             )) => (
                 health,
                 contact,
@@ -101,9 +109,13 @@ pub(super) fn collect_save_entities(
                 particle_emitter,
                 invincibility,
                 render_layer,
+                collision_layer,
+                state_machine,
+                inventory,
             ),
             Err(_) => (
                 None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None,
             ),
         };
         let mut components = Vec::new();
@@ -250,6 +262,25 @@ pub(super) fn collect_save_entities(
                 components.push(ComponentDef::RenderLayer { layer: rl.0 });
             }
         }
+        if let Some(cl) = collision_layer {
+            if cl.layer != 1 || cl.mask != 0xFFFF {
+                components.push(ComponentDef::CollisionLayer {
+                    layer: cl.layer,
+                    mask: cl.mask,
+                });
+            }
+        }
+        if let Some(sm) = state_machine {
+            components.push(ComponentDef::StateMachine {
+                initial: sm.current.clone(),
+                states: sm.states.clone(),
+            });
+        }
+        if let Some(inv) = inventory {
+            components.push(ComponentDef::Inventory {
+                max_slots: inv.max_slots,
+            });
+        }
         let req = EntitySpawnRequest {
             x: pos.x,
             y: pos.y,
@@ -278,6 +309,9 @@ pub(super) fn collect_save_entities(
                 .map(|pf| pf.path.iter().map(|p| (p.x, p.y)).collect())
                 .unwrap_or_default(),
             path_follower_frames_until_recalc: path_follower.map(|pf| pf.frames_until_recalc),
+            inventory_slots: inventory
+                .map(|inv| inv.slots.clone())
+                .unwrap_or_default(),
         });
     }
     entities
@@ -301,14 +335,23 @@ pub(super) fn apply_loaded_save_data(
     next_network_id: &mut NextNetworkId,
     commands: &mut Commands,
     entity_query: &Query<EntityQueryItem<'_>>,
-) {
+) -> ImportResult {
+    let mut warnings = Vec::new();
+
     let restore_animation_graphs = save.version >= 2 || !save.animation_graphs.is_empty();
     let restore_sprite_sheets = save.version >= 2 || !save.sprite_sheets.is_empty();
     let restore_particle_presets = save.version >= 2 || !save.particle_presets.is_empty();
+    let ag_count = save.animation_graphs.len();
+    let ss_count = save.sprite_sheets.len();
     let animation_graphs = save.animation_graphs.clone();
     let sprite_sheets_payload = save.sprite_sheets.clone();
     let particle_presets_payload = save.particle_presets.clone();
     let game_state = save.game_state.clone();
+
+    // Track script counts before restore to detect failures
+    let scripts_submitted: std::collections::HashSet<String> =
+        save.scripts.keys().cloned().collect();
+    let scripts_submitted_count = scripts_submitted.len();
 
     pending_level.0 = Some(SetLevelRequest {
         width: save.tilemap.width,
@@ -317,12 +360,38 @@ pub(super) fn apply_loaded_save_data(
         player_spawn: Some(save.tilemap.player_spawn),
         goal: save.tilemap.goal,
     });
+    let tilemap_applied = true;
+
     pending_physics.0 = Some(save.config.clone());
+    let config_applied = true;
+
     script_engine.restore_snapshot(crate::scripting::ScriptRuntimeSnapshot {
         scripts: save.scripts.clone(),
         global_scripts: save.global_scripts.into_iter().collect(),
         vars: save.game_vars.clone(),
     });
+
+    // Determine which scripts failed to load by comparing submitted vs loaded
+    let loaded_scripts: std::collections::HashSet<String> = crate::scripting::ScriptBackend::list_scripts(&*script_engine)
+        .iter()
+        .map(|info| info.name.clone())
+        .collect();
+    let mut scripts_failed = Vec::new();
+    for name in &scripts_submitted {
+        if !loaded_scripts.contains(name) {
+            scripts_failed.push(name.clone());
+        }
+    }
+    scripts_failed.sort();
+    let scripts_loaded = scripts_submitted_count - scripts_failed.len();
+    if !scripts_failed.is_empty() {
+        warnings.push(format!(
+            "{} script(s) failed to load: {}",
+            scripts_failed.len(),
+            scripts_failed.join(", ")
+        ));
+    }
+
     next_network_id.0 = save.next_network_id.max(1);
 
     commands.queue(move |world: &mut World| {
@@ -357,6 +426,7 @@ pub(super) fn apply_loaded_save_data(
     for (entity, _, _, _, _, _, _, _, _, _, _, _, _, _) in entity_query.iter() {
         commands.entity(entity).despawn();
     }
+    let entities_spawned = save.entities.len();
     for se in &save.entities {
         let req = EntitySpawnRequest {
             x: se.x,
@@ -413,9 +483,28 @@ pub(super) fn apply_loaded_save_data(
                 }
             });
         }
+        if !se.inventory_slots.is_empty() {
+            let slots = se.inventory_slots.clone();
+            commands.queue(move |world: &mut World| {
+                if let Some(mut inv) = world.get_mut::<crate::inventory::Inventory>(entity) {
+                    inv.slots = slots;
+                }
+            });
+        }
     }
     if next_network_id.0 == 0 {
         next_network_id.0 = 1;
+    }
+
+    ImportResult {
+        entities_spawned,
+        scripts_loaded,
+        scripts_failed,
+        config_applied,
+        tilemap_applied,
+        animation_graphs: ag_count,
+        sprite_sheets: ss_count,
+        warnings,
     }
 }
 

@@ -238,6 +238,7 @@ fn generate_platformer(req: &GenerateRequest, physics: &GameConfig) -> GenerateR
         tiles: tiles.clone(),
         player_spawn: spawn,
         goal: Some((goal_x, goal_y)),
+        ..Default::default()
     };
 
     let mut entities = Vec::new();
@@ -417,6 +418,7 @@ fn generate_top_down_dungeon(req: &GenerateRequest, physics: &GameConfig) -> Gen
             tiles: tiles.clone(),
             player_spawn: spawn,
             goal: Some((goal_x, goal_y)),
+            ..Default::default()
         };
         if constraints::check_top_down_reachability_pub(&test_tilemap, spawn_tile, (goal_x, goal_y))
         {
@@ -432,6 +434,7 @@ fn generate_top_down_dungeon(req: &GenerateRequest, physics: &GameConfig) -> Gen
         tiles: tiles.clone(),
         player_spawn: spawn,
         goal: Some((goal_x, goal_y)),
+        ..Default::default()
     };
 
     let mut entities = Vec::new();
@@ -564,6 +567,7 @@ fn generate_rts_arena(req: &GenerateRequest, physics: &GameConfig) -> GenerateRe
         tiles: tiles.clone(),
         player_spawn: spawn,
         goal: Some((goal_x, goal_y)),
+        ..Default::default()
     };
 
     let mut entities = Vec::new();
@@ -673,6 +677,7 @@ fn generate_fighting_arena(req: &GenerateRequest, physics: &GameConfig) -> Gener
         tiles: tiles.clone(),
         player_spawn: spawn,
         goal: Some((goal_x, goal_y)),
+        ..Default::default()
     };
 
     let entities = vec![
@@ -785,6 +790,7 @@ fn generate_arena_waves(req: &GenerateRequest, physics: &GameConfig) -> Generate
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -850,6 +856,7 @@ fn generate_tower_defense_map(req: &GenerateRequest, physics: &GameConfig) -> Ge
         tiles: tiles.clone(),
         player_spawn: spawn,
         goal: Some((goal_x, goal_y)),
+        ..Default::default()
     };
     let validation = run_validation(&tilemap, physics, &req.constraints, &entities);
     GenerateResult {
@@ -902,6 +909,7 @@ fn generate_boss_arena(req: &GenerateRequest, physics: &GameConfig) -> GenerateR
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -941,6 +949,7 @@ fn generate_metroidvania(req: &GenerateRequest, physics: &GameConfig) -> Generat
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -987,6 +996,7 @@ fn generate_roguelike_floor(req: &GenerateRequest, physics: &GameConfig) -> Gene
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -1024,6 +1034,7 @@ fn generate_puzzle_platformer(req: &GenerateRequest, physics: &GameConfig) -> Ge
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -1067,6 +1078,7 @@ fn generate_side_scroller(req: &GenerateRequest, physics: &GameConfig) -> Genera
         tiles: result.tilemap.tiles.clone(),
         player_spawn: result.player_spawn,
         goal: Some(result.goal),
+        ..Default::default()
     };
     result.validation = run_validation(&tilemap, physics, &req.constraints, &result.entities);
     result
@@ -1215,6 +1227,7 @@ mod tests {
             tiles: out.tilemap.tiles.clone(),
             player_spawn: out.player_spawn,
             goal: Some(out.goal),
+            ..Default::default()
         };
         let from = Vec2::new(out.player_spawn.0, out.player_spawn.1);
         let to = Vec2::new(
@@ -1241,6 +1254,7 @@ mod tests {
             initial_game_state: None,
             state_transitions: Vec::new(),
             moving_platforms: Vec::new(),
+            entities: Vec::new(),
         };
         let sim = run_simulation(&tilemap, &cfg, &req);
         assert_eq!(sim.outcome, "goal_reached");
@@ -1265,6 +1279,7 @@ mod tests {
             tiles: out.tilemap.tiles.clone(),
             player_spawn: out.player_spawn,
             goal: Some(out.goal),
+            ..Default::default()
         };
         let from = Vec2::new(out.player_spawn.0, out.player_spawn.1);
         let to = Vec2::new(
@@ -1291,6 +1306,7 @@ mod tests {
             initial_game_state: None,
             state_transitions: Vec::new(),
             moving_platforms: Vec::new(),
+            entities: Vec::new(),
         };
         let sim = run_simulation(&tilemap, &cfg, &req);
         assert_eq!(sim.outcome, "goal_reached");

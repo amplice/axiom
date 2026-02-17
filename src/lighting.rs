@@ -10,12 +10,117 @@ pub struct LightingPlugin;
 impl Plugin for LightingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(LightingConfig::default())
+            .insert_resource(DayNightCycle::default())
             .add_systems(PreStartup, generate_light_texture)
             .add_systems(Startup, spawn_darkness_overlay)
             .add_systems(
                 Update,
-                (sync_darkness_overlay, sync_light_sprites).chain(),
+                (tick_day_night, sync_darkness_overlay, sync_light_sprites).chain(),
             );
+    }
+}
+
+/// Day/night cycle resource.
+#[derive(Resource, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DayNightCycle {
+    pub enabled: bool,
+    /// 0.0-24.0 hours.
+    pub time_of_day: f32,
+    /// Real seconds per game hour.
+    pub speed: f32,
+    pub phases: Vec<DayPhase>,
+    #[serde(skip)]
+    pub current_phase: String,
+}
+
+impl Default for DayNightCycle {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time_of_day: 12.0,
+            speed: 60.0,
+            phases: vec![
+                DayPhase { name: "night".into(), start_hour: 0.0, ambient_intensity: 0.15, ambient_color: [0.1, 0.1, 0.3] },
+                DayPhase { name: "dawn".into(), start_hour: 6.0, ambient_intensity: 0.6, ambient_color: [0.9, 0.6, 0.4] },
+                DayPhase { name: "day".into(), start_hour: 8.0, ambient_intensity: 1.0, ambient_color: [1.0, 1.0, 1.0] },
+                DayPhase { name: "dusk".into(), start_hour: 18.0, ambient_intensity: 0.5, ambient_color: [0.9, 0.5, 0.3] },
+                DayPhase { name: "night".into(), start_hour: 20.0, ambient_intensity: 0.15, ambient_color: [0.1, 0.1, 0.3] },
+            ],
+            current_phase: "day".into(),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct DayPhase {
+    pub name: String,
+    pub start_hour: f32,
+    pub ambient_intensity: f32,
+    pub ambient_color: [f32; 3],
+}
+
+fn tick_day_night(
+    time: Res<Time>,
+    mut cycle: ResMut<DayNightCycle>,
+    mut config: ResMut<LightingConfig>,
+    mut events: ResMut<crate::events::GameEventBus>,
+) {
+    if !cycle.enabled || cycle.phases.is_empty() {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    let hours_per_second = if cycle.speed > 0.0 { 1.0 / cycle.speed } else { 0.0 };
+    cycle.time_of_day += hours_per_second * dt;
+    if cycle.time_of_day >= 24.0 {
+        cycle.time_of_day -= 24.0;
+    }
+
+    let t = cycle.time_of_day;
+
+    // Find current and next phase
+    let mut current_idx = 0;
+    for (i, phase) in cycle.phases.iter().enumerate() {
+        if t >= phase.start_hour {
+            current_idx = i;
+        }
+    }
+    let next_idx = (current_idx + 1) % cycle.phases.len();
+    let current = &cycle.phases[current_idx];
+    let next = &cycle.phases[next_idx];
+
+    let span = if next.start_hour > current.start_hour {
+        next.start_hour - current.start_hour
+    } else {
+        (24.0 - current.start_hour) + next.start_hour
+    };
+    let progress = if span > 0.0 {
+        let elapsed = if t >= current.start_hour {
+            t - current.start_hour
+        } else {
+            (24.0 - current.start_hour) + t
+        };
+        (elapsed / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Lerp ambient
+    config.ambient_intensity = current.ambient_intensity + (next.ambient_intensity - current.ambient_intensity) * progress;
+    for i in 0..3 {
+        config.ambient_color[i] = current.ambient_color[i] + (next.ambient_color[i] - current.ambient_color[i]) * progress;
+    }
+
+    // Check phase change (clone to release borrow on cycle.phases)
+    let new_phase = cycle.phases[current_idx].name.clone();
+    if new_phase != cycle.current_phase {
+        let old = cycle.current_phase.clone();
+        cycle.current_phase = new_phase.clone();
+        events.emit(
+            "day_phase_changed",
+            serde_json::json!({ "phase": new_phase, "hour": t, "previous": old }),
+            None,
+        );
     }
 }
 
@@ -232,6 +337,10 @@ pub fn get_lighting_state(world: &mut World) -> LightingStateResponse {
         .get_resource::<LightingConfig>()
         .cloned()
         .unwrap_or_default();
+    let cycle = world
+        .get_resource::<DayNightCycle>()
+        .cloned()
+        .unwrap_or_default();
     let light_count = world
         .query::<&PointLight2d>()
         .iter(world)
@@ -241,5 +350,68 @@ pub fn get_lighting_state(world: &mut World) -> LightingStateResponse {
         ambient_intensity: config.ambient_intensity,
         ambient_color: config.ambient_color,
         light_count,
+        time_of_day: if cycle.enabled { Some(cycle.time_of_day) } else { None },
+        day_phase: if cycle.enabled { Some(cycle.current_phase.clone()) } else { None },
+    }
+}
+
+pub fn apply_day_night_config(
+    world: &mut World,
+    req: crate::api::types::DayNightRequest,
+) -> Result<(), String> {
+    let mut should_enable_lighting = false;
+    if let Some(mut cycle) = world.get_resource_mut::<DayNightCycle>() {
+        if let Some(enabled) = req.enabled {
+            cycle.enabled = enabled;
+            if enabled {
+                should_enable_lighting = true;
+            }
+        }
+        if let Some(time) = req.time_of_day {
+            cycle.time_of_day = time % 24.0;
+        }
+        if let Some(speed) = req.speed {
+            cycle.speed = speed.max(0.01);
+        }
+        if let Some(phases) = req.phases {
+            cycle.phases = phases
+                .into_iter()
+                .map(|p| DayPhase {
+                    name: p.name,
+                    start_hour: p.start_hour,
+                    ambient_intensity: p.ambient_intensity,
+                    ambient_color: p.ambient_color,
+                })
+                .collect();
+        }
+    }
+    if should_enable_lighting {
+        if let Some(mut config) = world.get_resource_mut::<LightingConfig>() {
+            config.enabled = true;
+        }
+    }
+    Ok(())
+}
+
+pub fn get_day_night_state(world: &mut World) -> crate::api::types::DayNightResponse {
+    let cycle = world
+        .get_resource::<DayNightCycle>()
+        .cloned()
+        .unwrap_or_default();
+    crate::api::types::DayNightResponse {
+        enabled: cycle.enabled,
+        time_of_day: cycle.time_of_day,
+        speed: cycle.speed,
+        current_phase: cycle.current_phase.clone(),
+        phases: cycle
+            .phases
+            .iter()
+            .map(|p| crate::api::types::DayPhaseRequest {
+                name: p.name.clone(),
+                start_hour: p.start_hour,
+                ambient_intensity: p.ambient_intensity,
+                ambient_color: p.ambient_color,
+            })
+            .collect(),
     }
 }

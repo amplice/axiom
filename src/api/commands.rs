@@ -40,6 +40,10 @@ pub enum ApiCommand {
         EntitySpawnRequest,
         tokio::sync::oneshot::Sender<Result<u64, String>>,
     ),
+    SpawnPreset(
+        PresetRequest,
+        tokio::sync::oneshot::Sender<Result<u64, String>>,
+    ),
     ListEntities(tokio::sync::oneshot::Sender<Vec<EntityInfo>>),
     GetEntity(u64, tokio::sync::oneshot::Sender<Option<EntityInfo>>),
     GetEntityAnimation(
@@ -65,7 +69,7 @@ pub enum ApiCommand {
     GetSaveData(tokio::sync::oneshot::Sender<SaveGameData>),
     LoadSaveData(
         Box<SaveGameData>,
-        tokio::sync::oneshot::Sender<Result<(), String>>,
+        tokio::sync::oneshot::Sender<Result<ImportResult, String>>,
     ),
     LoadScript(
         ScriptUpsertRequest,
@@ -193,6 +197,11 @@ pub enum ApiCommand {
         TweenRequest,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
+    SetEntityTweenSequence(
+        u64,
+        TweenSequenceRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     // Screen effects
     TriggerScreenEffect(
         ScreenEffectRequest,
@@ -205,6 +214,130 @@ pub enum ApiCommand {
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
     GetLightingState(tokio::sync::oneshot::Sender<LightingStateResponse>),
+    // Tint
+    SetEntityTint(
+        u64,
+        TintRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Trail
+    SetEntityTrail(
+        u64,
+        Option<TrailRequest>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Input bindings
+    GetInputBindings(tokio::sync::oneshot::Sender<InputBindingsResponse>),
+    SetInputBindings(
+        InputBindingsRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Day/Night
+    GetDayNight(tokio::sync::oneshot::Sender<DayNightResponse>),
+    SetDayNight(
+        DayNightRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // World text
+    SpawnWorldText(
+        WorldTextRequest,
+        tokio::sync::oneshot::Sender<Result<u64, String>>,
+    ),
+    // State machine
+    GetEntityState(u64, tokio::sync::oneshot::Sender<Option<StateMachineResponse>>),
+    TransitionEntityState(
+        u64,
+        StateTransitionRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Auto-tiling
+    SetAutoTile(
+        AutoTileRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Parallax
+    GetParallax(tokio::sync::oneshot::Sender<ParallaxResponse>),
+    SetParallax(
+        ParallaxRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Weather
+    GetWeather(tokio::sync::oneshot::Sender<WeatherResponse>),
+    SetWeather(
+        WeatherRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    ClearWeather(tokio::sync::oneshot::Sender<Result<(), String>>),
+    // Items/Inventory
+    DefineItems(
+        ItemDefineRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    GetEntityInventory(u64, tokio::sync::oneshot::Sender<Option<InventoryResponse>>),
+    EntityInventoryAction(
+        u64,
+        InventoryActionRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    // Cutscene
+    DefineCutscene(
+        CutsceneDefineRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    PlayCutscene(
+        CutscenePlayRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    StopCutscene(tokio::sync::oneshot::Sender<Result<(), String>>),
+    GetCutsceneState(tokio::sync::oneshot::Sender<CutsceneStateResponse>),
+    // Spawn presets
+    DefinePresets(
+        std::collections::HashMap<String, EntitySpawnRequest>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
+    ListPresets(tokio::sync::oneshot::Sender<std::collections::HashMap<String, EntitySpawnRequest>>),
+    // Tile layers
+    SetTileLayer(TileLayerRequest, tokio::sync::oneshot::Sender<Result<(), String>>),
+    GetTileLayers(tokio::sync::oneshot::Sender<TileLayersResponse>),
+    DeleteTileLayer(String, tokio::sync::oneshot::Sender<Result<(), String>>),
+    // Entity pool
+    InitPool(PoolInitRequest, tokio::sync::oneshot::Sender<Result<(), String>>),
+    AcquireFromPool(PoolAcquireRequest, tokio::sync::oneshot::Sender<Result<u64, String>>),
+    ReleaseToPool(u64, tokio::sync::oneshot::Sender<Result<(), String>>),
+    GetPoolStatus(tokio::sync::oneshot::Sender<PoolStatusResponse>),
+    // Telemetry
+    GetTelemetry(tokio::sync::oneshot::Sender<GameplayTelemetry>),
+    ResetTelemetry(tokio::sync::oneshot::Sender<()>),
+    // World Simulation
+    SimulateWorld(
+        WorldSimRequest,
+        tokio::sync::oneshot::Sender<Result<WorldSimResult, String>>,
+    ),
+    // Scenario Testing
+    RunScenario(
+        ScenarioRequest,
+        tokio::sync::oneshot::Sender<Result<ScenarioResult, String>>,
+    ),
+    // Atomic Build
+    AtomicBuild(
+        Box<BuildRequest>,
+        tokio::sync::oneshot::Sender<Result<BuildResult, String>>,
+    ),
+    // Asset Pipeline
+    UploadAsset(
+        AssetUploadRequest,
+        tokio::sync::oneshot::Sender<Result<AssetInfo, String>>,
+    ),
+    GenerateAsset(
+        AssetGenerateRequest,
+        tokio::sync::oneshot::Sender<Result<AssetInfo, String>>,
+    ),
+    ListAssets(tokio::sync::oneshot::Sender<Vec<AssetInfo>>),
+    // Playtest
+    RunPlaytest(
+        PlaytestRequest,
+        tokio::sync::oneshot::Sender<Result<PlaytestResult, String>>,
+    ),
 }
 
 #[derive(Resource, Default)]

@@ -147,25 +147,12 @@ pub(super) async fn create_entity_preset(
     State(state): State<AppState>,
     Json(req): Json<PresetRequest>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    let mut spawn_req = crate::spawn::preset_to_request(&req.preset, req.x, req.y);
-    if let Err(e) = crate::spawn::apply_preset_config(&mut spawn_req, &req.config) {
-        return Json(ApiResponse {
-            ok: false,
-            data: None,
-            error: Some(e),
-        });
-    }
-    if req.script.is_some() {
-        spawn_req.script = req.script.clone();
-    }
-    if !req.tags.is_empty() {
-        spawn_req.tags = req.tags.clone();
-    }
+    let preset_name = req.preset.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let _ = state.sender.send(ApiCommand::SpawnEntity(spawn_req, tx));
+    let _ = state.sender.send(ApiCommand::SpawnPreset(req, tx));
     match rx.await {
         Ok(Ok(id)) => Json(ApiResponse::success(
-            serde_json::json!({"id": id, "preset": req.preset}),
+            serde_json::json!({"id": id, "preset": preset_name}),
         )),
         Ok(Err(e)) => Json(ApiResponse {
             ok: false,

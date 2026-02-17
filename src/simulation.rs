@@ -1,8 +1,10 @@
 use crate::components::{GameConfig, TileType};
 use crate::physics_core::{self, PhysicsCounters};
+use crate::scripting::ScriptBackend;
 use crate::tilemap::Tilemap;
-use bevy::prelude::Vec2;
+use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 const PLAYER_WIDTH: f32 = 12.0;
 const PLAYER_HEIGHT: f32 = 14.0;
@@ -25,6 +27,8 @@ pub struct SimulationRequest {
     pub state_transitions: Vec<SimStateTransition>,
     #[serde(default)]
     pub moving_platforms: Vec<SimMovingPlatform>,
+    #[serde(default)]
+    pub entities: Vec<serde_json::Value>,
 }
 
 fn default_record_interval() -> u32 {
@@ -819,6 +823,453 @@ fn advance_sim_platform_waypoint(platform: &mut SimPlatformState) {
     }
 }
 
+// === Real Simulation (PendingRealSim) ===
+
+#[derive(Resource, Default)]
+pub struct PendingRealSim {
+    pub active: Option<ActiveRealSim>,
+}
+
+pub struct ActiveRealSim {
+    pub saved_state: crate::api::SaveGameData,
+    pub frames_remaining: u32,
+    pub frames_total: u32,
+    pub inputs: Vec<SimInput>,
+    pub record_interval: u32,
+    pub snapshots: Vec<crate::api::types::WorldSimSnapshot>,
+    pub sender: Option<tokio::sync::oneshot::Sender<Result<crate::api::types::WorldSimResult, String>>>,
+    pub saved_runtime_state: String,
+}
+
+/// Runs early in FixedUpdate to inject virtual inputs for real sim.
+pub fn tick_real_sim(
+    mut pending: ResMut<PendingRealSim>,
+    mut vinput: ResMut<crate::input::VirtualInput>,
+    mut runtime: ResMut<crate::game_runtime::RuntimeState>,
+) {
+    let Some(ref mut sim) = pending.active else { return };
+    if sim.frames_remaining == 0 { return; }
+
+    // Force gameplay to be active during sim
+    if !runtime.is_gameplay_active() {
+        runtime.state = "Playing".to_string();
+    }
+
+    let current_frame = sim.frames_total - sim.frames_remaining;
+
+    vinput.active.clear();
+    vinput.just_pressed.clear();
+    for input in &sim.inputs {
+        let dur = if input.duration == 0 { 1 } else { input.duration };
+        if current_frame >= input.frame && current_frame < input.frame + dur {
+            vinput.active.insert(input.action.clone());
+        }
+        if current_frame == input.frame {
+            vinput.just_pressed.insert(input.action.clone());
+        }
+    }
+
+    sim.frames_remaining -= 1;
+}
+
+/// Runs late in FixedUpdate to capture snapshots and finalize real sim.
+pub fn finalize_real_sim(
+    mut pending: ResMut<PendingRealSim>,
+    mut runtime: ResMut<crate::game_runtime::RuntimeState>,
+    entity_query: Query<(
+        &crate::components::GamePosition,
+        Option<&crate::components::Velocity>,
+        Option<&crate::components::NetworkId>,
+        Option<&crate::components::Player>,
+        Option<&crate::components::Alive>,
+        Option<&crate::components::Tags>,
+        Option<&crate::scripting::LuaScript>,
+        Option<&crate::components::Health>,
+    )>,
+    script_engine: Res<crate::scripting::ScriptEngine>,
+    event_bus: Res<crate::events::GameEventBus>,
+    script_errors: Res<crate::scripting::ScriptErrors>,
+) {
+    let Some(ref mut sim) = pending.active else { return };
+    let current_frame = sim.frames_total - sim.frames_remaining;
+
+    // Record snapshot at interval
+    if sim.record_interval > 0 && current_frame % sim.record_interval == 0 {
+        let mut entities = Vec::new();
+        for (pos, vel, nid, _player, alive, tags, script, health) in entity_query.iter() {
+            entities.push(crate::api::types::EntityInfo {
+                id: nid.map_or(0, |n| n.0),
+                network_id: nid.map(|n| n.0),
+                x: pos.x,
+                y: pos.y,
+                vx: vel.map_or(0.0, |v| v.x),
+                vy: vel.map_or(0.0, |v| v.y),
+                components: vec![],
+                script: script.map(|s| s.script_name.clone()),
+                tags: tags.map(|t| t.0.iter().cloned().collect()).unwrap_or_default(),
+                health: health.map(|h| h.current),
+                max_health: health.map(|h| h.max),
+                alive: Some(alive.map_or(true, |a| a.0)),
+                ai_behavior: None,
+                ai_state: None,
+                ai_target_id: None,
+                path_target: None,
+                path_len: None,
+                animation_graph: None,
+                animation_state: None,
+                animation_frame: None,
+                animation_facing_right: None,
+                render_layer: None,
+                collision_layer: None,
+                collision_mask: None,
+                machine_state: None,
+                inventory_slots: None,
+            });
+        }
+
+        let snapshot = script_engine.snapshot();
+        let vars_map: serde_json::Map<String, serde_json::Value> = snapshot.vars.into_iter().collect();
+
+        sim.snapshots.push(crate::api::types::WorldSimSnapshot {
+            frame: current_frame,
+            entities,
+            vars: serde_json::Value::Object(vars_map),
+        });
+    }
+
+    // If done, send result
+    if sim.frames_remaining == 0 {
+        let events: Vec<crate::events::GameEvent> = event_bus.recent.iter().cloned().collect();
+        let errors: Vec<crate::scripting::ScriptError> = script_errors.entries.iter().cloned().collect();
+
+        let snapshot = script_engine.snapshot();
+        let final_vars_map: serde_json::Map<String, serde_json::Value> = snapshot.vars.into_iter().collect();
+
+        if let Some(sender) = sim.sender.take() {
+            let _ = sender.send(Ok(crate::api::types::WorldSimResult {
+                frames_run: sim.frames_total,
+                snapshots: std::mem::take(&mut sim.snapshots),
+                events,
+                script_errors: errors,
+                final_vars: serde_json::Value::Object(final_vars_map),
+            }));
+        }
+
+        // Restore runtime state
+        runtime.state = sim.saved_runtime_state.clone();
+        pending.active = None;
+    }
+}
+
+// === Playtest Agent (PendingPlaytest) ===
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlaytestMode {
+    Platformer,
+    TopDown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlaytestGoal {
+    Survive,
+    ReachGoal,
+    Explore,
+}
+
+#[derive(Resource, Default)]
+pub struct PendingPlaytest {
+    pub active: Option<ActivePlaytest>,
+}
+
+pub struct ActivePlaytest {
+    pub saved_runtime_state: String,
+    pub frames_remaining: u32,
+    pub frames_total: u32,
+    pub mode: PlaytestMode,
+    pub goal: PlaytestGoal,
+    pub sender: Option<tokio::sync::oneshot::Sender<Result<crate::api::types::PlaytestResult, String>>>,
+    pub prev_x: f32,
+    pub prev_y: f32,
+    pub stuck_frames: u32,
+    pub last_jump_frame: u32,
+    pub direction: i32,
+    pub explore_phase: u32,
+    pub visited_cells: HashSet<(i32, i32)>,
+    pub events: Vec<crate::api::types::PlaytestEvent>,
+    pub total_damage: f32,
+    pub deaths: Vec<crate::api::types::PlaytestEvent>,
+    pub input_counts: HashMap<String, u32>,
+    pub distance_traveled: f32,
+    pub initial_health: f32,
+}
+
+/// Runs first in FixedUpdate to generate AI inputs for playtest.
+pub fn tick_playtest_agent(
+    mut pending: ResMut<PendingPlaytest>,
+    mut vinput: ResMut<crate::input::VirtualInput>,
+    mut runtime: ResMut<crate::game_runtime::RuntimeState>,
+    player_query: Query<
+        (&crate::components::GamePosition, Option<&crate::components::Health>),
+        With<crate::components::Player>,
+    >,
+    enemy_tags_query: Query<
+        (&crate::components::GamePosition, &crate::components::Tags),
+        Without<crate::components::Player>,
+    >,
+    tilemap: Res<Tilemap>,
+    config: Res<GameConfig>,
+) {
+    let Some(ref mut pt) = pending.active else { return };
+    if pt.frames_remaining == 0 { return; }
+
+    // Force gameplay active
+    if !runtime.is_gameplay_active() {
+        runtime.state = "Playing".to_string();
+    }
+
+    let current_frame = pt.frames_total - pt.frames_remaining;
+
+    // Get player position
+    let Ok((player_pos, player_health)) = player_query.get_single() else {
+        pt.frames_remaining -= 1;
+        return;
+    };
+    let px = player_pos.x;
+    let py = player_pos.y;
+
+    // Track visited cells (32px grid)
+    let cell_x = (px / 32.0) as i32;
+    let cell_y = (py / 32.0) as i32;
+    pt.visited_cells.insert((cell_x, cell_y));
+
+    // Track distance
+    if current_frame > 0 {
+        let dx = px - pt.prev_x;
+        let dy = py - pt.prev_y;
+        pt.distance_traveled += (dx * dx + dy * dy).sqrt();
+    }
+
+    // Check for damage taken
+    if let Some(health) = player_health {
+        let expected = pt.initial_health - pt.total_damage;
+        if health.current < expected - 0.01 {
+            let dmg = expected - health.current;
+            pt.total_damage += dmg;
+            pt.events.push(crate::api::types::PlaytestEvent {
+                frame: current_frame,
+                event_type: "damage_taken".to_string(),
+                x: px, y: py,
+                detail: format!("took {:.1} damage", dmg),
+            });
+        }
+        if health.current <= 0.0 {
+            pt.deaths.push(crate::api::types::PlaytestEvent {
+                frame: current_frame,
+                event_type: "death".to_string(),
+                x: px, y: py,
+                detail: "player died".to_string(),
+            });
+        }
+    }
+
+    // Stuck detection
+    let move_dist = ((px - pt.prev_x).powi(2) + (py - pt.prev_y).powi(2)).sqrt();
+    if move_dist < 0.5 { pt.stuck_frames += 1; } else { pt.stuck_frames = 0; }
+    pt.prev_x = px;
+    pt.prev_y = py;
+
+    // Find nearest enemy
+    let mut nearest_enemy_dist = f32::MAX;
+    let mut nearest_enemy_dx = 0.0f32;
+    let mut nearest_enemy_dy = 0.0f32;
+    for (epos, etags) in enemy_tags_query.iter() {
+        if !etags.0.contains("enemy") { continue; }
+        let edx = epos.x - px;
+        let edy = epos.y - py;
+        let dist = (edx * edx + edy * edy).sqrt();
+        if dist < nearest_enemy_dist {
+            nearest_enemy_dist = dist;
+            nearest_enemy_dx = edx;
+            nearest_enemy_dy = edy;
+        }
+    }
+
+    // Clear inputs
+    vinput.active.clear();
+    vinput.just_pressed.clear();
+
+    let ts = config.tile_size;
+
+    match pt.mode {
+        PlaytestMode::Platformer => {
+            let dir_action = if pt.direction > 0 { "right" } else { "left" };
+            vinput.active.insert(dir_action.to_string());
+            *pt.input_counts.entry(dir_action.to_string()).or_insert(0) += 1;
+
+            // Check for wall ahead
+            let check_x = px + (pt.direction as f32) * ts;
+            let tile_x = (check_x / ts) as i32;
+            let tile_y = (py / ts) as i32;
+            let wall_ahead = tilemap.get(tile_x, tile_y) == TileType::Solid;
+
+            // Check for gap ahead
+            let gap_tile_x = ((px + (pt.direction as f32) * ts) / ts) as i32;
+            let below_y = tile_y - 1;
+            let ground_below = tilemap.get(gap_tile_x, below_y);
+            let gap_ahead = ground_below != TileType::Solid && ground_below != TileType::Platform;
+
+            if wall_ahead || gap_ahead {
+                vinput.active.insert("jump".to_string());
+                vinput.just_pressed.insert("jump".to_string());
+                *pt.input_counts.entry("jump".to_string()).or_insert(0) += 1;
+                pt.last_jump_frame = current_frame;
+            }
+
+            if pt.stuck_frames > 60 {
+                if pt.stuck_frames < 90 {
+                    vinput.active.insert("jump".to_string());
+                    vinput.just_pressed.insert("jump".to_string());
+                    *pt.input_counts.entry("jump".to_string()).or_insert(0) += 1;
+                } else {
+                    pt.direction = -pt.direction;
+                    pt.stuck_frames = 0;
+                    pt.events.push(crate::api::types::PlaytestEvent {
+                        frame: current_frame,
+                        event_type: "stuck_reverse".to_string(),
+                        x: px, y: py,
+                        detail: "reversed direction due to being stuck".to_string(),
+                    });
+                }
+            }
+
+            if nearest_enemy_dist < 60.0 {
+                vinput.active.insert("attack".to_string());
+                vinput.just_pressed.insert("attack".to_string());
+                *pt.input_counts.entry("attack".to_string()).or_insert(0) += 1;
+            }
+        }
+        PlaytestMode::TopDown => {
+            let phase = (current_frame / 120) % 4;
+            let (dir_x, dir_y): (f32, f32) = match phase {
+                0 => (1.0, 0.0),
+                1 => (0.0, 1.0),
+                2 => (-1.0, 0.0),
+                _ => (0.0, -1.0),
+            };
+
+            if nearest_enemy_dist < 100.0 {
+                let flee_x = if nearest_enemy_dx > 0.0 { -1.0 } else { 1.0 };
+                let flee_y = if nearest_enemy_dy > 0.0 { -1.0 } else { 1.0 };
+                if flee_x > 0.0 { vinput.active.insert("right".to_string()); }
+                else { vinput.active.insert("left".to_string()); }
+                if flee_y > 0.0 { vinput.active.insert("up".to_string()); }
+                else { vinput.active.insert("down".to_string()); }
+                vinput.active.insert("sprint".to_string());
+                *pt.input_counts.entry("sprint".to_string()).or_insert(0) += 1;
+
+                if nearest_enemy_dist < 50.0 {
+                    vinput.active.insert("attack".to_string());
+                    vinput.just_pressed.insert("attack".to_string());
+                    *pt.input_counts.entry("attack".to_string()).or_insert(0) += 1;
+                }
+            } else {
+                if dir_x > 0.0 { vinput.active.insert("right".to_string()); *pt.input_counts.entry("right".to_string()).or_insert(0) += 1; }
+                if dir_x < 0.0 { vinput.active.insert("left".to_string()); *pt.input_counts.entry("left".to_string()).or_insert(0) += 1; }
+                if dir_y > 0.0 { vinput.active.insert("up".to_string()); *pt.input_counts.entry("up".to_string()).or_insert(0) += 1; }
+                if dir_y < 0.0 { vinput.active.insert("down".to_string()); *pt.input_counts.entry("down".to_string()).or_insert(0) += 1; }
+            }
+
+            // Wall check
+            let check_x = px + dir_x * ts;
+            let check_y = py + dir_y * ts;
+            let tile_cx = (check_x / ts) as i32;
+            let tile_cy = (check_y / ts) as i32;
+            if tilemap.get(tile_cx, tile_cy) == TileType::Solid {
+                vinput.active.clear();
+                let perp_action = match phase { 0 | 2 => "up", _ => "right" };
+                vinput.active.insert(perp_action.to_string());
+                *pt.input_counts.entry(perp_action.to_string()).or_insert(0) += 1;
+            }
+
+            if pt.stuck_frames > 60 {
+                pt.explore_phase = pt.explore_phase.wrapping_add(1);
+                pt.stuck_frames = 0;
+                pt.events.push(crate::api::types::PlaytestEvent {
+                    frame: current_frame,
+                    event_type: "stuck_change_dir".to_string(),
+                    x: px, y: py,
+                    detail: "changed exploration direction due to being stuck".to_string(),
+                });
+            }
+        }
+    }
+
+    pt.frames_remaining -= 1;
+}
+
+/// Runs late in FixedUpdate to detect playtest completion and send results.
+pub fn finalize_playtest(
+    mut pending: ResMut<PendingPlaytest>,
+    mut runtime: ResMut<crate::game_runtime::RuntimeState>,
+    player_query: Query<
+        (Option<&crate::components::Alive>, Option<&crate::components::Health>),
+        With<crate::components::Player>,
+    >,
+) {
+    let Some(ref mut pt) = pending.active else { return };
+
+    let player_alive = player_query
+        .get_single()
+        .map(|(alive, _)| alive.map_or(true, |a| a.0))
+        .unwrap_or(false);
+
+    let current_frame = pt.frames_total - pt.frames_remaining;
+    let done = pt.frames_remaining == 0 || !player_alive;
+    if !done { return; }
+
+    let frames_played = current_frame;
+    let tiles_explored = pt.visited_cells.len();
+    let stuck_count = pt.events.iter().filter(|e| e.event_type.starts_with("stuck_")).count() as u32;
+    let death_count = pt.deaths.len();
+
+    let difficulty_rating = if death_count > 2 || (frames_played < 120 && death_count > 0) {
+        "impossible"
+    } else if death_count > 0 || pt.total_damage > 8.0 {
+        "hard"
+    } else if pt.total_damage > 4.0 || stuck_count > 3 {
+        "medium"
+    } else if pt.total_damage > 0.0 || stuck_count > 0 {
+        "easy"
+    } else {
+        "trivial"
+    };
+
+    let mut notes = Vec::new();
+    if !player_alive { notes.push(format!("Player died at frame {}", current_frame)); }
+    if tiles_explored < 5 { notes.push("Very limited exploration - agent may be trapped".to_string()); }
+    if stuck_count > 5 { notes.push(format!("Agent got stuck {} times - level may have navigation issues", stuck_count)); }
+    if pt.total_damage > 0.0 { notes.push(format!("Total damage taken: {:.1}", pt.total_damage)); }
+
+    if let Some(sender) = pt.sender.take() {
+        let _ = sender.send(Ok(crate::api::types::PlaytestResult {
+            frames_played,
+            alive: player_alive,
+            deaths: std::mem::take(&mut pt.deaths),
+            damage_taken: pt.total_damage,
+            distance_traveled: pt.distance_traveled,
+            tiles_explored,
+            events: std::mem::take(&mut pt.events),
+            stuck_count,
+            input_summary: pt.input_counts.clone(),
+            difficulty_rating: difficulty_rating.to_string(),
+            notes,
+        }));
+    }
+
+    runtime.state = pt.saved_runtime_state.clone();
+    pending.active = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1289,7 @@ mod tests {
             tiles,
             player_spawn: (24.0, 24.0),
             goal: None,
+            ..Default::default()
         }
     }
 
@@ -863,6 +1315,7 @@ mod tests {
                 to: "Playing".to_string(),
             }],
             moving_platforms: Vec::new(),
+            entities: vec![],
         };
         let result = run_simulation(&map, &cfg, &req);
         let start_x = result.trace.first().map(|f| f.x).unwrap_or(0.0);
@@ -912,6 +1365,7 @@ mod tests {
             initial_game_state: None,
             state_transitions: Vec::new(),
             moving_platforms: Vec::new(),
+            entities: vec![],
         };
         let result = run_simulation(&map, &cfg, &req);
         let start_y = result.trace.first().map(|f| f.y).unwrap_or(0.0);
@@ -950,6 +1404,7 @@ mod tests {
             initial_game_state: None,
             state_transitions: Vec::new(),
             moving_platforms: Vec::new(),
+            entities: vec![],
         };
         let result = run_simulation(&map, &cfg, &req);
         assert_eq!(result.outcome, "goal_reached");

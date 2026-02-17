@@ -552,6 +552,38 @@ impl GameConfig {
 #[derive(Component, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct RenderLayer(pub i32);
 
+/// Collision layer for filtering entity interactions.
+#[derive(Component, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct CollisionLayer {
+    pub layer: u16,
+    pub mask: u16,
+}
+
+impl Default for CollisionLayer {
+    fn default() -> Self {
+        Self {
+            layer: 1,
+            mask: 0xFFFF,
+        }
+    }
+}
+
+/// Sprite color tint component.
+#[derive(Component, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpriteColorTint {
+    pub color: [f32; 4],
+    #[serde(default)]
+    pub flash_color: Option<[f32; 4]>,
+    #[serde(default)]
+    pub flash_frames: u32,
+}
+
+/// Marks an entity as belonging to a pool for recycling.
+#[derive(Component, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Pooled {
+    pub pool_name: String,
+}
+
 /// Marks whether we're running in headless mode (no window/rendering)
 #[derive(Resource)]
 pub struct HeadlessMode(pub bool);

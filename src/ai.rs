@@ -588,6 +588,7 @@ mod tests {
             tiles,
             player_spawn: (8.0, 8.0),
             goal: None,
+            ..Default::default()
         }
     }
 
@@ -621,6 +622,7 @@ mod tests {
             tiles: hazard_tiles,
             player_spawn: (8.0, 8.0),
             goal: None,
+            ..Default::default()
         };
         assert!(!top_down_cell_walkable(&hazard_tm, 16.0, 2, 2));
     }

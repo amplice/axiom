@@ -19,6 +19,7 @@ pub(super) struct ApiRuntimeCtx<'w, 's> {
     script_errors: ResMut<'w, ScriptErrors>,
     sprite_assets: Option<ResMut<'w, SpriteAssets>>,
     pending_screenshot: ResMut<'w, PendingScreenshot>,
+    preset_registry: Res<'w, crate::spawn::PresetRegistry>,
     entity_query: Query<'w, 's, EntityQueryItem<'static>>,
     extras_query: Query<'w, 's, ExtrasQueryItem<'static>>,
 }
@@ -39,6 +40,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
         mut script_errors,
         sprite_assets,
         mut pending_screenshot,
+        preset_registry,
         entity_query,
         extras_query,
     } = ctx;
@@ -118,7 +120,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 ai_behavior,
                 particle_emitter,
                 _invincibility,
-                render_layer,
+                (render_layer, collision_layer, state_machine, inventory),
             )) => EntityInfoExtras {
                 health_current: health.map(|h| h.current),
                 health_max: health.map(|h| h.max),
@@ -145,6 +147,10 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 animation_frame: animation_controller.map(|a| a.frame),
                 animation_facing_right: animation_controller.map(|a| a.facing_right),
                 render_layer: render_layer.map(|r| r.0),
+                collision_layer: collision_layer.map(|c| c.layer),
+                collision_mask: collision_layer.map(|c| c.mask),
+                machine_state: state_machine.map(|sm| sm.current.clone()),
+                inventory_slots: inventory.map(|inv| inv.max_slots),
             },
             Err(_) => EntityInfoExtras::default(),
         }
@@ -184,6 +190,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
 
     while let Ok(cmd) = channels.receiver.try_recv() {
         match cmd {
+            // ── Game State & World Queries ──────────────────────────────
             ApiCommand::GetState(tx) => {
                 let player_state = player_state_snapshot();
                 let state = GameState {
@@ -261,6 +268,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         .collect();
                 let _ = tx.send(hits);
             }
+            // ── Level, Config & Assets ──────────────────────────────────
             ApiCommand::SetLevel(req, tx) => {
                 if req.tiles.len() != req.width * req.height {
                     let _ = tx.send(Err(format!(
@@ -422,14 +430,40 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Ok(()));
                 });
             }
+            // ── Screenshots ─────────────────────────────────────────────
             ApiCommand::TakeScreenshot(tx) => {
                 pending_screenshot.0 = true;
                 let _ = tx.send(Ok(()));
             }
+            // ── Entity CRUD ─────────────────────────────────────────────
             ApiCommand::SpawnEntity(req, tx) => {
                 ensure_entity_id_index!();
                 let assigned_id = next_network_id.0;
                 let entity = crate::spawn::spawn_entity(&mut commands, &req, &mut next_network_id);
+                entity_id_index.insert(assigned_id, entity);
+                commands.queue(move |_world: &mut World| {
+                    let _ = tx.send(Ok(assigned_id));
+                });
+            }
+            ApiCommand::SpawnPreset(req, tx) => {
+                ensure_entity_id_index!();
+                let mut spawn_req = crate::spawn::preset_to_request_with_registry(
+                    &req.preset, req.x, req.y, Some(&preset_registry),
+                );
+                if let Err(e) = crate::spawn::apply_preset_config(&mut spawn_req, &req.config) {
+                    commands.queue(move |_world: &mut World| {
+                        let _ = tx.send(Err(e));
+                    });
+                    continue;
+                }
+                if req.script.is_some() {
+                    spawn_req.script = req.script;
+                }
+                if !req.tags.is_empty() {
+                    spawn_req.tags = req.tags;
+                }
+                let assigned_id = next_network_id.0;
+                let entity = crate::spawn::spawn_entity(&mut commands, &spawn_req, &mut next_network_id);
                 entity_id_index.insert(assigned_id, entity);
                 commands.queue(move |_world: &mut World| {
                     let _ = tx.send(Ok(assigned_id));
@@ -722,8 +756,9 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Err("Entity not found".into()));
                 }
             }
+            // ── Events & Performance ────────────────────────────────────
             ApiCommand::GetEvents(tx) => {
-                let _ = tx.send(event_bus.recent.clone());
+                let _ = tx.send(event_bus.recent.iter().cloned().collect());
             }
             ApiCommand::GetPerf(tx) => {
                 let _ = tx.send(perf.clone());
@@ -731,6 +766,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
             ApiCommand::GetPerfHistory(tx) => {
                 let _ = tx.send(perf.history.clone());
             }
+            // ── Save/Load ──────────────────────────────────────────────
             ApiCommand::GetSaveData(tx) => {
                 let entities = collect_save_entities(&entity_query, &extras_query);
                 let script_snapshot = script_engine.snapshot();
@@ -772,7 +808,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 });
             }
             ApiCommand::LoadSaveData(save, tx) => {
-                apply_loaded_save_data(
+                let result = apply_loaded_save_data(
                     *save,
                     &mut pending_level,
                     &mut pending_physics,
@@ -781,8 +817,9 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     &mut commands,
                     &entity_query,
                 );
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(Ok(result));
             }
+            // ── Scripting ──────────────────────────────────────────────
             ApiCommand::LoadScript(req, tx) => {
                 let script_name = req.name.clone();
                 let always_run = req.always_run.unwrap_or(false);
@@ -891,6 +928,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     ),
                 });
             }
+            // ── Animation Graphs ────────────────────────────────────────
             ApiCommand::ListAnimationGraphs(tx) => {
                 commands.queue(move |world: &mut World| {
                     let items = world
@@ -947,6 +985,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(items);
                 });
             }
+            // ── Debug Overlay ──────────────────────────────────────────
             ApiCommand::GetDebugOverlay(tx) => {
                 let mut features = debug_overlay.features.iter().cloned().collect::<Vec<_>>();
                 features.sort();
@@ -960,6 +999,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 debug_overlay.features = req.features.into_iter().collect();
                 let _ = tx.send(Ok(()));
             }
+            // ── Audio ───────────────────────────────────────────────────
             ApiCommand::SetAudioSfx(effects, tx) => {
                 commands.queue(move |world: &mut World| {
                     let Some(mut audio) = world.get_resource_mut::<crate::audio::AudioManager>()
@@ -1092,6 +1132,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(snapshot);
                 });
             }
+            // ── Camera ──────────────────────────────────────────────────
             ApiCommand::SetCameraConfig(req, tx) => {
                 commands.queue(move |world: &mut World| {
                     let Some(mut camera_config) =
@@ -1203,6 +1244,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(state);
                 });
             }
+            // ── UI & Dialogue ──────────────────────────────────────────
             ApiCommand::SetUiScreen(req, tx) => {
                 commands.queue(move |world: &mut World| {
                     let Some(mut ui) = world.get_resource_mut::<crate::ui::UiManager>() else {
@@ -1367,6 +1409,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(snapshot);
                 });
             }
+            // ── Runtime State & Input ──────────────────────────────────
             ApiCommand::SetRuntimeState(state, effect, duration, tx) => {
                 commands.queue(move |world: &mut World| {
                     let Some(mut runtime) =
@@ -1464,9 +1507,26 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Ok(()));
                 });
             }
+            // ── Visual Effects (Tweens, Screen, Lighting, Tint, Trail) ─
             ApiCommand::SetEntityTween(entity_id, req, tx) => {
                 commands.queue(move |world: &mut World| {
                     let _ = tx.send(crate::tween::apply_tween_command(world, entity_id, req));
+                });
+            }
+            ApiCommand::SetEntityTweenSequence(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let steps: Vec<crate::tween::TweenStep> = req.steps.into_iter().map(|s| {
+                        crate::tween::TweenStep {
+                            property: s.property,
+                            to: s.to,
+                            from: s.from,
+                            duration: s.duration,
+                            easing: s.easing,
+                        }
+                    }).collect();
+                    let _ = tx.send(crate::tween::apply_tween_sequence_command(
+                        world, entity_id, steps, req.sequence_id,
+                    ));
                 });
             }
             ApiCommand::TriggerScreenEffect(req, tx) => {
@@ -1491,8 +1551,1136 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(state);
                 });
             }
+            ApiCommand::SetEntityTint(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = apply_tint_to_entity(world, entity_id, req);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::SetEntityTrail(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = apply_trail_to_entity(world, entity_id, req);
+                    let _ = tx.send(result);
+                });
+            }
+            // ── Input Bindings & Day/Night ──────────────────────────────
+            ApiCommand::GetInputBindings(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let bindings = world.get_resource::<crate::input::InputBindings>().cloned().unwrap_or_default();
+                    let _ = tx.send(InputBindingsResponse {
+                        keyboard: bindings.keyboard,
+                        gamepad: bindings.gamepad,
+                    });
+                });
+            }
+            ApiCommand::SetInputBindings(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut bindings) = world.get_resource_mut::<crate::input::InputBindings>() {
+                        if !req.keyboard.is_empty() {
+                            bindings.keyboard = req.keyboard;
+                        }
+                        if !req.gamepad.is_empty() {
+                            bindings.gamepad = req.gamepad;
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::GetDayNight(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let state = crate::lighting::get_day_night_state(world);
+                    let _ = tx.send(state);
+                });
+            }
+            ApiCommand::SetDayNight(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let _ = tx.send(crate::lighting::apply_day_night_config(world, req));
+                });
+            }
+            // ── World Text, State Machine, Tilemap ─────────────────────
+            ApiCommand::SpawnWorldText(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = spawn_world_text_command(world, req);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::GetEntityState(entity_id, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = get_entity_state_machine(world, entity_id);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::TransitionEntityState(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = transition_entity_state(world, entity_id, req.state);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::SetAutoTile(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
+                        tilemap.auto_tile_rules = req.rules;
+                        tilemap.recalculate_auto_tiles();
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            // ── Parallax, Weather, Inventory, Cutscenes ────────────────
+            ApiCommand::GetParallax(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let config = world.get_resource::<crate::parallax::ParallaxConfig>().cloned().unwrap_or_default();
+                    let _ = tx.send(ParallaxResponse { layers: config.layers });
+                });
+            }
+            ApiCommand::SetParallax(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut config) = world.get_resource_mut::<crate::parallax::ParallaxConfig>() {
+                        config.layers = req.layers;
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::GetWeather(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let weather = world.get_resource::<crate::weather::WeatherSystem>().cloned().unwrap_or_default();
+                    let resp = match weather.active {
+                        Some(ref c) => WeatherResponse {
+                            active: true,
+                            weather_type: Some(match c.weather_type {
+                                crate::weather::WeatherType::Rain => "rain".into(),
+                                crate::weather::WeatherType::Snow => "snow".into(),
+                                crate::weather::WeatherType::Dust => "dust".into(),
+                            }),
+                            intensity: c.intensity,
+                            wind: c.wind,
+                        },
+                        None => WeatherResponse { active: false, weather_type: None, intensity: 0.0, wind: 0.0 },
+                    };
+                    let _ = tx.send(resp);
+                });
+            }
+            ApiCommand::SetWeather(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut weather: Mut<crate::weather::WeatherSystem>| {
+                        world.resource_scope(|_world, mut events: Mut<GameEventBus>| {
+                            crate::weather::apply_weather(&mut weather, &mut events, &req.weather_type, req.intensity, req.wind);
+                        });
+                    });
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::ClearWeather(tx) => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut weather: Mut<crate::weather::WeatherSystem>| {
+                        world.resource_scope(|_world, mut events: Mut<GameEventBus>| {
+                            crate::weather::clear_weather(&mut weather, &mut events);
+                        });
+                    });
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::DefineItems(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut registry) = world.get_resource_mut::<crate::inventory::ItemRegistry>() {
+                        for (id, def) in req.items {
+                            registry.items.insert(id, def);
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::GetEntityInventory(entity_id, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = get_entity_inventory(world, entity_id);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::EntityInventoryAction(entity_id, req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let result = entity_inventory_action(world, entity_id, req);
+                    let _ = tx.send(result);
+                });
+            }
+            ApiCommand::DefineCutscene(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut manager) = world.get_resource_mut::<crate::cutscene::CutsceneManager>() {
+                        manager.definitions.insert(req.name.clone(), crate::cutscene::CutsceneDef {
+                            name: req.name,
+                            steps: req.steps,
+                        });
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::PlayCutscene(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut manager: Mut<crate::cutscene::CutsceneManager>| {
+                        world.resource_scope(|world, mut events: Mut<GameEventBus>| {
+                            world.resource_scope(|_world, mut runtime: Mut<crate::game_runtime::RuntimeState>| {
+                                let result = crate::cutscene::play_cutscene(&mut manager, &mut events, &mut runtime, &req.name);
+                                let _ = tx.send(result);
+                            });
+                        });
+                    });
+                });
+            }
+            ApiCommand::StopCutscene(tx) => {
+                commands.queue(move |world: &mut World| {
+                    world.resource_scope(|world, mut manager: Mut<crate::cutscene::CutsceneManager>| {
+                        world.resource_scope(|world, mut events: Mut<GameEventBus>| {
+                            world.resource_scope(|_world, mut runtime: Mut<crate::game_runtime::RuntimeState>| {
+                                crate::cutscene::stop_cutscene(&mut manager, &mut events, &mut runtime);
+                            });
+                        });
+                    });
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::GetCutsceneState(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let manager = world.get_resource::<crate::cutscene::CutsceneManager>().cloned().unwrap_or_default();
+                    let resp = CutsceneStateResponse {
+                        playing: manager.active.is_some(),
+                        name: manager.active.as_ref().map(|a| a.name.clone()),
+                        step_index: manager.active.as_ref().map(|a| a.step_index),
+                        total_steps: manager.active.as_ref().and_then(|a| {
+                            manager.definitions.get(&a.name).map(|d| d.steps.len())
+                        }),
+                        defined_cutscenes: manager.definitions.keys().cloned().collect(),
+                    };
+                    let _ = tx.send(resp);
+                });
+            }
+            // ── Spawn Presets ──────────────────────────────────────────
+            ApiCommand::DefinePresets(presets, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut registry) = world.get_resource_mut::<crate::spawn::PresetRegistry>() {
+                        for (name, req) in presets {
+                            registry.presets.insert(name, req);
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::ListPresets(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let presets = world
+                        .get_resource::<crate::spawn::PresetRegistry>()
+                        .map(|r| r.presets.clone())
+                        .unwrap_or_default();
+                    let _ = tx.send(presets);
+                });
+            }
+            // ── Tile Layers ───────────────────────────────────────────
+            ApiCommand::SetTileLayer(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
+                        let expected_len = tilemap.width * tilemap.height;
+                        if req.tiles.len() != expected_len {
+                            let _ = tx.send(Err(format!(
+                                "Layer tiles length {} doesn't match tilemap {}x{} (expected {})",
+                                req.tiles.len(), tilemap.width, tilemap.height, expected_len
+                            )));
+                            return;
+                        }
+                        // Update existing or add new
+                        if let Some(layer) = tilemap.extra_layers.iter_mut().find(|l| l.name == req.name) {
+                            layer.tiles = req.tiles;
+                            layer.z_offset = req.z_offset;
+                        } else {
+                            tilemap.extra_layers.push(crate::tilemap::TileLayer {
+                                name: req.name,
+                                tiles: req.tiles,
+                                z_offset: req.z_offset,
+                            });
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::GetTileLayers(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let layers = world.get_resource::<Tilemap>()
+                        .map(|tm| tm.extra_layers.iter().map(|l| TileLayerInfo {
+                            name: l.name.clone(),
+                            z_offset: l.z_offset,
+                            tile_count: l.tiles.iter().filter(|&&t| t != 0).count(),
+                        }).collect())
+                        .unwrap_or_default();
+                    let _ = tx.send(TileLayersResponse { layers });
+                });
+            }
+            ApiCommand::DeleteTileLayer(name, tx) => {
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
+                        let before = tilemap.extra_layers.len();
+                        tilemap.extra_layers.retain(|l| l.name != name);
+                        if tilemap.extra_layers.len() == before {
+                            let _ = tx.send(Err(format!("Layer '{}' not found", name)));
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            // ── Entity Pool ──────────────────────────────────────────
+            ApiCommand::InitPool(req, tx) => {
+                let mut template = crate::spawn::preset_to_request_with_registry(
+                    &req.preset, 0.0, 0.0, Some(&preset_registry),
+                );
+                if let Err(e) = crate::spawn::apply_preset_config(&mut template, &req.config) {
+                    commands.queue(move |_world: &mut World| {
+                        let _ = tx.send(Err(e));
+                    });
+                    continue;
+                }
+                let pool_name = req.pool_name.clone();
+                let count = req.count;
+                commands.queue(move |world: &mut World| {
+                    let mut pool = world.resource_mut::<crate::spawn::EntityPool>();
+                    pool.pools.entry(pool_name.clone()).or_insert_with(|| {
+                        crate::spawn::PoolBucket {
+                            template: template.clone(),
+                            available: Vec::new(),
+                            active_count: 0,
+                        }
+                    }).template = template.clone();
+                    drop(pool);
+                    // Pre-spawn hidden entities using Commands pattern
+                    for _ in 0..count {
+                        let mut spawn_req = template.clone();
+                        spawn_req.x = 0.0;
+                        spawn_req.y = -10000.0;
+                        let mut next_id = world.resource_mut::<NextNetworkId>();
+                        let nid = next_id.0;
+                        next_id.0 += 1;
+                        let entity = world.spawn((
+                            crate::components::GamePosition { x: 0.0, y: -10000.0 },
+                            crate::components::NetworkId(crate::components::NetworkId(nid).0),
+                            crate::components::Alive(false),
+                            crate::components::Pooled { pool_name: pool_name.clone() },
+                        )).id();
+                        world.resource_mut::<crate::spawn::EntityPool>()
+                            .pools.get_mut(&pool_name)
+                            .unwrap()
+                            .available.push(entity);
+                    }
+                    let _ = tx.send(Ok(()));
+                });
+            }
+            ApiCommand::AcquireFromPool(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let entity = {
+                        let mut pool = world.resource_mut::<crate::spawn::EntityPool>();
+                        pool.acquire(&req.pool_name)
+                    };
+                    match entity {
+                        Some(entity) => {
+                            if let Some(mut pos) = world.get_mut::<crate::components::GamePosition>(entity) {
+                                pos.x = req.x;
+                                pos.y = req.y;
+                            }
+                            if let Some(mut alive) = world.get_mut::<crate::components::Alive>(entity) {
+                                alive.0 = true;
+                            }
+                            if let Some(mut vis) = world.get_mut::<Visibility>(entity) {
+                                *vis = Visibility::Inherited;
+                            }
+                            let nid = world.get::<crate::components::NetworkId>(entity)
+                                .map(|n| n.0).unwrap_or(0);
+                            let _ = tx.send(Ok(nid));
+                        }
+                        None => {
+                            let _ = tx.send(Err(format!("Pool '{}' is empty", req.pool_name)));
+                        }
+                    }
+                });
+            }
+            ApiCommand::ReleaseToPool(entity_nid, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let entity = find_entity_by_network_id(world, entity_nid);
+                    match entity {
+                        Some(entity) => {
+                            let pool_name = world.get::<crate::components::Pooled>(entity)
+                                .map(|p| p.pool_name.clone());
+                            match pool_name {
+                                Some(name) => {
+                                    if let Some(mut pos) = world.get_mut::<crate::components::GamePosition>(entity) {
+                                        pos.x = 0.0;
+                                        pos.y = -10000.0;
+                                    }
+                                    if let Some(mut alive) = world.get_mut::<crate::components::Alive>(entity) {
+                                        alive.0 = false;
+                                    }
+                                    if let Some(mut vis) = world.get_mut::<Visibility>(entity) {
+                                        *vis = Visibility::Hidden;
+                                    }
+                                    world.resource_mut::<crate::spawn::EntityPool>().release(&name, entity);
+                                    let _ = tx.send(Ok(()));
+                                }
+                                None => {
+                                    let _ = tx.send(Err("Entity is not pooled".to_string()));
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = tx.send(Err(format!("Entity {} not found", entity_nid)));
+                        }
+                    }
+                });
+            }
+            ApiCommand::GetPoolStatus(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let pool = world.resource::<crate::spawn::EntityPool>();
+                    let pools = pool.pools.iter().map(|(name, bucket)| PoolInfo {
+                        name: name.clone(),
+                        available: bucket.available.len(),
+                        active: bucket.active_count,
+                    }).collect();
+                    let _ = tx.send(PoolStatusResponse { pools });
+                });
+            }
+            // ── Telemetry ──────────────────────────────────────────────
+            ApiCommand::GetTelemetry(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let telemetry = world.resource::<GameplayTelemetry>();
+                    let _ = tx.send(telemetry.clone());
+                });
+            }
+            ApiCommand::ResetTelemetry(tx) => {
+                commands.queue(move |world: &mut World| {
+                    *world.resource_mut::<GameplayTelemetry>() = GameplayTelemetry::default();
+                    let _ = tx.send(());
+                });
+            }
+            // ── World Simulation ───────────────────────────────────────
+            ApiCommand::SimulateWorld(req, tx) => {
+                let record_interval = req.record_interval.unwrap_or(10).max(1);
+                let frames = req.frames.min(3600);
+                let inputs = req.inputs.clone();
+                let real = req.real;
+
+                if real {
+                    // Real simulation: piggyback on the actual game loop
+                    commands.queue(move |world: &mut World| {
+                        let saved_runtime_state = world.resource::<crate::game_runtime::RuntimeState>().state.clone();
+
+                        let mut pending = world.resource_mut::<crate::simulation::PendingRealSim>();
+                        if pending.active.is_some() {
+                            let _ = tx.send(Err("A real simulation is already running".to_string()));
+                            return;
+                        }
+                        pending.active = Some(crate::simulation::ActiveRealSim {
+                            saved_state: SaveGameData {
+                                version: 4,
+                                config: GameConfig::default(),
+                                tilemap: crate::tilemap::Tilemap::default(),
+                                game_state: saved_runtime_state.clone(),
+                                next_network_id: 1,
+                                entities: vec![],
+                                scripts: std::collections::HashMap::new(),
+                                global_scripts: vec![],
+                                game_vars: std::collections::HashMap::new(),
+                                animation_graphs: std::collections::HashMap::new(),
+                                sprite_sheets: std::collections::HashMap::new(),
+                                particle_presets: std::collections::HashMap::new(),
+                            },
+                            frames_remaining: frames,
+                            frames_total: frames,
+                            inputs,
+                            record_interval,
+                            snapshots: Vec::new(),
+                            sender: Some(tx),
+                            saved_runtime_state,
+                        });
+                    });
+                } else {
+                    // Deterministic simulation (existing behavior)
+                    commands.queue(move |world: &mut World| {
+                        let tilemap = world.resource::<Tilemap>().clone();
+                        let config = world.resource::<GameConfig>().clone();
+
+                        let sim_req = crate::simulation::SimulationRequest {
+                            tilemap: None,
+                            inputs,
+                            max_frames: frames,
+                            record_interval,
+                            physics: None,
+                            goal_position: None,
+                            goal_radius: None,
+                            initial_game_state: Some("Playing".to_string()),
+                            state_transitions: vec![],
+                            moving_platforms: vec![],
+                            entities: vec![],
+                        };
+
+                        let result = crate::simulation::run_simulation(&tilemap, &config, &sim_req);
+
+                        let snapshots: Vec<WorldSimSnapshot> = result.trace.iter().map(|t| {
+                            WorldSimSnapshot {
+                                frame: t.frame,
+                                entities: vec![EntityInfo {
+                                    id: 1,
+                                    network_id: Some(1),
+                                    x: t.x,
+                                    y: t.y,
+                                    vx: t.vx,
+                                    vy: t.vy,
+                                    components: vec![],
+                                    script: None,
+                                    tags: vec![],
+                                    health: None,
+                                    max_health: None,
+                                    alive: Some(true),
+                                    ai_behavior: None,
+                                    ai_state: None,
+                                    ai_target_id: None,
+                                    path_target: None,
+                                    path_len: None,
+                                    animation_graph: None,
+                                    animation_state: None,
+                                    animation_frame: None,
+                                    animation_facing_right: None,
+                                    render_layer: None,
+                                    collision_layer: None,
+                                    collision_mask: None,
+                                    machine_state: None,
+                                    inventory_slots: None,
+                                }],
+                                vars: serde_json::json!({}),
+                            }
+                        }).collect();
+
+                        let events: Vec<crate::events::GameEvent> = result.events.iter().map(|e| {
+                            crate::events::GameEvent {
+                                name: e.event_type.clone(),
+                                data: serde_json::json!({
+                                    "x": e.x,
+                                    "y": e.y,
+                                }),
+                                frame: e.frame as u64,
+                                source_entity: None,
+                            }
+                        }).collect();
+
+                        let _ = tx.send(Ok(WorldSimResult {
+                            frames_run: result.frames_elapsed,
+                            snapshots,
+                            events,
+                            script_errors: vec![],
+                            final_vars: serde_json::json!({}),
+                        }));
+                    });
+                }
+            }
+            // ── Scenario Testing ───────────────────────────────────────
+            ApiCommand::RunScenario(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    // Apply setup steps
+                    for step in &req.setup {
+                        match step.action.as_str() {
+                            "set_var" => {
+                                if let (Some(name), Some(value)) = (
+                                    step.params.get("name").and_then(|v| v.as_str()),
+                                    step.params.get("value"),
+                                ) {
+                                    let mut engine = world.resource_mut::<ScriptEngine>();
+                                    let mut vars = std::collections::HashMap::new();
+                                    vars.insert(name.to_string(), value.clone());
+                                    crate::scripting::ScriptBackend::set_vars(
+                                        engine.as_mut(),
+                                        vars,
+                                    );
+                                }
+                            }
+                            "teleport_player" => {
+                                let x = step.params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                let y = step.params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                let mut pq = world.query_filtered::<&mut GamePosition, With<crate::components::Player>>();
+                                for mut pos in pq.iter_mut(world) {
+                                    pos.x = x;
+                                    pos.y = y;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Run simulation frames
+                    let tilemap = world.resource::<Tilemap>().clone();
+                    let config = world.resource::<GameConfig>().clone();
+                    let sim_req = crate::simulation::SimulationRequest {
+                        tilemap: None,
+                        inputs: req.inputs.clone(),
+                        max_frames: req.frames.min(3600),
+                        record_interval: req.frames.max(1),
+                        physics: None,
+                        goal_position: None,
+                        goal_radius: None,
+                        initial_game_state: None,
+                        state_transitions: vec![],
+                        moving_platforms: vec![],
+                        entities: vec![],
+                    };
+                    let result = crate::simulation::run_simulation(&tilemap, &config, &sim_req);
+
+                    // Check assertions
+                    let engine = world.resource::<ScriptEngine>();
+                    let vars_snapshot = engine.snapshot();
+                    let final_vars = serde_json::to_value(&vars_snapshot.vars).unwrap_or_default();
+
+                    let mut assertions = Vec::new();
+                    let mut all_passed = true;
+                    for assertion in &req.assertions {
+                        let (passed, actual) = match assertion.check.as_str() {
+                            "player_alive" => {
+                                let expected = assertion.expected.as_bool().unwrap_or(true);
+                                let alive = result.entity_states.first().map(|s| s.alive).unwrap_or(false);
+                                (alive == expected, serde_json::json!(alive))
+                            }
+                            "var_equals" => {
+                                let var_name = assertion.expected.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let expected_val = assertion.expected.get("value").cloned().unwrap_or_default();
+                                let actual_val = vars_snapshot.vars.get(var_name).cloned().unwrap_or_default();
+                                (actual_val == expected_val, actual_val)
+                            }
+                            "event_fired" => {
+                                let event_name = assertion.expected.as_str().unwrap_or("");
+                                let fired = result.events.iter().any(|e| e.event_type == event_name);
+                                (fired, serde_json::json!(fired))
+                            }
+                            "outcome" => {
+                                let expected = assertion.expected.as_str().unwrap_or("");
+                                (result.outcome == expected, serde_json::json!(result.outcome))
+                            }
+                            _ => (false, serde_json::json!("unknown assertion")),
+                        };
+                        if !passed {
+                            all_passed = false;
+                        }
+                        assertions.push(AssertionResult {
+                            check: assertion.check.clone(),
+                            passed,
+                            expected: assertion.expected.clone(),
+                            actual,
+                        });
+                    }
+
+                    let events = result.events.iter().map(|e| crate::events::GameEvent {
+                        name: e.event_type.clone(),
+                        data: serde_json::json!({"x": e.x, "y": e.y}),
+                        frame: e.frame as u64,
+                        source_entity: None,
+                    }).collect();
+
+                    let _ = tx.send(Ok(ScenarioResult {
+                        passed: all_passed,
+                        assertions,
+                        frames_run: result.frames_elapsed,
+                        events,
+                        final_vars,
+                    }));
+                });
+            }
+            // ── Atomic Build ───────────────────────────────────────────
+            ApiCommand::AtomicBuild(req, tx) => {
+                let build_req = *req;
+
+                // Optionally validate first
+                if let Some(ref constraints) = build_req.validate_first {
+                    if !constraints.is_empty() {
+                        if let Some(ref tm) = build_req.tilemap {
+                            let val_tilemap = Tilemap {
+                                width: tm.width,
+                                height: tm.height,
+                                tiles: tm.tiles.clone(),
+                                player_spawn: tm.player_spawn.unwrap_or((16.0, 16.0)),
+                                goal: tm.goal,
+                                ..Default::default()
+                            };
+                            let val_config = build_req.config.as_ref().cloned().unwrap_or(physics.clone());
+                            let validate_result = crate::constraints::validate(
+                                &val_tilemap,
+                                &val_config,
+                                constraints,
+                                &[],
+                            );
+                            if !validate_result.valid {
+                                let _ = tx.send(Ok(BuildResult {
+                                    success: false,
+                                    import_result: None,
+                                    validation: Some(validate_result),
+                                    errors: vec!["Validation failed".to_string()],
+                                }));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let config = build_req.config.unwrap_or_else(|| physics.clone());
+                let tm = build_req.tilemap.unwrap_or_else(|| SetLevelRequest {
+                    width: tilemap.width,
+                    height: tilemap.height,
+                    tiles: tilemap.tiles.clone(),
+                    player_spawn: Some(tilemap.player_spawn),
+                    goal: tilemap.goal,
+                });
+
+                let mut save_entities = Vec::new();
+                let mut entity_count = 0usize;
+                for spawn_req in &build_req.entities {
+                    entity_count += 1;
+                    save_entities.push(SaveEntity {
+                        network_id: None,
+                        x: spawn_req.x,
+                        y: spawn_req.y,
+                        vx: 0.0,
+                        vy: 0.0,
+                        is_player: spawn_req.is_player,
+                        components: spawn_req.components.clone(),
+                        script: spawn_req.script.clone(),
+                        script_state: None,
+                        tags: spawn_req.tags.clone(),
+                        alive: true,
+                        ai_state: None,
+                        invincibility_frames: None,
+                        path_follower_path: vec![],
+                        path_follower_frames_until_recalc: None,
+                        inventory_slots: vec![],
+                    });
+                }
+
+                let scripts_count = build_req.scripts.len();
+                let ag_count = build_req.animation_graphs.as_ref().map_or(0, |g| g.len());
+                let ss_count = build_req.sprite_sheets.as_ref().map_or(0, |s| s.len());
+                let presets_to_register = build_req.presets;
+
+                let save = SaveGameData {
+                    version: 4,
+                    config,
+                    tilemap: Tilemap {
+                        width: tm.width,
+                        height: tm.height,
+                        tiles: tm.tiles.clone(),
+                        player_spawn: tm.player_spawn.unwrap_or((16.0, 16.0)),
+                        goal: tm.goal,
+                        ..Default::default()
+                    },
+                    game_state: "Playing".to_string(),
+                    next_network_id: 1,
+                    entities: save_entities,
+                    scripts: build_req.scripts,
+                    global_scripts: build_req.global_scripts,
+                    game_vars: build_req.game_vars.unwrap_or_default(),
+                    animation_graphs: build_req.animation_graphs.unwrap_or_default(),
+                    sprite_sheets: build_req.sprite_sheets.unwrap_or_default(),
+                    particle_presets: std::collections::HashMap::new(),
+                };
+
+                apply_loaded_save_data(
+                    save,
+                    &mut pending_level,
+                    &mut pending_physics,
+                    &mut script_engine,
+                    &mut next_network_id,
+                    &mut commands,
+                    &entity_query,
+                );
+
+                // Register presets after load
+                if let Some(presets) = presets_to_register {
+                    commands.queue(move |world: &mut World| {
+                        let mut preset_reg = world.resource_mut::<crate::spawn::PresetRegistry>();
+                        for (name, req) in presets {
+                            preset_reg.presets.insert(name, req);
+                        }
+                    });
+                }
+
+                let import_result = ImportResult {
+                    entities_spawned: entity_count,
+                    scripts_loaded: scripts_count,
+                    scripts_failed: vec![],
+                    config_applied: true,
+                    tilemap_applied: true,
+                    animation_graphs: ag_count,
+                    sprite_sheets: ss_count,
+                    warnings: vec![],
+                };
+
+                let _ = tx.send(Ok(BuildResult {
+                    success: true,
+                    import_result: Some(import_result),
+                    validation: None,
+                    errors: vec![],
+                }));
+            }
+            // ── Asset Pipeline ─────────────────────────────────────────
+            ApiCommand::UploadAsset(req, tx) => {
+                let name = req.name.trim().to_string();
+                if name.is_empty() {
+                    let _ = tx.send(Err("Asset name cannot be empty".into()));
+                    continue;
+                }
+                let data = match base64_decode(&req.data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Invalid base64 data: {e}")));
+                        continue;
+                    }
+                };
+                let assets_dir = std::env::var("AXIOM_ASSETS_DIR").unwrap_or_else(|_| "assets".to_string());
+                let dir_path = std::path::Path::new(&assets_dir);
+                let _ = std::fs::create_dir_all(dir_path);
+                let file_name = if name.ends_with(".png") { name.clone() } else { format!("{name}.png") };
+                let file_path = dir_path.join(&file_name);
+                if let Err(e) = std::fs::write(&file_path, &data) {
+                    let _ = tx.send(Err(format!("Failed to write asset: {e}")));
+                    continue;
+                }
+                let size_bytes = data.len() as u64;
+                let dims = image::image_dimensions(&file_path).ok();
+                let _ = tx.send(Ok(AssetInfo {
+                    name: file_name,
+                    path: file_path.to_string_lossy().to_string(),
+                    size_bytes,
+                    width: dims.map(|(w, _)| w),
+                    height: dims.map(|(_, h)| h),
+                }));
+            }
+            ApiCommand::GenerateAsset(req, tx) => {
+                let name = req.name.trim().to_string();
+                if name.is_empty() {
+                    let _ = tx.send(Err("Asset name cannot be empty".into()));
+                    continue;
+                }
+                let w = req.width.clamp(1, 512);
+                let h = req.height.clamp(1, 512);
+                let [r, g, b] = req.color;
+                let mut img = image::RgbaImage::new(w, h);
+                for pixel in img.pixels_mut() {
+                    *pixel = image::Rgba([r, g, b, 255]);
+                }
+                // Draw simple text label if provided (just a centered block for now)
+                if let Some(ref label) = req.label {
+                    if !label.is_empty() {
+                        let text_y = h / 2;
+                        let text_w = (label.len() as u32 * 4).min(w);
+                        let start_x = (w - text_w) / 2;
+                        for x in start_x..(start_x + text_w).min(w) {
+                            for dy in 0..4u32 {
+                                let y = text_y.saturating_sub(2) + dy;
+                                if y < h {
+                                    let inv_r = 255u8.wrapping_sub(r);
+                                    let inv_g = 255u8.wrapping_sub(g);
+                                    let inv_b = 255u8.wrapping_sub(b);
+                                    img.put_pixel(x, y, image::Rgba([inv_r, inv_g, inv_b, 255]));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let assets_dir = std::env::var("AXIOM_ASSETS_DIR").unwrap_or_else(|_| "assets".to_string());
+                let dir_path = std::path::Path::new(&assets_dir);
+                let _ = std::fs::create_dir_all(dir_path);
+                let file_name = if name.ends_with(".png") { name.clone() } else { format!("{name}.png") };
+                let file_path = dir_path.join(&file_name);
+                if let Err(e) = img.save(&file_path) {
+                    let _ = tx.send(Err(format!("Failed to save generated asset: {e}")));
+                    continue;
+                }
+                let size_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                let _ = tx.send(Ok(AssetInfo {
+                    name: file_name,
+                    path: file_path.to_string_lossy().to_string(),
+                    size_bytes,
+                    width: Some(w),
+                    height: Some(h),
+                }));
+            }
+            ApiCommand::ListAssets(tx) => {
+                let assets_dir = std::env::var("AXIOM_ASSETS_DIR").unwrap_or_else(|_| "assets".to_string());
+                let dir_path = std::path::Path::new(&assets_dir);
+                let mut assets = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(dir_path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()).map_or(false, |e| {
+                            matches!(e.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif")
+                        }) {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            let dims = image::image_dimensions(&path).ok();
+                            assets.push(AssetInfo {
+                                name,
+                                path: path.to_string_lossy().to_string(),
+                                size_bytes,
+                                width: dims.map(|(w, _)| w),
+                                height: dims.map(|(_, h)| h),
+                            });
+                        }
+                    }
+                }
+                let _ = tx.send(assets);
+            }
+            // ── Playtest ─────────────────────────────────────────────────
+            ApiCommand::RunPlaytest(req, tx) => {
+                let frames = req.frames.min(3600);
+                let goal_str = req.goal.clone().unwrap_or_else(|| "survive".to_string());
+                let mode_str = req.mode.clone();
+
+                commands.queue(move |world: &mut World| {
+                    let saved_runtime_state = world.resource::<crate::game_runtime::RuntimeState>().state.clone();
+
+                    // Auto-detect mode from gravity
+                    let config = world.resource::<GameConfig>();
+                    let mode = match mode_str.as_deref() {
+                        Some("platformer") => crate::simulation::PlaytestMode::Platformer,
+                        Some("top_down") => crate::simulation::PlaytestMode::TopDown,
+                        _ => {
+                            if config.gravity_magnitude() > 0.1 {
+                                crate::simulation::PlaytestMode::Platformer
+                            } else {
+                                crate::simulation::PlaytestMode::TopDown
+                            }
+                        }
+                    };
+
+                    let goal = match goal_str.as_str() {
+                        "reach_goal" => crate::simulation::PlaytestGoal::ReachGoal,
+                        "explore" => crate::simulation::PlaytestGoal::Explore,
+                        _ => crate::simulation::PlaytestGoal::Survive,
+                    };
+
+                    // Get player initial state
+                    let (px, py, initial_health) = {
+                        let mut pq = world.query::<(
+                            &GamePosition,
+                            Option<&crate::components::Health>,
+                            &crate::components::Player,
+                        )>();
+                        pq.iter(world)
+                            .next()
+                            .map(|(pos, h, _)| (pos.x, pos.y, h.map_or(10.0, |h| h.current)))
+                            .unwrap_or((0.0, 0.0, 10.0))
+                    };
+
+                    let mut pending = world.resource_mut::<crate::simulation::PendingPlaytest>();
+                    if pending.active.is_some() {
+                        let _ = tx.send(Err("A playtest is already running".to_string()));
+                        return;
+                    }
+                    pending.active = Some(crate::simulation::ActivePlaytest {
+                        saved_runtime_state,
+                        frames_remaining: frames,
+                        frames_total: frames,
+                        mode,
+                        goal,
+                        sender: Some(tx),
+                        prev_x: px,
+                        prev_y: py,
+                        stuck_frames: 0,
+                        last_jump_frame: 0,
+                        direction: 1,
+                        explore_phase: 0,
+                        visited_cells: std::collections::HashSet::new(),
+                        events: Vec::new(),
+                        total_damage: 0.0,
+                        deaths: Vec::new(),
+                        input_counts: std::collections::HashMap::new(),
+                        distance_traveled: 0.0,
+                        initial_health,
+                    });
+                });
+            }
         }
     }
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    // Simple base64 decoder
+    use std::io::Read;
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let table: [u8; 256] = {
+        let mut t = [255u8; 256];
+        for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+            t[*c as usize] = i as u8;
+        }
+        t[b'=' as usize] = 0;
+        t
+    };
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let a = table[bytes[i] as usize];
+        let b = table[bytes[i + 1] as usize];
+        let c = table[bytes[i + 2] as usize];
+        let d = table[bytes[i + 3] as usize];
+        if a == 255 || b == 255 {
+            return Err("Invalid base64 character".to_string());
+        }
+        out.push((a << 2) | (b >> 4));
+        if bytes[i + 2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if bytes[i + 3] != b'=' {
+            out.push((c << 6) | d);
+        }
+        i += 4;
+    }
+    let _ = out.as_slice().read(&mut []);
+    Ok(out)
+}
+
+fn apply_tint_to_entity(world: &mut World, entity_id: u64, req: TintRequest) -> Result<(), String> {
+    let entity = find_entity_by_network_id(world, entity_id)
+        .ok_or_else(|| format!("Entity {} not found", entity_id))?;
+    let tint = crate::components::SpriteColorTint {
+        color: req.color,
+        flash_color: req.flash_color,
+        flash_frames: req.flash_frames,
+    };
+    world.entity_mut(entity).insert(tint);
+    Ok(())
+}
+
+fn apply_trail_to_entity(world: &mut World, entity_id: u64, req: Option<TrailRequest>) -> Result<(), String> {
+    let entity = find_entity_by_network_id(world, entity_id)
+        .ok_or_else(|| format!("Entity {} not found", entity_id))?;
+    match req {
+        Some(r) => {
+            world.entity_mut(entity).insert(crate::trail::TrailEffect {
+                interval: r.interval,
+                duration: r.duration,
+                alpha_start: r.alpha_start,
+                alpha_end: r.alpha_end,
+                frame_counter: 0,
+            });
+        }
+        None => {
+            world.entity_mut(entity).remove::<crate::trail::TrailEffect>();
+        }
+    }
+    Ok(())
+}
+
+fn spawn_world_text_command(world: &mut World, req: WorldTextRequest) -> Result<u64, String> {
+    let text_id = {
+        let mut counter = world.resource_mut::<crate::world_text::WorldTextIdCounter>();
+        let id = counter.0;
+        counter.0 += 1;
+        id
+    };
+    let z = if req.owner_id.is_some() { 10.5 } else { 10.0 + (-req.y * 0.001) + 0.5 };
+    world.spawn((
+        crate::world_text::WorldText {
+            text_id,
+            text: req.text,
+            font_size: req.font_size,
+            color: req.color,
+            offset: Vec2::new(0.0, 0.0),
+            owner_entity: req.owner_id,
+            duration: req.duration,
+            elapsed: 0.0,
+            fade: req.fade,
+            rise_speed: req.rise_speed,
+        },
+        Transform::from_xyz(req.x, req.y, z),
+    ));
+    Ok(text_id)
+}
+
+fn get_entity_state_machine(world: &mut World, entity_id: u64) -> Option<StateMachineResponse> {
+    let entity = find_entity_by_network_id(world, entity_id)?;
+    let sm = world.get::<crate::state_machine::EntityStateMachine>(entity)?;
+    Some(StateMachineResponse {
+        current: sm.current.clone(),
+        previous: sm.previous.clone(),
+        entered_at_frame: sm.entered_at_frame,
+        states: sm.states.keys().cloned().collect(),
+    })
+}
+
+fn transition_entity_state(world: &mut World, entity_id: u64, new_state: String) -> Result<(), String> {
+    let entity = find_entity_by_network_id(world, entity_id)
+        .ok_or_else(|| format!("Entity {} not found", entity_id))?;
+    let frame = world.get_resource::<crate::scripting::vm::ScriptFrame>().map(|f| f.frame).unwrap_or(0);
+    // Need to get the state machine and event bus
+    let sm = world.get_mut::<crate::state_machine::EntityStateMachine>(entity)
+        .ok_or_else(|| format!("Entity {} has no state machine", entity_id))?;
+    // Clone to avoid borrow issues
+    let mut sm_clone = sm.clone();
+    let result = {
+        let mut events = world.resource_mut::<GameEventBus>();
+        sm_clone.transition(&new_state, entity_id, frame, &mut events)
+    };
+    if result.is_ok() {
+        if let Some(mut sm) = world.get_mut::<crate::state_machine::EntityStateMachine>(entity) {
+            *sm = sm_clone;
+        }
+    }
+    result
+}
+
+fn get_entity_inventory(world: &mut World, entity_id: u64) -> Option<InventoryResponse> {
+    let entity = find_entity_by_network_id(world, entity_id)?;
+    let inv = world.get::<crate::inventory::Inventory>(entity)?;
+    Some(InventoryResponse {
+        slots: inv.slots.clone(),
+        max_slots: inv.max_slots,
+    })
+}
+
+fn entity_inventory_action(world: &mut World, entity_id: u64, req: InventoryActionRequest) -> Result<(), String> {
+    let entity = find_entity_by_network_id(world, entity_id)
+        .ok_or_else(|| format!("Entity {} not found", entity_id))?;
+
+    match req.action.as_str() {
+        "add" => {
+            let item_id = req.item_id.ok_or("item_id required for add")?;
+            let registry = world.get_resource::<crate::inventory::ItemRegistry>().cloned().unwrap_or_default();
+            let nid = entity_id;
+            let mut inv = world.get_mut::<crate::inventory::Inventory>(entity)
+                .ok_or_else(|| format!("Entity {} has no inventory", entity_id))?;
+            let added = inv.add_item(&item_id, req.count, &registry);
+            let new_total = inv.count_item(&item_id);
+            drop(inv);
+            let mut events = world.resource_mut::<GameEventBus>();
+            events.emit("item_added", serde_json::json!({
+                "entity": nid, "item_id": item_id, "count": added, "new_total": new_total
+            }), Some(nid));
+            Ok(())
+        }
+        "remove" => {
+            let item_id = req.item_id.ok_or("item_id required for remove")?;
+            let nid = entity_id;
+            let mut inv = world.get_mut::<crate::inventory::Inventory>(entity)
+                .ok_or_else(|| format!("Entity {} has no inventory", entity_id))?;
+            let removed = inv.remove_item(&item_id, req.count);
+            let new_total = inv.count_item(&item_id);
+            drop(inv);
+            let mut events = world.resource_mut::<GameEventBus>();
+            events.emit("item_removed", serde_json::json!({
+                "entity": nid, "item_id": item_id, "count": removed, "new_total": new_total
+            }), Some(nid));
+            Ok(())
+        }
+        "clear" => {
+            let mut inv = world.get_mut::<crate::inventory::Inventory>(entity)
+                .ok_or_else(|| format!("Entity {} has no inventory", entity_id))?;
+            inv.clear();
+            Ok(())
+        }
+        _ => Err(format!("Unknown inventory action: {}", req.action)),
+    }
+}
+
+fn find_entity_by_network_id(world: &mut World, network_id: u64) -> Option<Entity> {
+    let mut query = world.query::<(Entity, &NetworkId)>();
+    query.iter(world).find(|(_, nid)| nid.0 == network_id).map(|(e, _)| e)
 }
 
 #[derive(Default)]
@@ -1519,6 +2707,10 @@ struct EntityInfoExtras {
     animation_frame: Option<usize>,
     animation_facing_right: Option<bool>,
     render_layer: Option<i32>,
+    collision_layer: Option<u16>,
+    collision_mask: Option<u16>,
+    machine_state: Option<String>,
+    inventory_slots: Option<usize>,
 }
 
 struct EntityInfoSource<'a> {
@@ -1634,6 +2826,10 @@ fn build_entity_info(source: EntityInfoSource<'_>, extras: EntityInfoExtras) -> 
         animation_frame: extras.animation_frame,
         animation_facing_right: extras.animation_facing_right,
         render_layer: extras.render_layer,
+        collision_layer: extras.collision_layer,
+        collision_mask: extras.collision_mask,
+        machine_state: extras.machine_state,
+        inventory_slots: extras.inventory_slots,
     }
 }
 
@@ -1822,6 +3018,8 @@ mod tests {
             .insert_resource(crate::animation::AnimationLibrary::default())
             .insert_resource(crate::sprites::SpriteSheetRegistry::default())
             .insert_resource(crate::particles::ParticlePresetLibrary::default())
+            .insert_resource(crate::spawn::PresetRegistry::default())
+            .insert_resource(crate::spawn::EntityPool::default())
             .add_systems(Update, process_api_commands);
         app
     }

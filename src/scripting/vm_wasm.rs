@@ -2906,6 +2906,7 @@ fn __axiom_entity_entry() {
             tiles,
             player_spawn: (8.0, 8.0),
             goal: None,
+            ..Default::default()
         };
         let config = GameConfig::default();
         let entities = Arc::new(Vec::new());

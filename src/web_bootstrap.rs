@@ -1200,6 +1200,7 @@ mod tests {
             tiles: vec![0u8; 12],
             player_spawn: (8.0, 8.0),
             goal: Some((2, 1)),
+            ..Default::default()
         };
         let src_cfg = GameConfig {
             move_speed: 321.0,

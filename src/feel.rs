@@ -59,6 +59,7 @@ pub fn measure_jump(_tilemap: &Tilemap, physics: &GameConfig) -> JumpProfile {
         tiles,
         player_spawn: (5.0 * ts + ts / 2.0, ts + ts / 2.0 + 1.0),
         goal: None,
+        ..Default::default()
     };
 
     // Full jump: hold jump for entire duration
@@ -84,6 +85,7 @@ pub fn measure_jump(_tilemap: &Tilemap, physics: &GameConfig) -> JumpProfile {
         initial_game_state: None,
         state_transitions: Vec::new(),
         moving_platforms: Vec::new(),
+        entities: Vec::new(),
     };
     let result = simulation::run_simulation(&measure_map, physics, &req);
 
@@ -162,6 +164,7 @@ pub fn measure_jump(_tilemap: &Tilemap, physics: &GameConfig) -> JumpProfile {
         initial_game_state: None,
         state_transitions: Vec::new(),
         moving_platforms: Vec::new(),
+        entities: Vec::new(),
     };
     let short_result = simulation::run_simulation(&measure_map, physics, &short_req);
     let short_max_y = short_result

@@ -1,5 +1,5 @@
 use crate::components::HeadlessMode;
-use crate::components::{Collider, GamePosition, PathFollower, TriggerZone};
+use crate::components::{Collider, CollisionLayer, GamePosition, Hitbox, PathFollower, TriggerZone};
 use crate::perf::PerfStats;
 use crate::spatial_hash::SpatialHash;
 use bevy::gizmos::config::GizmoConfigStore;
@@ -101,9 +101,10 @@ fn update_debug_overlay_text(
 fn draw_debug_overlay(
     config: Res<DebugOverlayConfig>,
     mut gizmos: Gizmos,
-    colliders: Query<(&GamePosition, &Collider)>,
+    colliders: Query<(&GamePosition, &Collider, Option<&CollisionLayer>)>,
     triggers: Query<(&GamePosition, &TriggerZone)>,
     paths: Query<(&GamePosition, &PathFollower)>,
+    hitboxes: Query<(&GamePosition, &Hitbox)>,
     spatial: Option<Res<SpatialHash>>,
 ) {
     if !config.show {
@@ -115,13 +116,21 @@ fn draw_debug_overlay(
     let show_triggers = show_all || config.features.contains("triggers");
     let show_paths = show_all || config.features.contains("paths");
     let show_spatial_hash = show_all || config.features.contains("spatial_hash");
+    let show_hitboxes = show_all || config.features.contains("hitboxes");
 
     if show_colliders {
-        for (pos, collider) in colliders.iter() {
+        for (pos, collider, cl) in colliders.iter() {
+            // Tint collider color by collision layer for visual distinction
+            let color = if let Some(cl) = cl {
+                let hue = (cl.layer as f32 * 0.618) % 1.0;
+                Color::hsla(hue * 360.0, 0.8, 0.55, 0.9)
+            } else {
+                Color::srgba(0.15, 1.0, 0.2, 0.9)
+            };
             gizmos.rect_2d(
                 Vec2::new(pos.x, pos.y),
                 Vec2::new(collider.width, collider.height),
-                Color::srgba(0.15, 1.0, 0.2, 0.9),
+                color,
             );
         }
     }
@@ -132,6 +141,21 @@ fn draw_debug_overlay(
                 Vec2::new(pos.x, pos.y),
                 trigger.radius,
                 Color::srgba(0.25, 0.55, 1.0, 0.85),
+            );
+        }
+    }
+
+    if show_hitboxes {
+        for (pos, hitbox) in hitboxes.iter() {
+            let color = if hitbox.active {
+                Color::srgba(1.0, 0.2, 0.15, 0.9)
+            } else {
+                Color::srgba(0.6, 0.3, 0.15, 0.4)
+            };
+            gizmos.rect_2d(
+                Vec2::new(pos.x + hitbox.offset.x, pos.y + hitbox.offset.y),
+                Vec2::new(hitbox.width, hitbox.height),
+                color,
             );
         }
     }

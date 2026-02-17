@@ -127,6 +127,7 @@ pub fn solve(tilemap: &Tilemap, physics: &GameConfig) -> SolveResult {
         initial_game_state: None,
         state_transitions: Vec::new(),
         moving_platforms: Vec::new(),
+        entities: Vec::new(),
     };
     let sim_result = simulation::run_simulation(tilemap, physics, &sim_request);
     if sim_result.outcome == "goal_reached" {
@@ -154,6 +155,7 @@ pub fn solve(tilemap: &Tilemap, physics: &GameConfig) -> SolveResult {
             initial_game_state: None,
             state_transitions: Vec::new(),
             moving_platforms: Vec::new(),
+            entities: Vec::new(),
         };
         let res = simulation::run_simulation(tilemap, physics, &req);
         if res.outcome == "goal_reached" {
@@ -275,6 +277,7 @@ fn solve_top_down(
                 initial_game_state: None,
                 state_transitions: Vec::new(),
                 moving_platforms: Vec::new(),
+                entities: Vec::new(),
             },
         )
     };
@@ -906,6 +909,7 @@ fn brute_force_platformer_pulses(
                         initial_game_state: None,
                         state_transitions: Vec::new(),
                         moving_platforms: Vec::new(),
+                        entities: Vec::new(),
                     },
                 );
                 if sim.outcome == "goal_reached" {
@@ -984,6 +988,7 @@ fn adaptive_input_search(
                 initial_game_state: None,
                 state_transitions: Vec::new(),
                 moving_platforms: Vec::new(),
+                entities: Vec::new(),
             },
         )
     };
@@ -1661,6 +1666,7 @@ mod tests {
             tiles,
             player_spawn: (24.0, 24.0),
             goal: Some((9, 1)),
+            ..Default::default()
         };
         let cfg = GameConfig::default();
         let path = find_platformer_path_points(
@@ -1693,6 +1699,7 @@ mod tests {
             tiles,
             player_spawn: (1.5 * 16.0, 1.5 * 16.0),
             goal: Some((10, 7)),
+            ..Default::default()
         };
         let cfg = GameConfig {
             gravity: Vec2::ZERO,

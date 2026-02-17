@@ -339,6 +339,51 @@ pub fn spawn_entity_with_network_id(
                     radius: *radius,
                 });
             }
+            ComponentDef::CollisionLayer { layer, mask } => {
+                entity.insert(CollisionLayer {
+                    layer: *layer,
+                    mask: *mask,
+                });
+            }
+            ComponentDef::SpriteColorTint {
+                color,
+                flash_color,
+                flash_frames,
+            } => {
+                entity.insert(SpriteColorTint {
+                    color: *color,
+                    flash_color: *flash_color,
+                    flash_frames: *flash_frames,
+                });
+            }
+            ComponentDef::TrailEffect {
+                interval,
+                duration,
+                alpha_start,
+                alpha_end,
+            } => {
+                entity.insert(crate::trail::TrailEffect {
+                    interval: *interval,
+                    duration: *duration,
+                    alpha_start: *alpha_start,
+                    alpha_end: *alpha_end,
+                    frame_counter: 0,
+                });
+            }
+            ComponentDef::StateMachine { states, initial } => {
+                entity.insert(crate::state_machine::EntityStateMachine {
+                    states: states.clone(),
+                    current: initial.clone(),
+                    previous: None,
+                    entered_at_frame: 0,
+                });
+            }
+            ComponentDef::Inventory { max_slots } => {
+                entity.insert(crate::inventory::Inventory {
+                    slots: Vec::new(),
+                    max_slots: *max_slots,
+                });
+            }
         }
     }
 
@@ -1184,6 +1229,59 @@ pub fn preset_to_request(preset: &str, x: f32, y: f32) -> EntitySpawnRequest {
             }],
         },
     }
+}
+
+/// Registry for user-defined entity presets.
+#[derive(Resource, Clone, Default)]
+pub struct PresetRegistry {
+    pub presets: std::collections::HashMap<String, EntitySpawnRequest>,
+}
+
+/// Like `preset_to_request` but checks the user registry first.
+pub fn preset_to_request_with_registry(
+    preset: &str,
+    x: f32,
+    y: f32,
+    registry: Option<&PresetRegistry>,
+) -> EntitySpawnRequest {
+    if let Some(reg) = registry {
+        if let Some(template) = reg.presets.get(preset) {
+            let mut req = template.clone();
+            req.x = x;
+            req.y = y;
+            return req;
+        }
+    }
+    preset_to_request(preset, x, y)
+}
+
+/// Entity pool for recycling entities.
+#[derive(Resource, Clone, Default)]
+pub struct EntityPool {
+    pub pools: std::collections::HashMap<String, PoolBucket>,
+}
+
+impl EntityPool {
+    pub fn acquire(&mut self, pool_name: &str) -> Option<Entity> {
+        let bucket = self.pools.get_mut(pool_name)?;
+        let entity = bucket.available.pop()?;
+        bucket.active_count += 1;
+        Some(entity)
+    }
+
+    pub fn release(&mut self, pool_name: &str, entity: Entity) {
+        if let Some(bucket) = self.pools.get_mut(pool_name) {
+            bucket.active_count = bucket.active_count.saturating_sub(1);
+            bucket.available.push(entity);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PoolBucket {
+    pub template: EntitySpawnRequest,
+    pub available: Vec<Entity>,
+    pub active_count: usize,
 }
 
 #[cfg(test)]
