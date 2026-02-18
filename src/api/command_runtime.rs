@@ -2569,6 +2569,59 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                 let scripts_count = build_req.scripts.len();
                 let ag_count = build_req.animation_graphs.as_ref().map_or(0, |g| g.len());
                 let ss_count = build_req.sprite_sheets.as_ref().map_or(0, |s| s.len());
+
+                // Asset validation warnings
+                let mut build_warnings: Vec<String> = Vec::new();
+                let assets_dir = resolve_assets_dir(config.asset_path.as_deref());
+                let assets_path = std::path::Path::new(&assets_dir);
+
+                // Validate sprite sheet paths
+                if let Some(ref sheets) = build_req.sprite_sheets {
+                    for (name, sheet) in sheets {
+                        let resolved = crate::sprites::resolve_sprite_asset_path(&sheet.path, config.asset_path.as_deref());
+                        let full_path = if std::path::Path::new(&resolved).is_absolute() {
+                            std::path::PathBuf::from(&resolved)
+                        } else {
+                            assets_path.join(&resolved)
+                        };
+                        if !full_path.exists() {
+                            build_warnings.push(format!("Sprite sheet '{}': file not found at '{}'", name, sheet.path));
+                        }
+                        // Check animation path overrides
+                        for (anim_name, anim) in &sheet.animations {
+                            if let Some(ref anim_path) = anim.path {
+                                let resolved_anim = crate::sprites::resolve_sprite_asset_path(anim_path, config.asset_path.as_deref());
+                                let full_anim_path = if std::path::Path::new(&resolved_anim).is_absolute() {
+                                    std::path::PathBuf::from(&resolved_anim)
+                                } else {
+                                    assets_path.join(&resolved_anim)
+                                };
+                                if !full_anim_path.exists() {
+                                    build_warnings.push(format!("Sprite sheet '{}' animation '{}': file not found at '{}'", name, anim_name, anim_path));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Validate animation graph references in entities
+                if let Some(ref graphs) = build_req.animation_graphs {
+                    for spawn_req in &build_req.entities {
+                        for comp in &spawn_req.components {
+                            if let ComponentDef::AnimationController { ref graph, .. } = comp {
+                                if !graphs.contains_key(graph) {
+                                    let tag_hint = if spawn_req.tags.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" (tags: {})", spawn_req.tags.join(", "))
+                                    };
+                                    build_warnings.push(format!("Entity at ({}, {}){}: animation graph '{}' not found in build request", spawn_req.x, spawn_req.y, tag_hint, graph));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let presets_to_register = build_req.presets;
 
                 let save = SaveGameData {
@@ -2621,7 +2674,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     tilemap_applied: true,
                     animation_graphs: ag_count,
                     sprite_sheets: ss_count,
-                    warnings: vec![],
+                    warnings: build_warnings,
                 };
 
                 let _ = tx.send(Ok(BuildResult {
@@ -2956,6 +3009,129 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         game_vars_count,
                         tilemap_set,
                         issues,
+                    });
+                });
+            }
+            // ── Diagnose ─────────────────────────────────────────────
+            ApiCommand::Diagnose(tx) => {
+                commands.queue(move |world: &mut World| {
+                    let mut entity_count = 0usize;
+                    let mut diagnosed: Vec<EntityDiagnosis> = Vec::new();
+
+                    let mut q = world.query::<(
+                        Entity,
+                        &NetworkId,
+                        Option<&Tags>,
+                        Option<&Collider>,
+                        Option<&CircleCollider>,
+                        Option<&ContactDamage>,
+                        Option<&Pickup>,
+                        Option<&SolidBody>,
+                        Option<&CollisionLayer>,
+                        Option<&HorizontalMover>,
+                        Option<&TopDownMover>,
+                        Option<&Jumper>,
+                        Option<&GravityBody>,
+                        Option<&Projectile>,
+                    )>();
+
+                    for (_entity, network_id, tags, collider, circle_collider, contact_damage, pickup, solid_body, collision_layer, horizontal_mover, top_down_mover, jumper, gravity_body, projectile) in q.iter(world) {
+                        entity_count += 1;
+                        let has_collider = collider.is_some();
+                        let has_circle = circle_collider.is_some();
+                        let has_either = has_collider || has_circle;
+                        let mut issues = Vec::new();
+
+                        if contact_damage.is_some() && !has_either {
+                            issues.push(ComponentIssue {
+                                component: "ContactDamage".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider or CircleCollider for overlap detection".to_string(),
+                                missing: vec!["Collider".to_string(), "CircleCollider".to_string()],
+                            });
+                        }
+                        if pickup.is_some() && !has_either {
+                            issues.push(ComponentIssue {
+                                component: "Pickup".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider or CircleCollider to be collected".to_string(),
+                                missing: vec!["Collider".to_string(), "CircleCollider".to_string()],
+                            });
+                        }
+                        if solid_body.is_some() && !has_either {
+                            issues.push(ComponentIssue {
+                                component: "SolidBody".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider or CircleCollider for push-back".to_string(),
+                                missing: vec!["Collider".to_string(), "CircleCollider".to_string()],
+                            });
+                        }
+                        if collision_layer.is_some() && !has_either {
+                            issues.push(ComponentIssue {
+                                component: "CollisionLayer".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider or CircleCollider to filter".to_string(),
+                                missing: vec!["Collider".to_string(), "CircleCollider".to_string()],
+                            });
+                        }
+                        if horizontal_mover.is_some() && !has_collider {
+                            issues.push(ComponentIssue {
+                                component: "HorizontalMover".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider for tilemap collision".to_string(),
+                                missing: vec!["Collider".to_string()],
+                            });
+                        }
+                        if top_down_mover.is_some() && !has_collider {
+                            issues.push(ComponentIssue {
+                                component: "TopDownMover".to_string(),
+                                severity: "error".to_string(),
+                                message: "requires Collider for tilemap collision".to_string(),
+                                missing: vec!["Collider".to_string()],
+                            });
+                        }
+                        if jumper.is_some() {
+                            if gravity_body.is_none() {
+                                issues.push(ComponentIssue {
+                                    component: "Jumper".to_string(),
+                                    severity: "error".to_string(),
+                                    message: "requires GravityBody for falling".to_string(),
+                                    missing: vec!["GravityBody".to_string()],
+                                });
+                            }
+                            if !has_collider {
+                                issues.push(ComponentIssue {
+                                    component: "Jumper".to_string(),
+                                    severity: "error".to_string(),
+                                    message: "requires Collider for ground detection".to_string(),
+                                    missing: vec!["Collider".to_string()],
+                                });
+                            }
+                        }
+                        if projectile.is_some() && !has_either {
+                            issues.push(ComponentIssue {
+                                component: "Projectile".to_string(),
+                                severity: "warning".to_string(),
+                                message: "has no collider; will use default 4x4 hitbox".to_string(),
+                                missing: vec!["Collider".to_string(), "CircleCollider".to_string()],
+                            });
+                        }
+
+                        if !issues.is_empty() {
+                            let tag_list = tags.map(|t| t.0.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                            diagnosed.push(EntityDiagnosis {
+                                id: network_id.0,
+                                tags: tag_list,
+                                issues,
+                            });
+                        }
+                    }
+
+                    let issues_count = diagnosed.iter().map(|d| d.issues.len()).sum();
+                    let _ = tx.send(DiagnoseResult {
+                        entity_count,
+                        issues_count,
+                        entities: diagnosed,
                     });
                 });
             }

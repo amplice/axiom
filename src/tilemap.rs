@@ -198,11 +198,13 @@ pub fn prepare_tileset_data(
     registry: &TileTypeRegistry,
     asset_server: &AssetServer,
     atlas_layouts: &mut Assets<TextureAtlasLayout>,
+    asset_path: Option<&str>,
 ) -> HashMap<u8, TilesetRenderData> {
     let mut data = HashMap::new();
     for (idx, def) in registry.types.iter().enumerate() {
         if let Some(ref tileset) = def.tileset {
-            let texture: Handle<Image> = asset_server.load(&tileset.path);
+            let resolved = crate::sprites::resolve_sprite_asset_path(&tileset.path, asset_path);
+            let texture: Handle<Image> = asset_server.load(&resolved);
             let frame_size = UVec2::new(tileset.tile_width, tileset.tile_height);
             let layout = TextureAtlasLayout::from_grid(
                 frame_size,
@@ -304,6 +306,10 @@ pub fn spawn_tile_layer(
             );
             let tile_type = TileType::from_u8(tile_id);
             let (wx, wy) = tile_mode.grid_to_world(x as f32, y as f32, ts);
+            let z = match tile_mode {
+                TileMode::Isometric { depth_sort: true, .. } => z_offset - wy * 0.001,
+                _ => z_offset,
+            };
 
             commands.spawn((
                 TileEntity,
@@ -313,7 +319,7 @@ pub fn spawn_tile_layer(
                     y: y as i32,
                 },
                 sprite,
-                Transform::from_xyz(wx, wy, z_offset),
+                Transform::from_xyz(wx, wy, z),
             ));
         }
     }
@@ -332,7 +338,7 @@ fn spawn_tilemap(
         return;
     }
     let ts = physics.tile_size;
-    let tileset_data = prepare_tileset_data(&physics.tile_types, &asset_server, &mut atlas_layouts);
+    let tileset_data = prepare_tileset_data(&physics.tile_types, &asset_server, &mut atlas_layouts, physics.asset_path.as_deref());
     let sa = sprite_assets.as_deref();
 
     // Spawn main tilemap layer

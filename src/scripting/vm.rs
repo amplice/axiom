@@ -15,9 +15,9 @@ use crate::api::types::{
     AiBehaviorDef, ComponentDef, EntitySpawnRequest, PathTypeDef, PickupEffectDef, Vec2Def,
 };
 use crate::components::{
-    AiBehavior, AiState, Alive, AnimationController, Collider, GameConfig, GamePosition, Grounded,
-    Health, Hitbox, Invisible, NetworkId, NextNetworkId, OnDeathFired, PathFollower, PendingDeath,
-    Player, RenderLayer, Tags, TopDownMover, Velocity,
+    AiBehavior, AiState, Alive, AnimationController, CircleCollider, Collider, GameConfig,
+    GamePosition, Grounded, Health, Hitbox, Invisible, NetworkId, NextNetworkId, OnDeathFired,
+    PathFollower, PendingDeath, Player, RenderLayer, Tags, TopDownMover, Velocity,
 };
 use crate::events::{GameEvent, GameEventBus};
 use crate::input::{MouseInput, VirtualInput};
@@ -416,6 +416,7 @@ type ScriptEntityCacheQueryItem<'a> = (
     &'a GamePosition,
     Option<&'a Velocity>,
     Option<&'a Collider>,
+    Option<&'a CircleCollider>,
     Option<&'a NetworkId>,
     Option<&'a Tags>,
     Option<&'a Player>,
@@ -460,6 +461,7 @@ struct LuaEntitySnapshotParts<'a> {
     pos: &'a GamePosition,
     vel: Option<&'a Velocity>,
     collider: Option<&'a Collider>,
+    circle_collider: Option<&'a CircleCollider>,
     network_id: Option<&'a NetworkId>,
     tags: Option<&'a Tags>,
     player: Option<&'a Player>,
@@ -851,11 +853,12 @@ fn refresh_script_entity_cache(
     let entities = query
         .iter()
         .filter_map(
-            |(entity, pos, vel, collider, network_id, tags, player, grounded, alive, health, invisible)| {
+            |(entity, pos, vel, collider, circle_collider, network_id, tags, player, grounded, alive, health, invisible)| {
                 let snapshot = make_lua_entity_snapshot(LuaEntitySnapshotParts {
                     pos,
                     vel,
                     collider,
+                    circle_collider,
                     network_id,
                     tags,
                     player,
@@ -1830,6 +1833,7 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
         pos,
         vel,
         collider,
+        circle_collider,
         network_id,
         tags,
         player,
@@ -1840,12 +1844,19 @@ fn make_lua_entity_snapshot(parts: LuaEntitySnapshotParts<'_>) -> Option<LuaEnti
     } = parts;
     let network_id = network_id?;
     let tags_set = tags.map(|t| t.0.clone()).unwrap_or_default();
-    let aabb = collider.map(|c| {
-        (
+    let aabb = if let Some(c) = collider {
+        Some((
             Vec2::new(pos.x - c.width * 0.5, pos.y - c.height * 0.5),
             Vec2::new(pos.x + c.width * 0.5, pos.y + c.height * 0.5),
-        )
-    });
+        ))
+    } else if let Some(cc) = circle_collider {
+        Some((
+            Vec2::new(pos.x - cc.radius, pos.y - cc.radius),
+            Vec2::new(pos.x + cc.radius, pos.y + cc.radius),
+        ))
+    } else {
+        None
+    };
     Some(LuaEntitySnapshot {
         id: network_id.0,
         x: pos.x,
@@ -1967,6 +1978,8 @@ fn component_from_name(name: &str, config: &GameConfig) -> Option<ComponentDef> 
                 pause_frames: 30,
             },
         }),
+        "circlecollider" => Some(ComponentDef::CircleCollider { radius: 8.0 }),
+        "solidbody" => Some(ComponentDef::SolidBody),
         _ => None,
     }
 }

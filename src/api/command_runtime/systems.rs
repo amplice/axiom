@@ -39,6 +39,7 @@ pub(in crate::api) fn apply_level_change(
             &ctx.physics.tile_types,
             &ctx.asset_server,
             &mut ctx.atlas_layouts,
+            ctx.physics.asset_path.as_deref(),
         );
         let sa = ctx.sprite_assets.as_deref();
 

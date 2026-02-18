@@ -2,14 +2,21 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
-use crate::components::{Collider, GamePosition};
+use crate::components::{CircleCollider, Collider, GamePosition};
 
-type SpatialChangedItem<'a> = (Entity, &'a GamePosition, &'a Collider);
+type SpatialChangedItem<'a> = (
+    Entity,
+    &'a GamePosition,
+    Option<&'a Collider>,
+    Option<&'a CircleCollider>,
+);
 type SpatialChangedFilter = Or<(
     Changed<GamePosition>,
     Changed<Collider>,
     Added<GamePosition>,
     Added<Collider>,
+    Changed<CircleCollider>,
+    Added<CircleCollider>,
 )>;
 
 #[derive(Resource, Default)]
@@ -87,12 +94,16 @@ fn rebuild_spatial_hash(
     changed: Query<SpatialChangedItem<'_>, SpatialChangedFilter>,
     mut removed_pos: RemovedComponents<GamePosition>,
     mut removed_col: RemovedComponents<Collider>,
+    mut removed_circle: RemovedComponents<CircleCollider>,
 ) {
     let mut removed_entities = std::collections::HashSet::new();
     for entity in removed_pos.read() {
         removed_entities.insert(entity);
     }
     for entity in removed_col.read() {
+        removed_entities.insert(entity);
+    }
+    for entity in removed_circle.read() {
         removed_entities.insert(entity);
     }
 
@@ -104,21 +115,29 @@ fn rebuild_spatial_hash(
         remove_entity_cells(&mut hash, &mut occupancy, entity);
     }
 
-    for (entity, pos, collider) in changed.iter() {
-        let cells = compute_covered_cells(pos, collider, hash.cell_size);
+    for (entity, pos, collider, circle) in changed.iter() {
+        let (half_w, half_h) = if let Some(col) = collider {
+            (col.width / 2.0, col.height / 2.0)
+        } else if let Some(cc) = circle {
+            (cc.radius, cc.radius)
+        } else {
+            continue; // No collider of either type — skip
+        };
+        let cells = compute_covered_cells_bounds(pos, half_w, half_h, hash.cell_size);
         upsert_entity_cells(&mut hash, &mut occupancy, entity, cells);
     }
 }
 
-fn compute_covered_cells(
+fn compute_covered_cells_bounds(
     pos: &GamePosition,
-    collider: &Collider,
+    half_w: f32,
+    half_h: f32,
     cell_size: f32,
 ) -> Vec<(i32, i32)> {
-    let min_x = ((pos.x - collider.width / 2.0) / cell_size).floor() as i32;
-    let max_x = ((pos.x + collider.width / 2.0) / cell_size).floor() as i32;
-    let min_y = ((pos.y - collider.height / 2.0) / cell_size).floor() as i32;
-    let max_y = ((pos.y + collider.height / 2.0) / cell_size).floor() as i32;
+    let min_x = ((pos.x - half_w) / cell_size).floor() as i32;
+    let max_x = ((pos.x + half_w) / cell_size).floor() as i32;
+    let min_y = ((pos.y - half_h) / cell_size).floor() as i32;
+    let max_y = ((pos.y + half_h) / cell_size).floor() as i32;
     let mut out = Vec::new();
     for cy in min_y..=max_y {
         for cx in min_x..=max_x {
@@ -169,16 +188,12 @@ mod tests {
         let mut hash = SpatialHash::new(16.0);
         let mut occupancy = SpatialOccupancy::default();
         let entity = Entity::from_raw(42);
-        let collider = Collider {
-            width: 8.0,
-            height: 8.0,
-        };
 
-        let cells_a = compute_covered_cells(&GamePosition { x: 8.0, y: 8.0 }, &collider, 16.0);
+        let cells_a = compute_covered_cells_bounds(&GamePosition { x: 8.0, y: 8.0 }, 4.0, 4.0, 16.0);
         upsert_entity_cells(&mut hash, &mut occupancy, entity, cells_a);
         assert!(hash.cells.contains_key(&(0, 0)));
 
-        let cells_b = compute_covered_cells(&GamePosition { x: 40.0, y: 8.0 }, &collider, 16.0);
+        let cells_b = compute_covered_cells_bounds(&GamePosition { x: 40.0, y: 8.0 }, 4.0, 4.0, 16.0);
         upsert_entity_cells(&mut hash, &mut occupancy, entity, cells_b);
 
         assert!(!hash

@@ -196,6 +196,8 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         .route("/assets/list", get(list_assets))
         // Health check
         .route("/health", get(health_check))
+        // Diagnose
+        .route("/diagnose", get(diagnose))
         // Window config
         .route("/window", post(set_window_config))
         // Evaluation

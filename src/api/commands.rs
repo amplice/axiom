@@ -365,6 +365,10 @@ pub enum ApiCommand {
     HealthCheck(
         tokio::sync::oneshot::Sender<HealthCheckResult>,
     ),
+    // Diagnose
+    Diagnose(
+        tokio::sync::oneshot::Sender<DiagnoseResult>,
+    ),
 }
 
 #[derive(Resource, Default)]

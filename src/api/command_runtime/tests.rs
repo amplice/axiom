@@ -798,3 +798,186 @@ fn save_load_restores_network_ids_and_content_resources() {
         .clone();
     assert!(presets.contains_key("burst"));
 }
+
+#[test]
+fn diagnose_clean_entity_no_issues() {
+    let (sender, receiver) = crossbeam_channel::unbounded::<ApiCommand>();
+    let mut app = setup_runtime_app(receiver);
+
+    // Spawn entity with ContactDamage + Collider (valid combo)
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(ApiCommand::SpawnEntity(
+            EntitySpawnRequest {
+                x: 16.0,
+                y: 16.0,
+                components: vec![
+                    ComponentDef::Collider { width: 12.0, height: 12.0 },
+                    ComponentDef::ContactDamage {
+                        amount: 10.0,
+                        cooldown_frames: 30,
+                        knockback: 0.0,
+                        damage_tag: "enemy".to_string(),
+                    },
+                ],
+                script: None,
+                tags: vec!["enemy".to_string()],
+                is_player: false,
+                invisible: false,
+            },
+            spawn_tx,
+        ))
+        .expect("send spawn");
+    app.update();
+    spawn_rx.blocking_recv().expect("spawn response").expect("spawn ok");
+
+    let (diag_tx, diag_rx) = tokio::sync::oneshot::channel();
+    sender.send(ApiCommand::Diagnose(diag_tx)).expect("send diagnose");
+    app.update();
+    let result = diag_rx.blocking_recv().expect("diagnose response");
+    assert_eq!(result.entity_count, 1);
+    assert_eq!(result.issues_count, 0);
+    assert!(result.entities.is_empty());
+}
+
+#[test]
+fn diagnose_catches_missing_collider() {
+    let (sender, receiver) = crossbeam_channel::unbounded::<ApiCommand>();
+    let mut app = setup_runtime_app(receiver);
+
+    // Spawn entity with ContactDamage but NO Collider
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(ApiCommand::SpawnEntity(
+            EntitySpawnRequest {
+                x: 32.0,
+                y: 32.0,
+                components: vec![ComponentDef::ContactDamage {
+                    amount: 5.0,
+                    cooldown_frames: 30,
+                    knockback: 0.0,
+                    damage_tag: "enemy".to_string(),
+                }],
+                script: None,
+                tags: vec!["broken_enemy".to_string()],
+                is_player: false,
+                invisible: false,
+            },
+            spawn_tx,
+        ))
+        .expect("send spawn");
+    app.update();
+    spawn_rx.blocking_recv().expect("spawn response").expect("spawn ok");
+
+    let (diag_tx, diag_rx) = tokio::sync::oneshot::channel();
+    sender.send(ApiCommand::Diagnose(diag_tx)).expect("send diagnose");
+    app.update();
+    let result = diag_rx.blocking_recv().expect("diagnose response");
+    assert_eq!(result.entity_count, 1);
+    assert!(result.issues_count > 0);
+    assert_eq!(result.entities.len(), 1);
+    let entity = &result.entities[0];
+    assert!(entity.issues.iter().any(|i| i.component == "ContactDamage" && i.missing.contains(&"Collider".to_string())));
+}
+
+#[test]
+fn damage_entity_reduces_health() {
+    let (sender, receiver) = crossbeam_channel::unbounded::<ApiCommand>();
+    let mut app = setup_runtime_app(receiver);
+
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(ApiCommand::SpawnEntity(
+            EntitySpawnRequest {
+                x: 16.0,
+                y: 16.0,
+                components: vec![ComponentDef::Health { current: 100.0, max: 100.0 }],
+                script: None,
+                tags: vec![],
+                is_player: false,
+                invisible: false,
+            },
+            spawn_tx,
+        ))
+        .expect("send spawn");
+    app.update();
+    let entity_id = spawn_rx.blocking_recv().expect("spawn response").expect("spawn ok");
+
+    let (dmg_tx, dmg_rx) = tokio::sync::oneshot::channel();
+    sender.send(ApiCommand::DamageEntity(entity_id, 10.0, dmg_tx)).expect("send damage");
+    app.update();
+    dmg_rx.blocking_recv().expect("damage response").expect("damage ok");
+
+    let (get_tx, get_rx) = tokio::sync::oneshot::channel();
+    sender.send(ApiCommand::GetEntity(entity_id, get_tx)).expect("send get");
+    app.update();
+    let entity = get_rx.blocking_recv().expect("get response").expect("entity exists");
+    assert!((entity.health.unwrap() - 90.0).abs() < 0.01);
+}
+
+#[test]
+fn build_warns_missing_sprite() {
+    let (sender, receiver) = crossbeam_channel::unbounded::<ApiCommand>();
+    let mut app = setup_runtime_app(receiver);
+
+    let mut sprite_sheets = HashMap::new();
+    sprite_sheets.insert(
+        "missing_hero".to_string(),
+        crate::sprites::SpriteSheetDef {
+            path: "nonexistent/hero.png".to_string(),
+            frame_width: 32,
+            frame_height: 32,
+            columns: 4,
+            rows: 1,
+            animations: HashMap::new(),
+            direction_map: None,
+            anchor_y: -0.15,
+        },
+    );
+
+    let (build_tx, build_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(ApiCommand::AtomicBuild(
+            Box::new(BuildRequest {
+                config: None,
+                tilemap: None,
+                entities: vec![],
+                scripts: HashMap::new(),
+                global_scripts: vec![],
+                game_vars: None,
+                animation_graphs: None,
+                sprite_sheets: Some(sprite_sheets),
+                presets: None,
+                validate_first: None,
+            }),
+            build_tx,
+        ))
+        .expect("send build");
+    app.update();
+    let result = build_rx.blocking_recv().expect("build response").expect("build ok");
+    assert!(result.success);
+    let import = result.import_result.expect("import result");
+    assert!(!import.warnings.is_empty(), "expected warnings for missing sprite");
+    assert!(import.warnings.iter().any(|w| w.contains("nonexistent/hero.png")));
+}
+
+#[test]
+fn docs_components_have_capability_fields() {
+    let components = crate::api::docs::docs_components();
+    for comp in &components {
+        let name = comp.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        assert!(comp.get("systems").is_some(), "component '{}' missing 'systems' field", name);
+        assert!(comp.get("requires").is_some(), "component '{}' missing 'requires' field", name);
+        assert!(comp.get("optional").is_some(), "component '{}' missing 'optional' field", name);
+    }
+}
+
+#[test]
+fn docs_components_covers_all_28() {
+    let components = crate::api::docs::docs_components();
+    assert!(
+        components.len() >= 28,
+        "expected at least 28 component docs, got {}",
+        components.len()
+    );
+}

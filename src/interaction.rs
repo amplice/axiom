@@ -13,6 +13,7 @@ impl Plugin for InteractionPlugin {
         app.add_systems(
             FixedUpdate,
             (
+                entity_collision_system,
                 projectile_system,
                 trigger_zone_system,
                 contact_damage_system,
@@ -27,6 +28,182 @@ impl Plugin for InteractionPlugin {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CollisionShape: unified shape abstraction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+enum CollisionShape {
+    Aabb { x: f32, y: f32, w: f32, h: f32 },
+    Circle { x: f32, y: f32, r: f32 },
+}
+
+impl CollisionShape {
+    fn bounding_rect(&self) -> (f32, f32, f32, f32) {
+        match *self {
+            CollisionShape::Aabb { x, y, w, h } => (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0),
+            CollisionShape::Circle { x, y, r } => (x - r, y - r, x + r, y + r),
+        }
+    }
+}
+
+fn extract_shape(
+    pos: &GamePosition,
+    collider: Option<&Collider>,
+    circle: Option<&CircleCollider>,
+) -> Option<CollisionShape> {
+    if let Some(c) = collider {
+        Some(CollisionShape::Aabb {
+            x: pos.x,
+            y: pos.y,
+            w: c.width,
+            h: c.height,
+        })
+    } else if let Some(cc) = circle {
+        Some(CollisionShape::Circle {
+            x: pos.x,
+            y: pos.y,
+            r: cc.radius,
+        })
+    } else {
+        None
+    }
+}
+
+fn shapes_overlap(a: &CollisionShape, b: &CollisionShape) -> bool {
+    match (a, b) {
+        (
+            CollisionShape::Aabb { x: ax, y: ay, w: aw, h: ah },
+            CollisionShape::Aabb { x: bx, y: by, w: bw, h: bh },
+        ) => {
+            let a_min_x = ax - aw / 2.0;
+            let a_max_x = ax + aw / 2.0;
+            let a_min_y = ay - ah / 2.0;
+            let a_max_y = ay + ah / 2.0;
+            let b_min_x = bx - bw / 2.0;
+            let b_max_x = bx + bw / 2.0;
+            let b_min_y = by - bh / 2.0;
+            let b_max_y = by + bh / 2.0;
+            a_max_x > b_min_x && a_min_x < b_max_x && a_max_y > b_min_y && a_min_y < b_max_y
+        }
+        (
+            CollisionShape::Circle { x: ax, y: ay, r: ar },
+            CollisionShape::Circle { x: bx, y: by, r: br },
+        ) => {
+            let dx = bx - ax;
+            let dy = by - ay;
+            let sum_r = ar + br;
+            dx * dx + dy * dy <= sum_r * sum_r
+        }
+        (circle @ CollisionShape::Circle { .. }, aabb @ CollisionShape::Aabb { .. }) => {
+            circle_aabb_overlap(circle, aabb)
+        }
+        (aabb @ CollisionShape::Aabb { .. }, circle @ CollisionShape::Circle { .. }) => {
+            circle_aabb_overlap(circle, aabb)
+        }
+    }
+}
+
+fn circle_aabb_overlap(circle: &CollisionShape, aabb: &CollisionShape) -> bool {
+    let CollisionShape::Circle { x: cx, y: cy, r } = *circle else {
+        return false;
+    };
+    let CollisionShape::Aabb { x, y, w, h } = *aabb else {
+        return false;
+    };
+    let half_w = w / 2.0;
+    let half_h = h / 2.0;
+    let closest_x = cx.clamp(x - half_w, x + half_w);
+    let closest_y = cy.clamp(y - half_h, y + half_h);
+    let dx = cx - closest_x;
+    let dy = cy - closest_y;
+    dx * dx + dy * dy <= r * r
+}
+
+fn compute_push_vector(a: &CollisionShape, b: &CollisionShape) -> (f32, f32) {
+    match (a, b) {
+        (
+            CollisionShape::Aabb { x: ax, y: ay, w: aw, h: ah },
+            CollisionShape::Aabb { x: bx, y: by, w: bw, h: bh },
+        ) => {
+            let overlap_x = (aw / 2.0 + bw / 2.0) - (bx - ax).abs();
+            let overlap_y = (ah / 2.0 + bh / 2.0) - (by - ay).abs();
+            if overlap_x <= 0.0 || overlap_y <= 0.0 {
+                return (0.0, 0.0);
+            }
+            if overlap_x < overlap_y {
+                let sign = if bx >= ax { 1.0 } else { -1.0 };
+                (sign * overlap_x, 0.0)
+            } else {
+                let sign = if by >= ay { 1.0 } else { -1.0 };
+                (0.0, sign * overlap_y)
+            }
+        }
+        (
+            CollisionShape::Circle { x: ax, y: ay, r: ar },
+            CollisionShape::Circle { x: bx, y: by, r: br },
+        ) => {
+            let dx = bx - ax;
+            let dy = by - ay;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let overlap = ar + br - dist;
+            if overlap <= 0.0 {
+                return (0.0, 0.0);
+            }
+            if dist < 0.0001 {
+                return (overlap, 0.0);
+            }
+            let nx = dx / dist;
+            let ny = dy / dist;
+            (nx * overlap, ny * overlap)
+        }
+        (circle @ CollisionShape::Circle { .. }, aabb @ CollisionShape::Aabb { .. }) => {
+            circle_aabb_push(circle, aabb, false)
+        }
+        (aabb @ CollisionShape::Aabb { .. }, circle @ CollisionShape::Circle { .. }) => {
+            circle_aabb_push(circle, aabb, true)
+        }
+    }
+}
+
+fn circle_aabb_push(
+    circle: &CollisionShape,
+    aabb: &CollisionShape,
+    invert: bool,
+) -> (f32, f32) {
+    let CollisionShape::Circle { x: cx, y: cy, r } = *circle else {
+        return (0.0, 0.0);
+    };
+    let CollisionShape::Aabb { x, y, w, h } = *aabb else {
+        return (0.0, 0.0);
+    };
+    let half_w = w / 2.0;
+    let half_h = h / 2.0;
+    let closest_x = cx.clamp(x - half_w, x + half_w);
+    let closest_y = cy.clamp(y - half_h, y + half_h);
+    let dx = cx - closest_x;
+    let dy = cy - closest_y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let overlap = r - dist;
+    if overlap <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let (nx, ny) = if dist < 0.0001 {
+        (1.0, 0.0)
+    } else {
+        (dx / dist, dy / dist)
+    };
+    // Push vector points from a→b; circle pushes away from aabb
+    // If circle is `a`, push = circle-away = (nx, ny) direction
+    // If aabb is `a` (invert=true), push direction reverses
+    let sign = if invert { -1.0 } else { 1.0 };
+    (sign * nx * overlap, sign * ny * overlap)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shared helpers and types
+// ═══════════════════════════════════════════════════════════════════════════════
+
 fn collision_layers_compatible(
     a: Option<&crate::components::CollisionLayer>,
     b: Option<&crate::components::CollisionLayer>,
@@ -39,10 +216,7 @@ fn collision_layers_compatible(
 #[derive(Clone)]
 struct CollisionView {
     entity: Entity,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    shape: CollisionShape,
     tags: Vec<String>,
     network_id: u64,
     contact_damage: Option<ContactDamage>,
@@ -50,18 +224,11 @@ struct CollisionView {
     collision_layer: Option<crate::components::CollisionLayer>,
 }
 
-#[derive(Clone, Copy)]
-struct Aabb {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-
 type ContactInteractionQueryItem<'a> = (
     Entity,
     &'a GamePosition,
-    &'a Collider,
+    Option<&'a Collider>,
+    Option<&'a CircleCollider>,
     Option<&'a Tags>,
     &'a NetworkId,
     Option<&'a ContactDamage>,
@@ -73,6 +240,7 @@ type ProjectileQueryItem<'a> = (
     &'a mut GamePosition,
     &'a mut Projectile,
     Option<&'a Collider>,
+    Option<&'a CircleCollider>,
     &'a NetworkId,
     Option<&'a crate::components::CollisionLayer>,
 );
@@ -80,25 +248,27 @@ type ProjectileQueryItem<'a> = (
 type TargetableEntityItem<'a> = (
     Entity,
     &'a GamePosition,
-    &'a Collider,
+    Option<&'a Collider>,
+    Option<&'a CircleCollider>,
     Option<&'a Tags>,
     &'a NetworkId,
     Option<&'a crate::components::CollisionLayer>,
 );
 
-type TargetView = (f32, f32, f32, f32, Vec<String>, u64, Option<crate::components::CollisionLayer>);
+type TargetView = (CollisionShape, Vec<String>, u64, Option<crate::components::CollisionLayer>);
 
 type PickupInteractionQueryItem<'a> = (
     Entity,
     &'a GamePosition,
-    &'a Collider,
+    Option<&'a Collider>,
+    Option<&'a CircleCollider>,
     Option<&'a Tags>,
     &'a NetworkId,
     Option<&'a Pickup>,
     Option<&'a crate::components::CollisionLayer>,
 );
 
-type ActorView = (f32, f32, u64, Vec<String>);
+type ActorView = (f32, f32, u64, Vec<String>, Option<CollisionShape>);
 
 #[derive(SystemParam)]
 struct InteractionIo<'w, 's> {
@@ -149,6 +319,99 @@ struct PickupApplication<'a> {
     collector_network_id: u64,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// entity_collision_system — SolidBody push-back
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn entity_collision_system(
+    spatial: Res<SpatialHash>,
+    mut positions: Query<(&mut GamePosition, Option<&Collider>, Option<&CircleCollider>)>,
+    solid_entities: Query<(Entity, Option<&crate::components::CollisionLayer>), With<SolidBody>>,
+) {
+    // Snapshot all SolidBody entities (read positions immutably via get())
+    struct SolidEntry {
+        entity: Entity,
+        shape: CollisionShape,
+        collision_layer: Option<crate::components::CollisionLayer>,
+    }
+    let solids: Vec<SolidEntry> = solid_entities
+        .iter()
+        .filter_map(|(entity, cl)| {
+            let (pos, col, circle) = positions.get(entity).ok()?;
+            let shape = extract_shape(&pos, col, circle)?;
+            Some(SolidEntry {
+                entity,
+                shape,
+                collision_layer: cl.copied(),
+            })
+        })
+        .collect();
+
+    if solids.len() < 2 {
+        return;
+    }
+
+    // Build entity→index lookup
+    let entity_to_idx: std::collections::HashMap<Entity, usize> = solids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.entity, i))
+        .collect();
+
+    // Accumulate displacements
+    let mut displacements: std::collections::HashMap<Entity, (f32, f32)> =
+        std::collections::HashMap::new();
+
+    for (i, a) in solids.iter().enumerate() {
+        let (min_x, min_y, max_x, max_y) = a.shape.bounding_rect();
+        let candidates = spatial.query_rect(min_x, min_y, max_x, max_y);
+        for cand in candidates {
+            let Some(&j) = entity_to_idx.get(&cand) else {
+                continue;
+            };
+            if j <= i {
+                continue; // dedupe: only process pair once
+            }
+            let b = &solids[j];
+            if !collision_layers_compatible(
+                a.collision_layer.as_ref(),
+                b.collision_layer.as_ref(),
+            ) {
+                continue;
+            }
+            if !shapes_overlap(&a.shape, &b.shape) {
+                continue;
+            }
+            let (px, py) = compute_push_vector(&a.shape, &b.shape);
+            // Split 50/50: a moves -half, b moves +half
+            let half_x = px * 0.5;
+            let half_y = py * 0.5;
+            {
+                let d = displacements.entry(a.entity).or_insert((0.0, 0.0));
+                d.0 -= half_x;
+                d.1 -= half_y;
+            }
+            {
+                let d = displacements.entry(b.entity).or_insert((0.0, 0.0));
+                d.0 += half_x;
+                d.1 += half_y;
+            }
+        }
+    }
+
+    // Apply all displacements
+    for (entity, (dx, dy)) in displacements {
+        if let Ok((mut pos, _, _)) = positions.get_mut(entity) {
+            pos.x += dx;
+            pos.y += dy;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// contact_damage_system
+// ═══════════════════════════════════════════════════════════════════════════════
+
 fn contact_damage_system(
     mut io: InteractionIo,
     spatial: Res<SpatialHash>,
@@ -157,31 +420,27 @@ fn contact_damage_system(
 ) {
     let items: Vec<CollisionView> = query
         .iter()
-        .map(|(entity, pos, col, tags, nid, contact, cl)| CollisionView {
-            entity,
-            x: pos.x,
-            y: pos.y,
-            w: col.width,
-            h: col.height,
-            tags: tags
-                .map(|t| t.0.iter().cloned().collect())
-                .unwrap_or_default(),
-            network_id: nid.0,
-            contact_damage: contact.cloned(),
-            pickup: None,
-            collision_layer: cl.copied(),
+        .filter_map(|(entity, pos, col, circle, tags, nid, contact, cl)| {
+            let shape = extract_shape(pos, col, circle)?;
+            Some(CollisionView {
+                entity,
+                shape,
+                tags: tags
+                    .map(|t| t.0.iter().cloned().collect())
+                    .unwrap_or_default(),
+                network_id: nid.0,
+                contact_damage: contact.cloned(),
+                pickup: None,
+                collision_layer: cl.copied(),
+            })
         })
         .collect();
     let by_entity: std::collections::HashMap<Entity, &CollisionView> =
         items.iter().map(|i| (i.entity, i)).collect();
 
     for a in &items {
-        let candidates = spatial.query_rect(
-            a.x - a.w / 2.0,
-            a.y - a.h / 2.0,
-            a.x + a.w / 2.0,
-            a.y + a.h / 2.0,
-        );
+        let (min_x, min_y, max_x, max_y) = a.shape.bounding_rect();
+        let candidates = spatial.query_rect(min_x, min_y, max_x, max_y);
         for cand in candidates {
             let Some(b) = by_entity.get(&cand).copied() else {
                 continue;
@@ -189,25 +448,18 @@ fn contact_damage_system(
             if b.network_id <= a.network_id {
                 continue;
             }
-            if !overlap(
-                Aabb {
-                    x: a.x,
-                    y: a.y,
-                    w: a.w,
-                    h: a.h,
-                },
-                Aabb {
-                    x: b.x,
-                    y: b.y,
-                    w: b.w,
-                    h: b.h,
-                },
-            ) {
+            if !shapes_overlap(&a.shape, &b.shape) {
                 continue;
             }
             if !collision_layers_compatible(a.collision_layer.as_ref(), b.collision_layer.as_ref()) {
                 continue;
             }
+            let (a_cx, b_cx) = match (&a.shape, &b.shape) {
+                (CollisionShape::Aabb { x: ax, .. }, CollisionShape::Aabb { x: bx, .. }) => (*ax, *bx),
+                (CollisionShape::Circle { x: ax, .. }, CollisionShape::Circle { x: bx, .. }) => (*ax, *bx),
+                (CollisionShape::Aabb { x: ax, .. }, CollisionShape::Circle { x: bx, .. }) => (*ax, *bx),
+                (CollisionShape::Circle { x: ax, .. }, CollisionShape::Aabb { x: bx, .. }) => (*ax, *bx),
+            };
             if let Some(cd) = &a.contact_damage {
                 if tag_matches(&b.tags, &cd.damage_tag) {
                     apply_damage(
@@ -217,7 +469,7 @@ fn contact_damage_system(
                             target: b.entity,
                             source_network_id: a.network_id,
                             damage: cd,
-                            knockback_dir_x: b.x - a.x,
+                            knockback_dir_x: b_cx - a_cx,
                         },
                     );
                 }
@@ -231,7 +483,7 @@ fn contact_damage_system(
                             target: a.entity,
                             source_network_id: b.network_id,
                             damage: cd,
-                            knockback_dir_x: a.x - b.x,
+                            knockback_dir_x: a_cx - b_cx,
                         },
                     );
                 }
@@ -239,6 +491,10 @@ fn contact_damage_system(
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// projectile_system
+// ═══════════════════════════════════════════════════════════════════════════════
 
 fn projectile_system(
     mut io: InteractionIo,
@@ -253,24 +509,22 @@ fn projectile_system(
 
     let target_view: std::collections::HashMap<Entity, TargetView> = targets
         .iter()
-        .map(|(e, pos, col, tags, nid, cl)| {
-            (
+        .filter_map(|(e, pos, col, circle, tags, nid, cl)| {
+            let shape = extract_shape(pos, col, circle)?;
+            Some((
                 e,
                 (
-                    pos.x,
-                    pos.y,
-                    col.width,
-                    col.height,
+                    shape,
                     tags.map(|t| t.0.iter().cloned().collect())
                         .unwrap_or_default(),
                     nid.0,
                     cl.copied(),
                 ),
-            )
+            ))
         })
         .collect();
 
-    for (entity, mut pos, mut proj, collider, nid, proj_cl) in projectiles.iter_mut() {
+    for (entity, mut pos, mut proj, collider, circle, nid, proj_cl) in projectiles.iter_mut() {
         let dir = if proj.direction.length_squared() > 0.0 {
             proj.direction.normalize()
         } else {
@@ -304,19 +558,23 @@ fn projectile_system(
             continue;
         }
 
-        let (pw, ph) = collider.map(|c| (c.width, c.height)).unwrap_or((4.0, 4.0));
-        let candidates = spatial.query_rect(
-            pos.x - pw / 2.0,
-            pos.y - ph / 2.0,
-            pos.x + pw / 2.0,
-            pos.y + ph / 2.0,
+        // Projectile shape: use its own collider, or 4x4 point AABB
+        let proj_shape = extract_shape(&pos, collider, circle).unwrap_or(
+            CollisionShape::Aabb {
+                x: pos.x,
+                y: pos.y,
+                w: 4.0,
+                h: 4.0,
+            },
         );
+        let (min_x, min_y, max_x, max_y) = proj_shape.bounding_rect();
+        let candidates = spatial.query_rect(min_x, min_y, max_x, max_y);
         let mut hit_target = None;
         for cand in candidates {
             if cand == entity {
                 continue;
             }
-            let Some((tx, ty, tw, th, tags, target_nid, target_cl)) = target_view.get(&cand) else {
+            let Some((target_shape, tags, target_nid, target_cl)) = target_view.get(&cand) else {
                 continue;
             };
             if *target_nid == proj.owner_id {
@@ -328,20 +586,7 @@ fn projectile_system(
             if !tag_matches(tags, &proj.damage_tag) {
                 continue;
             }
-            if !overlap(
-                Aabb {
-                    x: pos.x,
-                    y: pos.y,
-                    w: pw,
-                    h: ph,
-                },
-                Aabb {
-                    x: *tx,
-                    y: *ty,
-                    w: *tw,
-                    h: *th,
-                },
-            ) {
+            if !shapes_overlap(&proj_shape, target_shape) {
                 continue;
             }
             hit_target = Some((cand, *target_nid));
@@ -378,6 +623,10 @@ fn projectile_system(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// hitbox_system
+// ═══════════════════════════════════════════════════════════════════════════════
+
 fn hitbox_system(
     mut io: InteractionIo,
     spatial: Res<SpatialHash>,
@@ -387,20 +636,18 @@ fn hitbox_system(
 ) {
     let target_view: std::collections::HashMap<Entity, TargetView> = targets
         .iter()
-        .map(|(e, pos, col, tags, nid, cl)| {
-            (
+        .filter_map(|(e, pos, col, circle, tags, nid, cl)| {
+            let shape = extract_shape(pos, col, circle)?;
+            Some((
                 e,
                 (
-                    pos.x,
-                    pos.y,
-                    col.width,
-                    col.height,
+                    shape,
                     tags.map(|t| t.0.iter().cloned().collect())
                         .unwrap_or_default(),
                     nid.0,
                     cl.copied(),
                 ),
-            )
+            ))
         })
         .collect();
 
@@ -410,6 +657,12 @@ fn hitbox_system(
         }
         let hx = pos.x + hitbox.offset.x;
         let hy = pos.y + hitbox.offset.y;
+        let hitbox_shape = CollisionShape::Aabb {
+            x: hx,
+            y: hy,
+            w: hitbox.width,
+            h: hitbox.height,
+        };
         let candidates = spatial.query_rect(
             hx - hitbox.width / 2.0,
             hy - hitbox.height / 2.0,
@@ -420,7 +673,7 @@ fn hitbox_system(
             if cand == attacker {
                 continue;
             }
-            let Some((tx, ty, tw, th, tags, target_nid, target_cl)) = target_view.get(&cand) else {
+            let Some((target_shape, tags, target_nid, target_cl)) = target_view.get(&cand) else {
                 continue;
             };
             if !collision_layers_compatible(attacker_cl, target_cl.as_ref()) {
@@ -432,20 +685,7 @@ fn hitbox_system(
             if attacker_nid.0 == *target_nid {
                 continue;
             }
-            if !overlap(
-                Aabb {
-                    x: hx,
-                    y: hy,
-                    w: hitbox.width,
-                    h: hitbox.height,
-                },
-                Aabb {
-                    x: *tx,
-                    y: *ty,
-                    w: *tw,
-                    h: *th,
-                },
-            ) {
+            if !shapes_overlap(&hitbox_shape, target_shape) {
                 continue;
             }
 
@@ -479,6 +719,10 @@ fn hitbox_system(
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// apply_damage
+// ═══════════════════════════════════════════════════════════════════════════════
 
 fn apply_damage(
     io: &mut InteractionIo<'_, '_>,
@@ -530,6 +774,10 @@ fn apply_damage(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// pickup_system
+// ═══════════════════════════════════════════════════════════════════════════════
+
 fn pickup_system(
     mut io: InteractionIo,
     spatial: Res<SpatialHash>,
@@ -538,31 +786,27 @@ fn pickup_system(
 ) {
     let items: Vec<CollisionView> = query
         .iter()
-        .map(|(entity, pos, col, tags, nid, pickup, cl)| CollisionView {
-            entity,
-            x: pos.x,
-            y: pos.y,
-            w: col.width,
-            h: col.height,
-            tags: tags
-                .map(|t| t.0.iter().cloned().collect())
-                .unwrap_or_default(),
-            network_id: nid.0,
-            contact_damage: None,
-            pickup: pickup.cloned(),
-            collision_layer: cl.copied(),
+        .filter_map(|(entity, pos, col, circle, tags, nid, pickup, cl)| {
+            let shape = extract_shape(pos, col, circle)?;
+            Some(CollisionView {
+                entity,
+                shape,
+                tags: tags
+                    .map(|t| t.0.iter().cloned().collect())
+                    .unwrap_or_default(),
+                network_id: nid.0,
+                contact_damage: None,
+                pickup: pickup.cloned(),
+                collision_layer: cl.copied(),
+            })
         })
         .collect();
     let by_entity: std::collections::HashMap<Entity, &CollisionView> =
         items.iter().map(|i| (i.entity, i)).collect();
 
     for a in &items {
-        let candidates = spatial.query_rect(
-            a.x - a.w / 2.0,
-            a.y - a.h / 2.0,
-            a.x + a.w / 2.0,
-            a.y + a.h / 2.0,
-        );
+        let (min_x, min_y, max_x, max_y) = a.shape.bounding_rect();
+        let candidates = spatial.query_rect(min_x, min_y, max_x, max_y);
         for cand in candidates {
             let Some(b) = by_entity.get(&cand).copied() else {
                 continue;
@@ -570,20 +814,7 @@ fn pickup_system(
             if b.network_id <= a.network_id {
                 continue;
             }
-            if !overlap(
-                Aabb {
-                    x: a.x,
-                    y: a.y,
-                    w: a.w,
-                    h: a.h,
-                },
-                Aabb {
-                    x: b.x,
-                    y: b.y,
-                    w: b.w,
-                    h: b.h,
-                },
-            ) {
+            if !shapes_overlap(&a.shape, &b.shape) {
                 continue;
             }
             if !collision_layers_compatible(a.collision_layer.as_ref(), b.collision_layer.as_ref()) {
@@ -672,16 +903,28 @@ fn apply_pickup(
     io.commands.entity(app.pickup_entity).despawn();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// trigger_zone_system
+// ═══════════════════════════════════════════════════════════════════════════════
+
 fn trigger_zone_system(
     mut commands: Commands,
     mut events: ResMut<GameEventBus>,
     spatial: Res<SpatialHash>,
     triggers: Query<(Entity, &GamePosition, &TriggerZone, &NetworkId)>,
-    actors: Query<(Entity, &GamePosition, &NetworkId, Option<&Tags>)>,
+    actors: Query<(
+        Entity,
+        &GamePosition,
+        &NetworkId,
+        Option<&Tags>,
+        Option<&Collider>,
+        Option<&CircleCollider>,
+    )>,
 ) {
     let actor_view: std::collections::HashMap<Entity, ActorView> = actors
         .iter()
-        .map(|(e, pos, nid, tags)| {
+        .map(|(e, pos, nid, tags, col, circle)| {
+            let shape = extract_shape(pos, col, circle);
             (
                 e,
                 (
@@ -690,26 +933,40 @@ fn trigger_zone_system(
                     nid.0,
                     tags.map(|t| t.0.iter().cloned().collect())
                         .unwrap_or_default(),
+                    shape,
                 ),
             )
         })
         .collect();
 
     for (trigger_entity, trigger_pos, trigger, nid) in triggers.iter() {
+        let trigger_shape = CollisionShape::Circle {
+            x: trigger_pos.x,
+            y: trigger_pos.y,
+            r: trigger.radius,
+        };
         let mut fired = false;
         let candidates = spatial.query_radius(trigger_pos.x, trigger_pos.y, trigger.radius);
         for actor_entity in candidates {
             if actor_entity == trigger_entity {
                 continue;
             }
-            let Some((ax, ay, actor_network_id, actor_tags)) = actor_view.get(&actor_entity) else {
+            let Some((ax, ay, actor_network_id, actor_tags, actor_shape)) =
+                actor_view.get(&actor_entity)
+            else {
                 continue;
             };
             if !tag_matches(actor_tags, &trigger.trigger_tag) {
                 continue;
             }
-            let d2 = (ax - trigger_pos.x).powi(2) + (ay - trigger_pos.y).powi(2);
-            if d2 <= trigger.radius * trigger.radius {
+            // Use shape-based overlap if actor has a collider, else point-in-circle
+            let overlaps = if let Some(shape) = actor_shape {
+                shapes_overlap(&trigger_shape, shape)
+            } else {
+                let d2 = (ax - trigger_pos.x).powi(2) + (ay - trigger_pos.y).powi(2);
+                d2 <= trigger.radius * trigger.radius
+            };
+            if overlaps {
                 events.emit(
                     trigger.event_name.clone(),
                     serde_json::json!({
@@ -726,6 +983,10 @@ fn trigger_zone_system(
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// invincibility_system & death_system
+// ═══════════════════════════════════════════════════════════════════════════════
 
 fn invincibility_system(mut commands: Commands, mut query: Query<(Entity, &mut Invincibility)>) {
     for (entity, mut inv) in query.iter_mut() {
@@ -777,18 +1038,6 @@ fn death_system(
             });
         }
     }
-}
-
-fn overlap(a: Aabb, b: Aabb) -> bool {
-    let a_min_x = a.x - a.w / 2.0;
-    let a_max_x = a.x + a.w / 2.0;
-    let a_min_y = a.y - a.h / 2.0;
-    let a_max_y = a.y + a.h / 2.0;
-    let b_min_x = b.x - b.w / 2.0;
-    let b_max_x = b.x + b.w / 2.0;
-    let b_min_y = b.y - b.h / 2.0;
-    let b_max_y = b.y + b.h / 2.0;
-    a_max_x > b_min_x && a_min_x < b_max_x && a_max_y > b_min_y && a_min_y < b_max_y
 }
 
 fn tag_matches(tags: &[String], required: &str) -> bool {

@@ -308,6 +308,8 @@ pub enum ComponentDef {
         vx: f32,
         vy: f32,
     },
+    #[serde(rename = "solid_body")]
+    SolidBody,
 }
 
 fn default_left() -> String {
@@ -1847,6 +1849,30 @@ pub struct HealthCheckResult {
     pub game_vars_count: usize,
     pub tilemap_set: bool,
     pub issues: Vec<String>,
+}
+
+// === Diagnose API types ===
+
+#[derive(Serialize, Clone)]
+pub struct DiagnoseResult {
+    pub entity_count: usize,
+    pub issues_count: usize,
+    pub entities: Vec<EntityDiagnosis>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct EntityDiagnosis {
+    pub id: u64,
+    pub tags: Vec<String>,
+    pub issues: Vec<ComponentIssue>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ComponentIssue {
+    pub component: String,
+    pub severity: String,
+    pub message: String,
+    pub missing: Vec<String>,
 }
 
 // === Evaluation API types ===

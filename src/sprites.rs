@@ -303,7 +303,7 @@ fn ensure_sprite_for_sheet_entities(
 /// an absolute path that Bevy's AssetServer can load regardless of the startup
 /// asset root.  If asset_path is None, returns the path unchanged (relative to
 /// Bevy's default asset root).
-fn resolve_sprite_asset_path(relative: &str, asset_path: Option<&str>) -> String {
+pub fn resolve_sprite_asset_path(relative: &str, asset_path: Option<&str>) -> String {
     if let Some(base) = asset_path.filter(|s| !s.is_empty()) {
         let p = std::path::Path::new(relative);
         if p.is_absolute() {

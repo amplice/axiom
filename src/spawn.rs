@@ -396,6 +396,9 @@ pub fn spawn_entity_with_network_id(
             ComponentDef::KnockbackImpulse { vx, vy } => {
                 entity.insert(KnockbackImpulse { vx: *vx, vy: *vy });
             }
+            ComponentDef::SolidBody => {
+                entity.insert(SolidBody);
+            }
         }
     }
 

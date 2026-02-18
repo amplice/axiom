@@ -143,6 +143,10 @@ pub struct KnockbackImpulse {
     pub vy: f32,
 }
 
+/// Marker: entity participates in solid-body collision (entities push each other apart).
+#[derive(Component, Clone, Copy)]
+pub struct SolidBody;
+
 /// Entity affected by GameConfig.gravity
 #[derive(Component)]
 pub struct GravityBody;
@@ -587,6 +591,8 @@ pub enum TileMode {
     Isometric {
         tile_width: f32,
         tile_height: f32,
+        #[serde(default)]
+        depth_sort: bool,
     },
 }
 
@@ -601,6 +607,7 @@ impl TileMode {
             TileMode::Isometric {
                 tile_width,
                 tile_height,
+                ..
             } => {
                 let x = (col - row) * tile_width * 0.5;
                 let y = (col + row) * tile_height * 0.5;
@@ -615,6 +622,7 @@ impl TileMode {
             TileMode::Isometric {
                 tile_width,
                 tile_height,
+                ..
             } => {
                 let col = wx / tile_width + wy / tile_height;
                 let row = wy / tile_height - wx / tile_width;
