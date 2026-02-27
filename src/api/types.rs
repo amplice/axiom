@@ -1267,6 +1267,10 @@ pub struct TerrainMaterialRequest {
     /// Frames beyond this count are clamped back to 0 (fill).
     #[serde(default)]
     pub columns: Option<u32>,
+    /// Whether this material's tiles should be solid (unwalkable).
+    /// Default: false (walkable).
+    #[serde(default)]
+    pub solid: Option<bool>,
 }
 
 fn default_autotile() -> bool { true }

@@ -1925,6 +1925,9 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         }
                         let def = &mut registry.types[req.tile_id as usize];
                         def.name = req.name.clone();
+                        if req.solid == Some(true) {
+                            def.flags = crate::components::TILE_SOLID;
+                        }
                         let columns = if do_autotile {
                             req.columns.unwrap_or(13)
                         } else {
