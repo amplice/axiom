@@ -1907,6 +1907,60 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     let _ = tx.send(Ok(()));
                 });
             }
+            ApiCommand::RegisterTerrainMaterial(req, tx) => {
+                commands.queue(move |world: &mut World| {
+                    let do_autotile = req.autotile;
+                    // Register tileset for this tile_id in TileTypeRegistry
+                    if let Some(mut config) = world.get_resource_mut::<crate::components::GameConfig>() {
+                        let registry = &mut config.tile_types;
+                        // Grow registry if needed
+                        while registry.types.len() <= req.tile_id as usize {
+                            registry.types.push(crate::components::TileTypeDef {
+                                name: format!("auto_{}", registry.types.len()),
+                                flags: 0,
+                                friction: 1.0,
+                                color: None,
+                                tileset: None,
+                            });
+                        }
+                        let def = &mut registry.types[req.tile_id as usize];
+                        def.name = req.name.clone();
+                        let columns = if do_autotile {
+                            req.columns.unwrap_or(13)
+                        } else {
+                            1
+                        };
+                        def.tileset = Some(crate::components::TilesetDef {
+                            path: req.atlas.clone(),
+                            tile_width: req.frame_width,
+                            tile_height: req.frame_height,
+                            columns,
+                            rows: 1,
+                            variant_map: None,
+                        });
+                    }
+
+                    // Register the autotile rule (only if autotile is enabled)
+                    if do_autotile {
+                        let max_cols = req.columns.unwrap_or(13) as u16;
+                        let table = crate::tilemap::build_mask_to_frame_table(
+                            req.slots.as_deref(),
+                            max_cols,
+                        );
+                        let rule = crate::api::types::MaterialAutoTileRule {
+                            name: req.name.clone(),
+                            base_tile_id: req.tile_id,
+                            mask_to_frame: table,
+                        };
+                        if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
+                            tilemap.material_auto_tile_rules.insert(req.name.clone(), rule);
+                            tilemap.recalculate_auto_tiles();
+                        }
+                    }
+
+                    let _ = tx.send(Ok(()));
+                });
+            }
             // ── Parallax, Weather, Inventory, Cutscenes ────────────────
             ApiCommand::GetParallax(tx) => {
                 commands.queue(move |world: &mut World| {
@@ -2540,6 +2594,7 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                     tiles: tilemap.tiles.clone(),
                     player_spawn: Some(tilemap.player_spawn),
                     goal: tilemap.goal,
+                    extra_layers: tilemap.extra_layers.clone(),
                 });
 
                 let mut save_entities = Vec::new();

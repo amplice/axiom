@@ -367,6 +367,7 @@ pub(super) fn apply_loaded_save_data(
         tiles: save.tilemap.tiles.clone(),
         player_spawn: Some(save.tilemap.player_spawn),
         goal: save.tilemap.goal,
+        extra_layers: save.tilemap.extra_layers.clone(),
     });
     let tilemap_applied = true;
 

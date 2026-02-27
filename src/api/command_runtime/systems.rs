@@ -27,6 +27,10 @@ pub(in crate::api) fn apply_level_change(
         tilemap.player_spawn = spawn;
     }
     tilemap.goal = req.goal;
+    tilemap.extra_layers = req.extra_layers;
+
+    // Recalculate autotile visuals now that tiles are loaded
+    tilemap.recalculate_auto_tiles();
 
     for entity in tile_entities.iter() {
         ctx.commands.entity(entity).despawn();
@@ -43,6 +47,10 @@ pub(in crate::api) fn apply_level_change(
         );
         let sa = ctx.sprite_assets.as_deref();
 
+        println!("[LevelLoad] tileset_data keys: {:?}, tile_visuals len={}, non-zero={}",
+            tileset_data.keys().collect::<Vec<_>>(),
+            tilemap.tile_visuals.len(),
+            tilemap.tile_visuals.iter().filter(|&&v| v != 0).count());
         // Spawn main tilemap layer
         crate::tilemap::spawn_tile_layer(
             &mut ctx.commands,

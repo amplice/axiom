@@ -153,6 +153,7 @@ pub(super) fn build_router(state: AppState, security: ApiSecurity) -> Router {
         )
         .route("/tilemap/query", post(tilemap_query))
         .route("/tilemap/auto_tile", post(set_auto_tile))
+        .route("/terrain/materials", post(register_terrain_material))
         .route("/tilemap/layers", get(get_tile_layers).post(set_tile_layer))
         .route("/tilemap/layers/{name}", delete(delete_tile_layer))
         .route(

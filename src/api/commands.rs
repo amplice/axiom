@@ -269,6 +269,11 @@ pub enum ApiCommand {
         AutoTileRequest,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     ),
+    // 8-bit terrain material autotiling
+    RegisterTerrainMaterial(
+        TerrainMaterialRequest,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     // Parallax
     GetParallax(tokio::sync::oneshot::Sender<ParallaxResponse>),
     SetParallax(

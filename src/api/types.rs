@@ -36,6 +36,9 @@ pub struct SetLevelRequest {
     pub tiles: Vec<u8>,
     pub player_spawn: Option<(f32, f32)>,
     pub goal: Option<(i32, i32)>,
+    /// Optional extra decorative tile layers (visual-only, rendered on top).
+    #[serde(default)]
+    pub extra_layers: Vec<crate::tilemap::TileLayer>,
 }
 
 #[derive(Deserialize)]
@@ -1232,6 +1235,52 @@ pub struct AutoTileSetDef {
     pub base_tile_id: u8,
     /// 4-bit bitmask (N/S/E/W) -> sprite index.
     pub variants: HashMap<u8, usize>,
+}
+
+// === 8-bit Material Auto-Tile API types ===
+
+/// Request to register a terrain material with 8-bit autotiling.
+#[derive(Deserialize, Clone)]
+pub struct TerrainMaterialRequest {
+    /// Human-readable name (e.g. "grass").
+    pub name: String,
+    /// Which tile type ID triggers this material's autotiling.
+    pub tile_id: u8,
+    /// Path to the autotile atlas PNG (13 or 20 frames).
+    pub atlas: String,
+    /// Frame width in pixels.
+    #[serde(default = "default_frame_width")]
+    pub frame_width: u32,
+    /// Frame height in pixels.
+    #[serde(default = "default_frame_height")]
+    pub frame_height: u32,
+    /// Optional custom slot-to-frame mapping (13 entries).
+    /// If omitted, uses standard layout: fill=0, edge_N=1, ..., inner_SW=12.
+    #[serde(default)]
+    pub slots: Option<Vec<u16>>,
+    /// Whether to enable 8-bit autotiling for this material.
+    /// Default: true. Set to false for base materials (e.g. dirt) that just show a fill tile.
+    #[serde(default = "default_autotile")]
+    pub autotile: bool,
+    /// Number of atlas columns (frame slots). Default: 13 (classic layout).
+    /// Set to 20 for extended atlases with endcap/lane/full_surround slots.
+    /// Frames beyond this count are clamped back to 0 (fill).
+    #[serde(default)]
+    pub columns: Option<u32>,
+}
+
+fn default_autotile() -> bool { true }
+
+fn default_frame_width() -> u32 { 128 }
+fn default_frame_height() -> u32 { 256 }
+
+/// Pre-computed 8-bit autotile rule: mask8 -> atlas frame index.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MaterialAutoTileRule {
+    pub name: String,
+    pub base_tile_id: u8,
+    /// 256-entry lookup: mask8 value -> atlas frame index.
+    pub mask_to_frame: Vec<u16>,
 }
 
 // === Tile Layer API types ===

@@ -1489,6 +1489,24 @@ pub(super) async fn set_auto_tile(
     }
 }
 
+// === Terrain Materials (8-bit autotile) ===
+
+pub(super) async fn register_terrain_material(
+    State(state): State<AppState>,
+    Json(req): Json<TerrainMaterialRequest>,
+) -> Json<ApiResponse<String>> {
+    if req.name.trim().is_empty() {
+        return Json(ApiResponse::err("Material name cannot be empty"));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = state.sender.send(ApiCommand::RegisterTerrainMaterial(req, tx));
+    match rx.await {
+        Ok(Ok(())) => Json(ApiResponse::ok()),
+        Ok(Err(e)) => Json(ApiResponse::err(e)),
+        Err(_) => Json(ApiResponse::err("Channel closed")),
+    }
+}
+
 // === Parallax ===
 
 pub(super) async fn get_parallax(

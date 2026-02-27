@@ -757,6 +757,7 @@ pub(super) async fn apply_generated_level(
         tiles: generated.tilemap.tiles.clone(),
         player_spawn: Some(generated.player_spawn),
         goal: Some(generated.goal),
+        extra_layers: vec![],
     };
     let (lvl_tx, lvl_rx) = tokio::sync::oneshot::channel();
     if state
