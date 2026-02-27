@@ -369,25 +369,85 @@ fn apply_velocity(
     let ts = config.tile_size;
     let mut counters = PhysicsCounters::default();
 
+    let is_iso = matches!(config.tile_mode, TileMode::Isometric { .. });
+
     for (mut pos, mut vel, mut alive, collider) in query.iter_mut() {
-        let motion = physics_core::resolve_motion(
-            &tilemap,
-            physics_core::MotionParams {
-                tile_size: ts,
-                dt,
-                x: pos.x,
-                y: pos.y,
-                vx: vel.x,
-                vy: vel.y,
-                width: collider.width,
-                height: collider.height,
-            },
-            &mut counters,
-        );
-        pos.x = motion.x;
-        pos.y = motion.y;
-        vel.x = motion.vx;
-        vel.y = motion.vy;
+        let old_x = pos.x;
+        let old_y = pos.y;
+
+        if is_iso {
+            // Isometric mode: bypass resolve_motion entirely because it uses
+            // rectangular grid math (world_pos / tile_size) which maps to WRONG
+            // tiles in the isometric tilemap, causing invisible walls.
+            // Instead, apply velocity directly and check isometric grid collision.
+            pos.x += vel.x * dt;
+            pos.y += vel.y * dt;
+
+            if !tilemap.solid_ids.is_empty() {
+                let hw = collider.width * 0.5;
+                let hh = collider.height * 0.5;
+
+                // Tile sprites (128x256) have their diamond base at y=216 from the
+                // top of the image, which is 88 pixels below the sprite center.
+                // Collision must offset world Y to match the visual diamond position.
+                let diamond_offset_y: f32 = 88.0;
+
+                let any_solid = |cx: f32, cy: f32| -> bool {
+                    for &(ox, oy) in &[(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh), (0.0, 0.0)] {
+                        let (col, row) = config.tile_mode.world_to_grid(
+                            cx + ox,
+                            cy + oy + diamond_offset_y,
+                            ts,
+                        );
+                        let ci = col.floor() as i32;
+                        let ri = row.floor() as i32;
+                        if tilemap.is_solid(ci, ri) {
+                            return true;
+                        }
+                    }
+                    false
+                };
+
+                // Try each axis independently to allow sliding along edges
+                let x_ok = !any_solid(pos.x, old_y);
+                let y_ok = !any_solid(old_x, pos.y);
+
+                if !x_ok {
+                    pos.x = old_x;
+                    vel.x = 0.0;
+                }
+                if !y_ok {
+                    pos.y = old_y;
+                    vel.y = 0.0;
+                }
+                if x_ok && y_ok && any_solid(pos.x, pos.y) {
+                    pos.x = old_x;
+                    pos.y = old_y;
+                    vel.x = 0.0;
+                    vel.y = 0.0;
+                }
+            }
+        } else {
+            // Standard rectangular mode: use resolve_motion for full physics
+            let motion = physics_core::resolve_motion(
+                &tilemap,
+                physics_core::MotionParams {
+                    tile_size: ts,
+                    dt,
+                    x: pos.x,
+                    y: pos.y,
+                    vx: vel.x,
+                    vy: vel.y,
+                    width: collider.width,
+                    height: collider.height,
+                },
+                &mut counters,
+            );
+            pos.x = motion.x;
+            pos.y = motion.y;
+            vel.x = motion.vx;
+            vel.y = motion.vy;
+        }
 
         // Check spikes
         if physics_core::collides_type(

@@ -323,7 +323,7 @@ pub fn compute_grounded(
     for tx in left_tile_x..=right_tile_x {
         counters.collision_checks = counters.collision_checks.saturating_add(1);
         let tile = tilemap.get(tx, tile_y);
-        if tile.is_solid() || tile.is_platform() {
+        if tile.is_solid() || tile.is_platform() || tilemap.solid_ids.contains(&tilemap.get_tile(tx, tile_y)) {
             return true;
         }
         if tile.is_slope() {

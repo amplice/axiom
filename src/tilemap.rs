@@ -38,6 +38,9 @@ pub struct Tilemap {
     /// Extra decorative tile layers (visual-only, no physics).
     #[serde(default)]
     pub extra_layers: Vec<TileLayer>,
+    /// Additional tile IDs that should be treated as solid (from terrain materials).
+    #[serde(default)]
+    pub solid_ids: std::collections::HashSet<u8>,
 }
 
 impl Tilemap {
@@ -75,7 +78,8 @@ impl Tilemap {
     }
 
     pub fn is_solid(&self, x: i32, y: i32) -> bool {
-        self.get(x, y).is_solid()
+        let id = self.get_tile(x, y);
+        TileType::from_u8(id).is_solid() || self.solid_ids.contains(&id)
     }
 
     pub fn is_ground(&self, x: i32, y: i32) -> bool {

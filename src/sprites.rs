@@ -435,9 +435,8 @@ fn apply_sprite_sheet_rendering(
             layout: entry.layout.clone(),
             index: atlas_index,
         });
-        // Display at full frame size — character body (~30% of cell) scales with world
-        let display_size = sheet.frame_width.max(sheet.frame_height) as f32;
-        sprite.custom_size = Some(Vec2::new(display_size, display_size));
+        // Display at full frame size, preserving aspect ratio
+        sprite.custom_size = Some(Vec2::new(sheet.frame_width as f32, sheet.frame_height as f32));
         sprite.anchor = bevy::sprite::Anchor::Custom(Vec2::new(0.0, sheet.anchor_y));
         // Don't flip for 8-directional sprites
         if sheet.rows > 1 {

@@ -1943,6 +1943,10 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         });
                     }
 
+                    // Update tilemap solid_ids if this material is solid
+                    let tile_id = req.tile_id;
+                    let is_solid_mat = req.solid == Some(true);
+
                     // Register the autotile rule (only if autotile is enabled)
                     if do_autotile {
                         let max_cols = req.columns.unwrap_or(13) as u16;
@@ -1958,6 +1962,13 @@ pub(super) fn process_api_commands(ctx: ApiRuntimeCtx<'_, '_>) {
                         if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
                             tilemap.material_auto_tile_rules.insert(req.name.clone(), rule);
                             tilemap.recalculate_auto_tiles();
+                            if is_solid_mat {
+                                tilemap.solid_ids.insert(tile_id);
+                            }
+                        }
+                    } else if is_solid_mat {
+                        if let Some(mut tilemap) = world.get_resource_mut::<Tilemap>() {
+                            tilemap.solid_ids.insert(tile_id);
                         }
                     }
 

@@ -325,19 +325,27 @@ struct PickupApplication<'a> {
 
 fn entity_collision_system(
     spatial: Res<SpatialHash>,
-    mut positions: Query<(&mut GamePosition, Option<&Collider>, Option<&CircleCollider>)>,
-    solid_entities: Query<(Entity, Option<&crate::components::CollisionLayer>), With<SolidBody>>,
+    mut positions: Query<(
+        &mut GamePosition,
+        Option<&Collider>,
+        Option<&CircleCollider>,
+        Option<&crate::components::CollisionLayer>,
+    )>,
+    solid_entities: Query<Entity, With<SolidBody>>,
 ) {
-    // Snapshot all SolidBody entities (read positions immutably via get())
+    // Snapshot all SolidBody entities
     struct SolidEntry {
         entity: Entity,
         shape: CollisionShape,
         collision_layer: Option<crate::components::CollisionLayer>,
     }
+    let solid_set: std::collections::HashSet<Entity> =
+        solid_entities.iter().collect();
+
     let solids: Vec<SolidEntry> = solid_entities
         .iter()
-        .filter_map(|(entity, cl)| {
-            let (pos, col, circle) = positions.get(entity).ok()?;
+        .filter_map(|entity| {
+            let (pos, col, circle, cl) = positions.get(entity).ok()?;
             let shape = extract_shape(&pos, col, circle)?;
             Some(SolidEntry {
                 entity,
@@ -347,61 +355,79 @@ fn entity_collision_system(
         })
         .collect();
 
-    if solids.len() < 2 {
+    if solids.is_empty() {
         return;
     }
-
-    // Build entity→index lookup
-    let entity_to_idx: std::collections::HashMap<Entity, usize> = solids
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.entity, i))
-        .collect();
 
     // Accumulate displacements
     let mut displacements: std::collections::HashMap<Entity, (f32, f32)> =
         std::collections::HashMap::new();
+    let mut processed_pairs: std::collections::HashSet<(Entity, Entity)> =
+        std::collections::HashSet::new();
 
-    for (i, a) in solids.iter().enumerate() {
+    for a in solids.iter() {
         let (min_x, min_y, max_x, max_y) = a.shape.bounding_rect();
         let candidates = spatial.query_rect(min_x, min_y, max_x, max_y);
         for cand in candidates {
-            let Some(&j) = entity_to_idx.get(&cand) else {
+            if cand == a.entity {
+                continue;
+            }
+            // Dedupe: only process each pair once
+            let pair = if a.entity < cand {
+                (a.entity, cand)
+            } else {
+                (cand, a.entity)
+            };
+            if !processed_pairs.insert(pair) {
+                continue;
+            }
+            let Ok((cand_pos, cand_col, cand_circle, cand_cl)) =
+                positions.get(cand)
+            else {
                 continue;
             };
-            if j <= i {
-                continue; // dedupe: only process pair once
-            }
-            let b = &solids[j];
+            let Some(b_shape) = extract_shape(&cand_pos, cand_col, cand_circle)
+            else {
+                continue;
+            };
             if !collision_layers_compatible(
                 a.collision_layer.as_ref(),
-                b.collision_layer.as_ref(),
+                cand_cl,
             ) {
                 continue;
             }
-            if !shapes_overlap(&a.shape, &b.shape) {
+            if !shapes_overlap(&a.shape, &b_shape) {
                 continue;
             }
-            let (px, py) = compute_push_vector(&a.shape, &b.shape);
-            // Split 50/50: a moves -half, b moves +half
-            let half_x = px * 0.5;
-            let half_y = py * 0.5;
-            {
-                let d = displacements.entry(a.entity).or_insert((0.0, 0.0));
-                d.0 -= half_x;
-                d.1 -= half_y;
-            }
-            {
-                let d = displacements.entry(b.entity).or_insert((0.0, 0.0));
-                d.0 += half_x;
-                d.1 += half_y;
+            let (px, py) = compute_push_vector(&a.shape, &b_shape);
+
+            let cand_is_solid = solid_set.contains(&cand);
+            if cand_is_solid {
+                // Both solid: split 50/50
+                let half_x = px * 0.5;
+                let half_y = py * 0.5;
+                {
+                    let d = displacements.entry(a.entity).or_insert((0.0, 0.0));
+                    d.0 -= half_x;
+                    d.1 -= half_y;
+                }
+                {
+                    let d = displacements.entry(cand).or_insert((0.0, 0.0));
+                    d.0 += half_x;
+                    d.1 += half_y;
+                }
+            } else {
+                // Non-solid collides with solid: push non-solid 100%
+                let d = displacements.entry(cand).or_insert((0.0, 0.0));
+                d.0 += px;
+                d.1 += py;
             }
         }
     }
 
     // Apply all displacements
     for (entity, (dx, dy)) in displacements {
-        if let Ok((mut pos, _, _)) = positions.get_mut(entity) {
+        if let Ok((mut pos, _, _, _)) = positions.get_mut(entity) {
             pos.x += dx;
             pos.y += dy;
         }

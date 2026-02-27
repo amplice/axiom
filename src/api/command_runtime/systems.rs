@@ -29,6 +29,13 @@ pub(in crate::api) fn apply_level_change(
     tilemap.goal = req.goal;
     tilemap.extra_layers = req.extra_layers;
 
+    // Sync solid_ids from the tile type registry (materials registered before level load)
+    for (id, def) in ctx.physics.tile_types.types.iter().enumerate() {
+        if def.flags & crate::components::TILE_SOLID != 0 {
+            tilemap.solid_ids.insert(id as u8);
+        }
+    }
+
     // Recalculate autotile visuals now that tiles are loaded
     tilemap.recalculate_auto_tiles();
 
